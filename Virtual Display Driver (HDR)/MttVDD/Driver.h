@@ -9,6 +9,7 @@
 
 #include <dxgi1_5.h>
 #include <d3d11_2.h>
+#include <d3dcompiler.h>
 #include <avrt.h>
 #include <wrl.h>
 
@@ -66,6 +67,42 @@ namespace Microsoft
         };
 
         /// <summary>
+        /// Per-swap-chain state for the optional runtime pixel shader.
+        ///
+        /// This deliberately lives on the SwapChainProcessor and not on Direct3DDevice.
+        /// Direct3DDevice is cached per adapter LUID and is therefore shared by every monitor
+        /// rendered on that adapter, while each SwapChainProcessor runs on its own thread.
+        /// Holding the render targets and shader objects per swap chain stops one thread from
+        /// resetting textures another thread is drawing into, and stops two monitors with
+        /// different resolutions from re-creating the same textures on every frame.
+        /// </summary>
+        struct ShaderRenderState
+        {
+            Microsoft::WRL::ComPtr<ID3D11VertexShader> VertexShader;
+            Microsoft::WRL::ComPtr<ID3D11PixelShader> PixelShader;
+            Microsoft::WRL::ComPtr<ID3D11SamplerState> SamplerState;
+            Microsoft::WRL::ComPtr<ID3D11Buffer> ConstantBuffer;
+            Microsoft::WRL::ComPtr<ID3D11Texture2D> InputTexture;
+            Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> InputView;
+            Microsoft::WRL::ComPtr<ID3D11Texture2D> OutputTexture;
+            Microsoft::WRL::ComPtr<ID3D11RenderTargetView> OutputView;
+
+            std::wstring LoadedShaderPath;
+            ULONGLONG LoadedShaderTimestamp = 0;
+            ULONGLONG NextShaderScanTick = 0;
+            ULONGLONG NextMissingShaderLogTick = 0;
+
+            UINT TextureWidth = 0;
+            UINT TextureHeight = 0;
+            DXGI_FORMAT TextureFormat = DXGI_FORMAT_UNKNOWN;
+
+            // Set once the pipeline has failed in a way that retrying cannot fix, so the hot
+            // path stops re-attempting work every frame.
+            bool Disabled = false;
+            bool CompilerUnavailableLogged = false;
+        };
+
+        /// <summary>
         /// Manages a thread that consumes buffers from an indirect display swap-chain object.
         /// </summary>
         class SwapChainProcessor
@@ -86,6 +123,9 @@ namespace Microsoft
             HANDLE m_hAvailableBufferEvent;
             Microsoft::WRL::Wrappers::Thread m_hThread;
             Microsoft::WRL::Wrappers::Event m_hTerminateEvent;
+
+            // Only touched by this processor's own thread.
+            ShaderRenderState m_Shader;
         };
 
         /// <summary>

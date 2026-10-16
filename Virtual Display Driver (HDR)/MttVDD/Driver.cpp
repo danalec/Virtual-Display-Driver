@@ -53,6 +53,7 @@ HANDLE hPipeThread = NULL;
 bool g_Running = true;
 mutex g_Mutex;
 HANDLE g_pipeHandle = INVALID_HANDLE_VALUE;
+HINSTANCE g_ModuleInstance = nullptr;
 
 using namespace std;
 using namespace Microsoft::IndirectDisp;
@@ -136,6 +137,13 @@ IDDCX_BITS_PER_COMPONENT HDRCOLOUR = IDDCX_BITS_PER_COMPONENT_10;
 
 wstring ColourFormat = L"RGB";
 
+bool shaderRendererEnabled = false;
+bool shaderHotReload = true;
+wstring shaderDirectory = L"Shaders";
+wstring shaderFile = L"";
+double shaderParam0 = 1.0;
+const auto g_ShaderStartTime = std::chrono::steady_clock::now();
+
 // === EDID INTEGRATION SETTINGS ===
 bool edidIntegrationEnabled = false;
 bool autoConfigureFromEdid = false;
@@ -216,6 +224,14 @@ std::map<std::wstring, std::pair<std::wstring, std::wstring>> SettingsQueryMap =
 	{L"SDR10Enabled", {L"SDR10BIT", L"SDR10bit"}},
 	{L"ColourFormat", {L"COLOURFORMAT", L"ColourFormat"}},
 	//Colour End
+
+	//Shaders Begin
+	{L"ShaderRendererEnabled", {L"SHADERRENDERER", L"shader_renderer"}},
+	{L"ShaderHotReload", {L"SHADERHOTRELOAD", L"shader_hot_reload"}},
+	{L"ShaderDirectory", {L"SHADERDIRECTORY", L"shader_directory"}},
+	{L"ShaderFile", {L"SHADERFILE", L"shader_file"}},
+	{L"ShaderParam0", {L"SHADERPARAM0", L"shader_param0"}},
+	//Shaders End
 	
 	//EDID Integration Begin
 	{L"EdidIntegrationEnabled", {L"EDIDINTEGRATION", L"enabled"}},
@@ -677,6 +693,711 @@ double GetDoubleSetting(const std::wstring& settingKey) {
 	}
 
 	return xmlLoggingValue;
+}
+
+namespace
+{
+    struct ShaderConstantBufferData
+    {
+        float resolution[4];
+        float time;
+        float param0;
+        float param1;
+        float param2;
+    };
+
+    // The HLSL compiler is resolved at run time instead of being linked statically.
+    // d3dcompiler.lib is only an import library for D3DCOMPILER_47.dll, and that DLL is not a
+    // guaranteed OS component. A static import would make MttVDD.dll fail to load on a machine
+    // that does not have it - taking the virtual display down with it - even when the shader
+    // feature is switched off.
+    using PFN_D3DCompile =
+        HRESULT(WINAPI*)(LPCVOID, SIZE_T, LPCSTR, const D3D_SHADER_MACRO*, ID3DInclude*, LPCSTR, LPCSTR, UINT, UINT, ID3DBlob**, ID3DBlob**);
+    using PFN_D3DCompileFromFile =
+        HRESULT(WINAPI*)(LPCWSTR, const D3D_SHADER_MACRO*, ID3DInclude*, LPCSTR, LPCSTR, UINT, UINT, ID3DBlob**, ID3DBlob**);
+
+    struct HlslCompiler
+    {
+        HMODULE Module = nullptr;
+        PFN_D3DCompile Compile = nullptr;
+        PFN_D3DCompileFromFile CompileFromFile = nullptr;
+
+        bool EnsureLoaded()
+        {
+            if (Compile != nullptr && CompileFromFile != nullptr)
+            {
+                return true;
+            }
+
+            if (Module == nullptr)
+            {
+                Module = LoadLibraryExW(L"d3dcompiler_47.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+                if (Module == nullptr)
+                {
+                    return false;
+                }
+            }
+
+            Compile = reinterpret_cast<PFN_D3DCompile>(GetProcAddress(Module, "D3DCompile"));
+            CompileFromFile = reinterpret_cast<PFN_D3DCompileFromFile>(GetProcAddress(Module, "D3DCompileFromFile"));
+            return Compile != nullptr && CompileFromFile != nullptr;
+        }
+    };
+
+    HlslCompiler g_HlslCompiler;
+
+    DXGI_FORMAT GetShaderViewFormat(DXGI_FORMAT resourceFormat)
+    {
+        switch (resourceFormat)
+        {
+        case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+            return DXGI_FORMAT_B8G8R8A8_UNORM;
+        case DXGI_FORMAT_R8G8B8A8_TYPELESS:
+            return DXGI_FORMAT_R8G8B8A8_UNORM;
+        case DXGI_FORMAT_R16G16B16A16_TYPELESS:
+            return DXGI_FORMAT_R16G16B16A16_FLOAT;
+        default:
+            return resourceFormat;
+        }
+    }
+
+    bool IsSupportedShaderExtension(const wchar_t* extension)
+    {
+        return extension != nullptr &&
+            (_wcsicmp(extension, L".hlsl") == 0 || _wcsicmp(extension, L".cso") == 0);
+    }
+
+    ULONGLONG ToUint64(const FILETIME& fileTime)
+    {
+        ULARGE_INTEGER value = {};
+        value.HighPart = fileTime.dwHighDateTime;
+        value.LowPart = fileTime.dwLowDateTime;
+        return value.QuadPart;
+    }
+
+    ULONGLONG QueryFileTimestamp(const std::wstring& path)
+    {
+        WIN32_FILE_ATTRIBUTE_DATA fileData = {};
+        if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &fileData))
+        {
+            return 0;
+        }
+
+        return ToUint64(fileData.ftLastWriteTime);
+    }
+
+    std::wstring CombinePath(const std::wstring& basePath, const std::wstring& childPath)
+    {
+        wchar_t combinedPath[MAX_PATH] = {};
+        if (!PathCombineW(combinedPath, basePath.c_str(), childPath.c_str()))
+        {
+            return L"";
+        }
+
+        return combinedPath;
+    }
+
+    std::wstring GetModuleDirectory()
+    {
+        if (g_ModuleInstance == nullptr)
+        {
+            return L"";
+        }
+
+        wchar_t modulePath[MAX_PATH] = {};
+        DWORD result = GetModuleFileNameW(g_ModuleInstance, modulePath, ARRAYSIZE(modulePath));
+        if (result == 0 || result >= ARRAYSIZE(modulePath))
+        {
+            return L"";
+        }
+
+        if (!PathRemoveFileSpecW(modulePath))
+        {
+            return L"";
+        }
+
+        return modulePath;
+    }
+
+    std::vector<std::wstring> GetShaderSearchDirectories()
+    {
+        std::vector<std::wstring> directories;
+        std::wstring effectiveShaderDirectory = shaderDirectory.empty() ? L"Shaders" : shaderDirectory;
+
+        if (effectiveShaderDirectory.empty())
+        {
+            return directories;
+        }
+
+        if (PathIsRelativeW(effectiveShaderDirectory.c_str()))
+        {
+            std::wstring configShaderDirectory = CombinePath(confpath, effectiveShaderDirectory);
+            if (!configShaderDirectory.empty())
+            {
+                directories.push_back(configShaderDirectory);
+            }
+
+            std::wstring moduleDirectory = GetModuleDirectory();
+            if (!moduleDirectory.empty())
+            {
+                std::wstring moduleShaderDirectory = CombinePath(moduleDirectory, effectiveShaderDirectory);
+                if (!moduleShaderDirectory.empty() &&
+                    std::find(directories.begin(), directories.end(), moduleShaderDirectory) == directories.end())
+                {
+                    directories.push_back(moduleShaderDirectory);
+                }
+            }
+        }
+        else
+        {
+            directories.push_back(effectiveShaderDirectory);
+        }
+
+        return directories;
+    }
+
+    std::vector<std::wstring> EnumerateShaderFiles(const std::wstring& directory)
+    {
+        std::vector<std::wstring> shaderFiles;
+        if (directory.empty())
+        {
+            return shaderFiles;
+        }
+
+        std::wstring searchPattern = CombinePath(directory, L"*");
+        if (searchPattern.empty())
+        {
+            return shaderFiles;
+        }
+
+        WIN32_FIND_DATAW findData = {};
+        HANDLE findHandle = FindFirstFileW(searchPattern.c_str(), &findData);
+        if (findHandle == INVALID_HANDLE_VALUE)
+        {
+            return shaderFiles;
+        }
+
+        do
+        {
+            if ((findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0)
+            {
+                continue;
+            }
+
+            const wchar_t* extension = PathFindExtensionW(findData.cFileName);
+            if (IsSupportedShaderExtension(extension))
+            {
+                std::wstring shaderPath = CombinePath(directory, findData.cFileName);
+                if (!shaderPath.empty())
+                {
+                    shaderFiles.push_back(shaderPath);
+                }
+            }
+        } while (FindNextFileW(findHandle, &findData));
+
+        FindClose(findHandle);
+        std::sort(shaderFiles.begin(), shaderFiles.end());
+        return shaderFiles;
+    }
+
+    bool ResolveShaderPath(std::wstring& resolvedPath)
+    {
+        resolvedPath.clear();
+
+        // When a shader file is configured it is the only acceptable answer. Falling back to
+        // whichever .hlsl happens to sort first made a deleted or renamed file silently switch
+        // the driver to a different shader, which is far harder to diagnose than an error.
+        if (!shaderFile.empty())
+        {
+            if (!PathIsRelativeW(shaderFile.c_str()) && PathFileExistsW(shaderFile.c_str()))
+            {
+                resolvedPath = shaderFile;
+                return true;
+            }
+
+            for (const auto& directory : GetShaderSearchDirectories())
+            {
+                std::wstring candidatePath = CombinePath(directory, shaderFile);
+                if (!candidatePath.empty() && PathFileExistsW(candidatePath.c_str()))
+                {
+                    resolvedPath = candidatePath;
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        // No file configured: pick the first supported shader found in the search path.
+        for (const auto& directory : GetShaderSearchDirectories())
+        {
+            std::vector<std::wstring> files = EnumerateShaderFiles(directory);
+            if (!files.empty())
+            {
+                resolvedPath = files.front();
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    bool ReadBinaryFile(const std::wstring& path, std::vector<BYTE>& data)
+    {
+        std::ifstream file(path, std::ios::binary | std::ios::ate);
+        if (!file)
+        {
+            return false;
+        }
+
+        std::streamsize size = file.tellg();
+        file.seekg(0, std::ios::beg);
+        if (size <= 0)
+        {
+            data.clear();
+            return false;
+        }
+
+        data.resize(static_cast<size_t>(size));
+        return file.read(reinterpret_cast<char*>(data.data()), size).good();
+    }
+
+    HRESULT EnsureShaderStaticResources(Direct3DDevice& device, ShaderRenderState& state)
+    {
+        if (state.VertexShader && state.SamplerState && state.ConstantBuffer)
+        {
+            return S_OK;
+        }
+
+        if (!g_HlslCompiler.EnsureLoaded())
+        {
+            if (!state.CompilerUnavailableLogged)
+            {
+                state.CompilerUnavailableLogged = true;
+                vddlog("w", "D3DCOMPILER_47.dll is not available; runtime HLSL compilation is disabled. "
+                             "Pre-compiled .cso shaders also require it to be present.");
+            }
+            return HRESULT_FROM_WIN32(ERROR_MOD_NOT_FOUND);
+        }
+
+        static const char* fullscreenTriangleShader = R"(
+struct VSOutput
+{
+    float4 position : SV_POSITION;
+    float2 texcoord : TEXCOORD0;
+};
+
+VSOutput VSMain(uint vertexId : SV_VertexID)
+{
+    float2 positions[3] =
+    {
+        float2(-1.0f, -1.0f),
+        float2(-1.0f,  3.0f),
+        float2( 3.0f, -1.0f)
+    };
+
+    float2 texcoords[3] =
+    {
+        float2(0.0f, 1.0f),
+        float2(0.0f, -1.0f),
+        float2(2.0f, 1.0f)
+    };
+
+    VSOutput output;
+    output.position = float4(positions[vertexId], 0.0f, 1.0f);
+    output.texcoord = texcoords[vertexId];
+    return output;
+}
+)";
+
+        if (!state.VertexShader)
+        {
+            ComPtr<ID3DBlob> vertexShaderBlob;
+            ComPtr<ID3DBlob> errorBlob;
+            HRESULT hr = g_HlslCompiler.Compile(
+                fullscreenTriangleShader,
+                strlen(fullscreenTriangleShader),
+                nullptr,
+                nullptr,
+                nullptr,
+                "VSMain",
+                "vs_5_0",
+                D3DCOMPILE_ENABLE_STRICTNESS,
+                0,
+                &vertexShaderBlob,
+                &errorBlob);
+
+            if (FAILED(hr))
+            {
+                if (errorBlob)
+                {
+                    vddlog("e", static_cast<const char*>(errorBlob->GetBufferPointer()));
+                }
+                return hr;
+            }
+
+            hr = device.Device->CreateVertexShader(
+                vertexShaderBlob->GetBufferPointer(),
+                vertexShaderBlob->GetBufferSize(),
+                nullptr,
+                &state.VertexShader);
+
+            if (FAILED(hr))
+            {
+                return hr;
+            }
+        }
+
+        if (!state.SamplerState)
+        {
+            D3D11_SAMPLER_DESC samplerDesc = {};
+            samplerDesc.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+            samplerDesc.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
+            samplerDesc.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
+            samplerDesc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+            samplerDesc.MaxLOD = D3D11_FLOAT32_MAX;
+
+            HRESULT hr = device.Device->CreateSamplerState(&samplerDesc, &state.SamplerState);
+            if (FAILED(hr))
+            {
+                return hr;
+            }
+        }
+
+        if (!state.ConstantBuffer)
+        {
+            D3D11_BUFFER_DESC bufferDesc = {};
+            bufferDesc.ByteWidth = sizeof(ShaderConstantBufferData);
+            bufferDesc.Usage = D3D11_USAGE_DEFAULT;
+            bufferDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+
+            HRESULT hr = device.Device->CreateBuffer(&bufferDesc, nullptr, &state.ConstantBuffer);
+            if (FAILED(hr))
+            {
+                return hr;
+            }
+        }
+
+        return S_OK;
+    }
+
+    HRESULT LoadPixelShaderFromDisk(Direct3DDevice& device, ShaderRenderState& state, const std::wstring& shaderPath)
+    {
+        if (shaderPath.empty())
+        {
+            return E_INVALIDARG;
+        }
+
+        const wchar_t* extension = PathFindExtensionW(shaderPath.c_str());
+        ComPtr<ID3D11PixelShader> pixelShader;
+        HRESULT hr = E_FAIL;
+
+        if (extension != nullptr && _wcsicmp(extension, L".cso") == 0)
+        {
+            std::vector<BYTE> shaderBytecode;
+            if (!ReadBinaryFile(shaderPath, shaderBytecode) || shaderBytecode.empty())
+            {
+                return HRESULT_FROM_WIN32(ERROR_READ_FAULT);
+            }
+
+            hr = device.Device->CreatePixelShader(
+                shaderBytecode.data(),
+                shaderBytecode.size(),
+                nullptr,
+                &pixelShader);
+        }
+        else
+        {
+            if (!g_HlslCompiler.EnsureLoaded())
+            {
+                return HRESULT_FROM_WIN32(ERROR_MOD_NOT_FOUND);
+            }
+
+            const char* entryPoints[] = { "PSMain", "main" };
+            for (const char* entryPoint : entryPoints)
+            {
+                ComPtr<ID3DBlob> shaderBlob;
+                ComPtr<ID3DBlob> errorBlob;
+
+                hr = g_HlslCompiler.CompileFromFile(
+                    shaderPath.c_str(),
+                    nullptr,
+                    D3D_COMPILE_STANDARD_FILE_INCLUDE,
+                    entryPoint,
+                    "ps_5_0",
+                    D3DCOMPILE_ENABLE_STRICTNESS,
+                    0,
+                    &shaderBlob,
+                    &errorBlob);
+
+                if (SUCCEEDED(hr))
+                {
+                    hr = device.Device->CreatePixelShader(
+                        shaderBlob->GetBufferPointer(),
+                        shaderBlob->GetBufferSize(),
+                        nullptr,
+                        &pixelShader);
+                    if (SUCCEEDED(hr))
+                    {
+                        break;
+                    }
+                }
+                else if (errorBlob)
+                {
+                    vddlog("e", static_cast<const char*>(errorBlob->GetBufferPointer()));
+                }
+            }
+        }
+
+        if (FAILED(hr))
+        {
+            return hr;
+        }
+
+        state.PixelShader = pixelShader;
+        state.LoadedShaderPath = shaderPath;
+        state.LoadedShaderTimestamp = QueryFileTimestamp(shaderPath);
+
+        std::string logMessage = "Loaded runtime shader: " + WStringToString(shaderPath);
+        vddlog("i", logMessage.c_str());
+        return S_OK;
+    }
+
+    HRESULT EnsureShaderTextures(Direct3DDevice& device, ShaderRenderState& state, const D3D11_TEXTURE2D_DESC& sourceDesc)
+    {
+        // CopyResource requires identical descriptors on both ends, and the targets below are
+        // forced to single-mip / single-sample / single-array. If the acquired surface does not
+        // already have that shape, the write-back would fail on every single frame and the
+        // shader would look enabled while doing nothing. Refuse up front and say so instead.
+        if (sourceDesc.MipLevels != 1 || sourceDesc.ArraySize != 1 || sourceDesc.SampleDesc.Count != 1)
+        {
+            return E_NOTIMPL;
+        }
+
+        if (state.InputTexture &&
+            state.OutputTexture &&
+            state.TextureWidth == sourceDesc.Width &&
+            state.TextureHeight == sourceDesc.Height &&
+            state.TextureFormat == sourceDesc.Format)
+        {
+            return S_OK;
+        }
+
+        DXGI_FORMAT shaderViewFormat = GetShaderViewFormat(sourceDesc.Format);
+        if (shaderViewFormat == DXGI_FORMAT_UNKNOWN)
+        {
+            return E_INVALIDARG;
+        }
+
+        state.InputTexture.Reset();
+        state.InputView.Reset();
+        state.OutputTexture.Reset();
+        state.OutputView.Reset();
+
+        D3D11_TEXTURE2D_DESC inputDesc = sourceDesc;
+        inputDesc.MipLevels = 1;
+        inputDesc.ArraySize = 1;
+        inputDesc.SampleDesc.Count = 1;
+        inputDesc.SampleDesc.Quality = 0;
+        inputDesc.Usage = D3D11_USAGE_DEFAULT;
+        inputDesc.CPUAccessFlags = 0;
+        inputDesc.MiscFlags = 0;
+        inputDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+
+        HRESULT hr = device.Device->CreateTexture2D(&inputDesc, nullptr, &state.InputTexture);
+        if (FAILED(hr))
+        {
+            return hr;
+        }
+
+        D3D11_SHADER_RESOURCE_VIEW_DESC shaderResourceViewDesc = {};
+        shaderResourceViewDesc.Format = shaderViewFormat;
+        shaderResourceViewDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+        shaderResourceViewDesc.Texture2D.MostDetailedMip = 0;
+        shaderResourceViewDesc.Texture2D.MipLevels = 1;
+
+        hr = device.Device->CreateShaderResourceView(
+            state.InputTexture.Get(),
+            &shaderResourceViewDesc,
+            &state.InputView);
+        if (FAILED(hr))
+        {
+            return hr;
+        }
+
+        D3D11_TEXTURE2D_DESC outputDesc = inputDesc;
+        outputDesc.BindFlags = D3D11_BIND_RENDER_TARGET;
+
+        hr = device.Device->CreateTexture2D(&outputDesc, nullptr, &state.OutputTexture);
+        if (FAILED(hr))
+        {
+            return hr;
+        }
+
+        D3D11_RENDER_TARGET_VIEW_DESC renderTargetViewDesc = {};
+        renderTargetViewDesc.Format = shaderViewFormat;
+        renderTargetViewDesc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+        renderTargetViewDesc.Texture2D.MipSlice = 0;
+
+        hr = device.Device->CreateRenderTargetView(
+            state.OutputTexture.Get(),
+            &renderTargetViewDesc,
+            &state.OutputView);
+        if (FAILED(hr))
+        {
+            return hr;
+        }
+
+        state.TextureWidth = sourceDesc.Width;
+        state.TextureHeight = sourceDesc.Height;
+        state.TextureFormat = sourceDesc.Format;
+        return S_OK;
+    }
+
+    HRESULT EnsureShaderPipelineReady(Direct3DDevice& device, ShaderRenderState& state, const D3D11_TEXTURE2D_DESC& sourceDesc)
+    {
+        if (!shaderRendererEnabled)
+        {
+            return S_FALSE;
+        }
+
+        if (state.Disabled)
+        {
+            return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
+        }
+
+        HRESULT hr = EnsureShaderStaticResources(device, state);
+        if (FAILED(hr))
+        {
+            return hr;
+        }
+
+        // Resolving the shader touches the file system and hot reload stats the file. Doing
+        // that once per frame puts a syscall per frame inside the most performance critical
+        // section of the driver, and when the file was missing it scanned the whole directory
+        // every frame. Re-check on a timer instead; hot reload stays within a second.
+        ULONGLONG now = GetTickCount64();
+        if (state.NextShaderScanTick == 0 || now >= state.NextShaderScanTick)
+        {
+            state.NextShaderScanTick = now + 1000;
+
+            std::wstring resolvedShaderPath;
+            bool foundShader = ResolveShaderPath(resolvedShaderPath);
+
+            if (!foundShader)
+            {
+                if (state.NextMissingShaderLogTick == 0 || now - state.NextMissingShaderLogTick > 5000)
+                {
+                    state.NextMissingShaderLogTick = now;
+                    if (!shaderFile.empty())
+                    {
+                        std::string message = "Shader renderer enabled but the configured shader file was not found: "
+                            + WStringToString(shaderFile);
+                        vddlog("w", message.c_str());
+                    }
+                    else
+                    {
+                        vddlog("w", "Shader renderer enabled but no .hlsl or .cso file was found in the shader directory.");
+                    }
+                }
+
+                if (!state.PixelShader)
+                {
+                    return HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND);
+                }
+            }
+            else
+            {
+                ULONGLONG shaderTimestamp = QueryFileTimestamp(resolvedShaderPath);
+                bool needsReload =
+                    !state.PixelShader ||
+                    _wcsicmp(state.LoadedShaderPath.c_str(), resolvedShaderPath.c_str()) != 0 ||
+                    (shaderHotReload && shaderTimestamp != 0 && shaderTimestamp != state.LoadedShaderTimestamp);
+
+                if (needsReload)
+                {
+                    hr = LoadPixelShaderFromDisk(device, state, resolvedShaderPath);
+                    if (FAILED(hr))
+                    {
+                        std::string logMessage = "Failed to load shader: " + WStringToString(resolvedShaderPath);
+                        vddlog("e", logMessage.c_str());
+                    }
+                }
+            }
+        }
+
+        hr = EnsureShaderTextures(device, state, sourceDesc);
+        if (hr == E_NOTIMPL && !state.Disabled)
+        {
+            // The acquired surface cannot round-trip through this pipeline. Latch it off so the
+            // hot path stops re-discovering the same incompatibility on every frame.
+            state.Disabled = true;
+            vddlog("w", "Acquired surface is not compatible with the runtime shader pipeline "
+                        "(multi-mip, array or multisampled). Shader rendering disabled for this swap chain.");
+        }
+
+        return hr;
+    }
+
+    HRESULT ApplyConfiguredShader(Direct3DDevice& device, ShaderRenderState& state, ID3D11Texture2D* sourceTexture)
+    {
+        if (!shaderRendererEnabled || sourceTexture == nullptr)
+        {
+            return S_FALSE;
+        }
+
+        D3D11_TEXTURE2D_DESC sourceDesc = {};
+        sourceTexture->GetDesc(&sourceDesc);
+
+        HRESULT hr = EnsureShaderPipelineReady(device, state, sourceDesc);
+        if (FAILED(hr))
+        {
+            return hr;
+        }
+
+        // ID3D11DeviceContext::CopyResource returns void, so a failed copy cannot be detected
+        // from its return value. That is exactly why EnsureShaderTextures refuses surfaces whose
+        // descriptor cannot round-trip: validating the shape up front is the only guard that
+        // keeps a silent no-op out of the swap chain.
+        device.DeviceContext->CopyResource(state.InputTexture.Get(), sourceTexture);
+
+        ShaderConstantBufferData shaderData = {};
+        shaderData.resolution[0] = static_cast<float>(sourceDesc.Width);
+        shaderData.resolution[1] = static_cast<float>(sourceDesc.Height);
+        shaderData.time = std::chrono::duration<float>(std::chrono::steady_clock::now() - g_ShaderStartTime).count();
+        shaderData.param0 = static_cast<float>(shaderParam0);
+
+        device.DeviceContext->UpdateSubresource(state.ConstantBuffer.Get(), 0, nullptr, &shaderData, 0, 0);
+
+        D3D11_VIEWPORT viewport = {};
+        viewport.TopLeftX = 0.0f;
+        viewport.TopLeftY = 0.0f;
+        viewport.Width = static_cast<float>(sourceDesc.Width);
+        viewport.Height = static_cast<float>(sourceDesc.Height);
+        viewport.MinDepth = 0.0f;
+        viewport.MaxDepth = 1.0f;
+
+        ID3D11RenderTargetView* renderTargets[] = { state.OutputView.Get() };
+        ID3D11Buffer* constantBuffers[] = { state.ConstantBuffer.Get() };
+        ID3D11SamplerState* samplers[] = { state.SamplerState.Get() };
+        ID3D11ShaderResourceView* shaderResources[] = { state.InputView.Get() };
+        ID3D11ShaderResourceView* nullShaderResources[] = { nullptr };
+
+        device.DeviceContext->OMSetRenderTargets(1, renderTargets, nullptr);
+        device.DeviceContext->RSSetViewports(1, &viewport);
+        device.DeviceContext->IASetInputLayout(nullptr);
+        device.DeviceContext->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        device.DeviceContext->VSSetShader(state.VertexShader.Get(), nullptr, 0);
+        device.DeviceContext->PSSetShader(state.PixelShader.Get(), nullptr, 0);
+        device.DeviceContext->PSSetConstantBuffers(0, 1, constantBuffers);
+        device.DeviceContext->PSSetSamplers(0, 1, samplers);
+        device.DeviceContext->PSSetShaderResources(0, 1, shaderResources);
+        device.DeviceContext->Draw(3, 0);
+        device.DeviceContext->PSSetShaderResources(0, 1, nullShaderResources);
+
+        device.DeviceContext->CopyResource(sourceTexture, state.OutputTexture.Get());
+        return S_OK;
+    }
 }
 
 // === EDID PROFILE LOADING FUNCTION ===
@@ -1639,9 +2360,12 @@ extern "C" BOOL WINAPI DllMain(
 	_In_ UINT dwReason,
 	_In_opt_ LPVOID lpReserved)
 {
-	UNREFERENCED_PARAMETER(hInstance);
 	UNREFERENCED_PARAMETER(lpReserved);
-	UNREFERENCED_PARAMETER(dwReason);
+
+	if (dwReason == DLL_PROCESS_ATTACH)
+	{
+		g_ModuleInstance = hInstance;
+	}
 
 	return TRUE;
 }
@@ -2432,6 +3156,23 @@ extern "C" NTSTATUS DriverEntry(
 	HDRCOLOUR = HDRPlus ? IDDCX_BITS_PER_COMPONENT_12 : IDDCX_BITS_PER_COMPONENT_10;
 	SDRCOLOUR = SDR10 ? IDDCX_BITS_PER_COMPONENT_10 : IDDCX_BITS_PER_COMPONENT_8;
 	ColourFormat = GetStringSetting(L"ColourFormat");
+
+	//Shaders
+	shaderRendererEnabled = EnabledQuery(L"ShaderRendererEnabled");
+	shaderHotReload = EnabledQuery(L"ShaderHotReload");
+	shaderDirectory = GetStringSetting(L"ShaderDirectory");
+	if (shaderDirectory.empty()) {
+		shaderDirectory = L"Shaders";
+	}
+	shaderFile = GetStringSetting(L"ShaderFile");
+	shaderParam0 = GetDoubleSetting(L"ShaderParam0");
+
+	if (shaderRendererEnabled && PathIsRelativeW(shaderDirectory.c_str())) {
+		std::wstring shaderRoot = CombinePath(confpath, shaderDirectory);
+		if (!shaderRoot.empty() && !CreateDirectoryW(shaderRoot.c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS) {
+			vddlog("w", "Failed to create configured shader directory.");
+		}
+	}
 
 	//Cursor
 	hardwareCursor = EnabledQuery(L"HardwareCursorEnabled");
@@ -3385,16 +4126,24 @@ void SwapChainProcessor::RunCore()
 			
 			AcquiredBuffer.Attach(pSurface);
 
-			// ==============================
-			// TODO: Process the frame here
-			//
-			// This is the most performance-critical section of code in an IddCx driver. It's important that whatever
-			// is done with the acquired surface be finished as quickly as possible. This operation could be:
-			//  * a GPU copy to another buffer surface for later processing (such as a staging surface for mapping to CPU memory)
-			//  * a GPU encode operation
-			//  * a GPU VPBlt to another surface
-			//  * a GPU custom compute shader encode operation
-			// ==============================
+			// This is the most performance-critical section of code in an IddCx driver. Whatever is
+			// done with the acquired surface has to finish as fast as possible. The optional runtime
+			// shader adds two full-frame copies plus one fullscreen pass; it is off by default and
+			// disabled per swap chain as soon as the surface cannot round-trip through the pipeline.
+			ComPtr<ID3D11Texture2D> sourceTexture;
+			HRESULT textureHr = AcquiredBuffer.As(&sourceTexture);
+			if (SUCCEEDED(textureHr))
+			{
+				HRESULT shaderHr = ApplyConfiguredShader(*m_Device, m_Shader, sourceTexture.Get());
+				if (FAILED(shaderHr) &&
+					shaderHr != HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND) &&
+					shaderHr != HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED))
+				{
+					logStream.str("");
+					logStream << "Shader processing failed. HRESULT: " << shaderHr;
+					vddlog("w", logStream.str().c_str());
+				}
+			}
 
 			AcquiredBuffer.Reset();
 			//vddlog("d", "Reset buffer");

@@ -256,7 +256,9 @@
       <FileDigestAlgorithm>SHA1</FileDigestAlgorithm>
     </DriverSign>
     <PostBuildEvent>
-      <Command>copy "$(ProjectDir)..\vdd_settings.xml" "$(TargetDir)\MttVDD"</Command>
+      <Command>copy "$(ProjectDir)..\vdd_settings.xml" "$(TargetDir)\MttVDD"
+if not exist "$(TargetDir)\MttVDD\Shaders" mkdir "$(TargetDir)\MttVDD\Shaders"
+copy "$(ProjectDir)..\..\Common\Include\Shaders\*.hlsl" "$(TargetDir)\MttVDD\Shaders"</Command>
     </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
@@ -277,7 +279,9 @@
       <FileDigestAlgorithm>SHA256</FileDigestAlgorithm>
     </DriverSign>
     <PostBuildEvent>
-      <Command>copy "$(ProjectDir)..\vdd_settings.xml" "$(TargetDir)\MttVDD"</Command>
+      <Command>copy "$(ProjectDir)..\vdd_settings.xml" "$(TargetDir)\MttVDD"
+if not exist "$(TargetDir)\MttVDD\Shaders" mkdir "$(TargetDir)\MttVDD\Shaders"
+copy "$(ProjectDir)..\..\Common\Include\Shaders\*.hlsl" "$(TargetDir)\MttVDD\Shaders"</Command>
     </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|ARM'">
@@ -322,7 +326,9 @@
       <FileDigestAlgorithm>SHA1</FileDigestAlgorithm>
     </DriverSign>
     <PostBuildEvent>
-      <Command>copy "$(ProjectDir)..\vdd_settings.xml" "$(TargetDir)\MttVDD"</Command>
+      <Command>copy "$(ProjectDir)..\vdd_settings.xml" "$(TargetDir)\MttVDD"
+if not exist "$(TargetDir)\MttVDD\Shaders" mkdir "$(TargetDir)\MttVDD\Shaders"
+copy "$(ProjectDir)..\..\Common\Include\Shaders\*.hlsl" "$(TargetDir)\MttVDD\Shaders"</Command>
     </PostBuildEvent>
     <Inf>
       <DateStamp>10/16/2024</DateStamp>
@@ -346,7 +352,9 @@
       <FileDigestAlgorithm>SHA256</FileDigestAlgorithm>
     </DriverSign>
     <PostBuildEvent>
-      <Command>copy "$(ProjectDir)..\vdd_settings.xml" "$(TargetDir)\MttVDD"</Command>
+      <Command>copy "$(ProjectDir)..\vdd_settings.xml" "$(TargetDir)\MttVDD"
+if not exist "$(TargetDir)\MttVDD\Shaders" mkdir "$(TargetDir)\MttVDD\Shaders"
+copy "$(ProjectDir)..\..\Common\Include\Shaders\*.hlsl" "$(TargetDir)\MttVDD\Shaders"</Command>
     </PostBuildEvent>
     <Inf>
       <DateStamp>10/16/2024</DateStamp>
