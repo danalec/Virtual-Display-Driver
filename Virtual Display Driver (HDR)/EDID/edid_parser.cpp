@@ -345,9 +345,16 @@ private:
     void parse_cea_extension(const uint8_t* cea_block) {
         if (cea_block[0] != 0x02) return; // Not a CEA extension
         
+        // dtd_start is a byte read straight out of the EDID file, and a CEA extension block is
+        // only 128 bytes. Checking the lower bound alone is not enough: a value above 127 sends
+        // both loops below past the end of the block. The caller guarantees 128 bytes are
+        // present and not one byte more.
         uint8_t dtd_start = cea_block[2];
-        if (dtd_start < 4) return;
-        
+        if (dtd_start < 4 || dtd_start > 127) {
+            std::cout << "ERROR: DTD start offset " << (int)dtd_start
+                      << " is outside the 4..127 range of a CEA extension block" << std::endl;
+            return;
+        }        
         std::cout << "=== CEA Extension Block Debug ===" << std::endl;
         std::cout << "CEA revision: " << (int)cea_block[1] << std::endl;
         std::cout << "DTD start offset: " << (int)dtd_start << std::endl;
