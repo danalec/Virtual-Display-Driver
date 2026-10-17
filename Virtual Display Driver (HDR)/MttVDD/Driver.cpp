@@ -3248,7 +3248,13 @@ void SwapChainProcessor::Run()
 	/*
 	AvRevertMmThreadCharacteristics(AvTaskHandle);
 	*/ //error handling when reversing multimedia thread characteristics 
-	if (AvRevertMmThreadCharacteristics(AvTaskHandle))
+	if (!AvTaskHandle)
+	{
+		logStream.str("");
+		logStream << "Skipping revert: multimedia thread characteristics were never set.";
+		vddlog("d", logStream.str().c_str());
+	}
+	else if (AvRevertMmThreadCharacteristics(AvTaskHandle))
 	{
 		logStream.str(""); 
 		logStream << "Multimedia thread characteristics reverted successfully.";
@@ -3832,7 +3838,13 @@ void IndirectDeviceContext::CreateMonitor(unsigned int index) {
 	// ==============================
 
 	// Create a container ID
-	CoCreateGuid(&MonitorInfo.MonitorContainerId);
+	HRESULT hrContainerId = CoCreateGuid(&MonitorInfo.MonitorContainerId);
+	if (FAILED(hrContainerId)) {
+		// MonitorInfo is zero-initialised, so MonitorContainerId would stay GUID_NULL
+		// and be handed to IddCxMonitorCreate as if it were valid. Bail out instead.
+		vddlog("e", "Failed to create container ID for monitor, skipping monitor creation");
+		return;
+	}
 	vddlog("d", "Created container ID");
 
 	IDARG_IN_MONITORCREATE MonitorCreate = {};
