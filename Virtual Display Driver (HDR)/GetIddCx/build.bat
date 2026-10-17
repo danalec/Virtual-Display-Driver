@@ -1,25 +1,52 @@
 @echo off
+setlocal
+
 echo Building IddCx Version Query Tool...
 echo.
 
-if exist "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat" (
-    call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"
-    cl /EHsc IddCxVersionQuery.cpp /Fe:IddCxVersionQuery.exe
-) else if exist "C:\Program Files (x86)\Microsoft Visual Studio\2019\Community\VC\Auxiliary\Build\vcvars64.bat" (
-    call "C:\Program Files (x86)\Microsoft Visual Studio\2019\Community\VC\Auxiliary\Build\vcvars64.bat"
-    cl /EHsc IddCxVersionQuery.cpp /Fe:IddCxVersionQuery.exe
-) else (
-    echo Visual Studio not found. Trying g++...
-    g++ -std=c++11 -o IddCxVersionQuery.exe IddCxVersionQuery.cpp
+rem Locate any Visual Studio with the x64 C++ toolset via vswhere, instead of probing a
+rem hardcoded list of editions and years that misses whatever is actually installed.
+rem It used to check VS 2022 Community and VS 2019 Community only, so VS 2026 fell
+rem through to a g++ fallback that cannot possibly work: IddCxVersionQuery.cpp includes
+rem <windows.h> and uses ULONG/DWORD.
+
+set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
+set "VSPATH="
+
+if exist "%VSWHERE%" (
+    for /f "usebackq tokens=*" %%i in (`"%VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSPATH=%%i"
 )
 
-if exist IddCxVersionQuery.exe (
-    echo.
-    echo Build successful! Run IddCxVersionQuery.exe to check IddCx version.
-) else (
-    echo.
-    echo Build failed. Please ensure you have a C++ compiler installed.
-    echo You can install Visual Studio Community or MinGW-w64.
+if not defined VSPATH (
+    echo ERROR: No Visual Studio installation with the x64 C++ toolset was found.
+    echo        Install the "Desktop development with C++" workload, then run this again.
+    exit /b 1
 )
 
-pause
+set "VCVARS=%VSPATH%\VC\Auxiliary\Build\vcvars64.bat"
+if not exist "%VCVARS%" (
+    echo ERROR: vcvars64.bat not found under: %VSPATH%
+    exit /b 1
+)
+
+echo Using Visual Studio at: %VSPATH%
+call "%VCVARS%" >nul
+if errorlevel 1 (
+    echo ERROR: vcvars64.bat failed to initialise the build environment.
+    exit /b 1
+)
+
+pushd "%~dp0"
+cl /nologo /EHsc /std:c++17 IddCxVersionQuery.cpp /Fe:IddCxVersionQuery.exe
+set "BUILD_RC=%ERRORLEVEL%"
+popd
+
+if not "%BUILD_RC%"=="0" (
+    echo.
+    echo Build FAILED.
+    exit /b %BUILD_RC%
+)
+
+echo.
+echo Build successful! Run IddCxVersionQuery.exe to check the IddCx version.
+exit /b 0

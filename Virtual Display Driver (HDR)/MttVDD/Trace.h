@@ -2,7 +2,7 @@
 
 Module Name:
 
-    Internal.h
+    Trace.h
 
 Abstract:
 

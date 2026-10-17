@@ -22,6 +22,15 @@ bld/
 [Bb]in/
 [Oo]bj/
 
+# ARM64 build output is not matched by [Xx]64/ above (that pattern covers
+# x64/X64 only); ARM64 was previously covered only by accident, via [Rr]elease/.
+ARM64/
+
+# Standalone helper tools are built from the sources in the tree
+# (GetIddCx/build.bat and the EDID profile generator); keep their binaries out.
+Virtual Display Driver (HDR)/GetIddCx/*.exe
+Virtual Display Driver (HDR)/EDID/*.exe
+
 # Visual Studio 2015 cache/options directory
 .vs/
 # Uncomment if you have tasks that create the project's static files in wwwroot

@@ -11,6 +11,15 @@ if (-Not ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdent
 # install dependencies if required
 . "$PSScriptRoot\set-dependencies.ps1"
 
+$ErrorActionPreference = 'Stop';
+# Version 1.0 on purpose, not Latest: it enforces one rule -- an unassigned variable
+# raises instead of silently binding $null -- and that is exactly the rule that
+# catches the $rate class of bug. An AST sweep of all 12 helpers found 0 uninitialized
+# reads, so enabling it cannot regress anything that works today. Do NOT raise to
+# 2.0/Latest without auditing property access first: 2.0 also throws on a missing
+# property, and $monitor.LogicalDisplay.DeviceName in get_disp_num.ps1 does.
+Set-StrictMode -Version 1.0;
+
 $profi = Get-DisplayProfile
 
 if ( $profi -eq "Extend" ) {
@@ -21,3 +30,6 @@ if ( $profi -eq "Clone" ) {
     Set-DisplayProfile Extend
 	break
 }
+
+# Neither profile matched: say so instead of exiting silently.
+Write-Error "Current display profile is '$profi', which is neither Extend nor Clone. Nothing was changed.";

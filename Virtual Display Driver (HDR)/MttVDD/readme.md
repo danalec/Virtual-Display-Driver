@@ -1,14 +1,23 @@
-# Get 5 virtual monitors for the price of zero!
+# MttVDD
 
-# Steps (for experienced pros only!!!)
+The indirect display driver project. For the supported installation path, see the
+[repository README](../../README.md) — the easiest route is the Virtual Driver Control app.
+
+## Manual installation (for experienced pros only)
+
 1. Download the latest release as a zip file.
+2. Open Device Manager, click on any device, then use the **Action** menu → **Add Legacy Hardware**.
+3. Select "Add hardware from a list (Advanced)" and then **Display adapters**.
+4. Click **Have Disk...** → **Browse...**, navigate to the extracted files and select `MttVDD.inf`.
+5. Go to display settings to customize the resolution of the virtual displays.
 
-2. As an administrator, Run the *.bat file to add the driver certificate as a trusted root certificate.
+## Note on the driver certificate
 
-3. Don't install the inf. Open device manager, click on any device, then click on the "Action" menu and click "Add Legacy Hardware"
+Earlier revisions of this file told you to "run the `*.bat` file to add the driver certificate as a
+trusted root certificate". **There is no `.bat` in this folder**, and that step is no longer needed
+for release builds: they are code-signed by [SignPath.io](https://signpath.io) with a certificate
+from the [SignPath Foundation](https://signpath.org), so the driver is already trusted.
 
-4. Select "Add hardware from a list (Advanced)" and then select Display adapters
-
-5. Click "Have Disk..." and click the "Browse..." button. Navigate to the extracted files and select the inf file.
-
-6. You are done! Go to display settings to customize the resolution of the additional displays. These displays show up in Oculus and should be able to be streamed from.
+If you built the driver yourself with the WDK, it carries a self-signed test certificate and you do
+need to install that certificate into `Local Machine` → **Trusted Root Certification Authorities**
+yourself. Never commit certificates, private keys, or signing credentials to this repository.

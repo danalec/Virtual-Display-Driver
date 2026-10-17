@@ -2,7 +2,7 @@ name: Bug Report
 description: File a bug report.
 title: "[Bug]: "
 labels: ["bug", "triage"]
-assignees: ["zjoasan", "bud3699", "itsmikethetech"]
+assignees: ["zjoasan", "itsmikethetech"]
 
 body:
   - type: markdown
@@ -29,7 +29,7 @@ body:
     id: Version
     attributes:
       label: Which release?
-      description: What version of Windows are you running?
+      description: Which release of this driver are you running?
       options:
         - 24H2
         - 23H2
