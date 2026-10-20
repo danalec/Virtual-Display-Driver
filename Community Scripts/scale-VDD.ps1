@@ -8,6 +8,18 @@ param(
 	[switch]$reset
 )
 
+# A switch bound as $false is still bound: the caller asked for it to be off. The
+# elevated child cannot be told that. Windows PowerShell 5.1 cannot bind an
+# explicit switch value under -File -- "-reset:False" dies with "Cannot process
+# argument transformation on parameter 'reset'" before the body runs -- and
+# leaving the switch out is not the answer either: the child then falls back to
+# the default parameter set, which asks for a scale the caller never gave. So the
+# case is reported here, where it can be said plainly.
+if ($MyInvocation.BoundParameters.ContainsKey('reset') -and -not $reset.IsPresent) {
+    Write-Error "-reset was turned off explicitly, and there is no scale to apply instead. Pass a scale to set one, or pass -reset on its own to go back to the recommended one."
+    exit 2
+}
+
 # Self-elevate the script if required
 if (-Not ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] 'Administrator')) {
 	if ([int](Get-CimInstance -Class Win32_OperatingSystem | Select-Object -ExpandProperty BuildNumber) -ge 6000) {
