@@ -19,7 +19,7 @@ Write-Output "resolving dependencies"
 # Check if the repository is registered
 if (-not (Get-PSRepository -Name $repo.Name -ErrorAction SilentlyContinue)) {
     Write-Host "PSRepository '$($repo.Name)' cannot be found. Make sure it is available."
-    exit 1
+    throw "set-dependencies.ps1: a required module is missing. See the message above.";
 }
 
 # Trusting a repository is a persistent, user-scoped change, and this file is dot-sourced by
@@ -76,7 +76,7 @@ try {
         else {
             # If the module cannot be found in the online gallery, abort the script.
             Write-Output "Module '$($m.Name)' is not imported, not available on disk, and not found in the online gallery. Cannot run the script."
-            exit 1
+            throw "set-dependencies.ps1: a required module is missing. See the message above.";
         }
     }
     # Save Module for later use

@@ -6,7 +6,7 @@ Anyway here is a short description of each script:
 | Script                 | Description      |
 | ---------------------- | ---------------- |
 | [changeres-VDD.ps1](changeres-VDD.ps1)    | Hot-swaps the virtual panel’s resolution to the width and height you pass on the command line. |
-| [get_disp_num.ps1](get_disp_num.ps1)     | Returns the DeviceName of the first VDD screen by matching the monitor instance name against the driver’s own identity; pass -InstancePattern to override the default. |
+| [get_disp_num.ps1](get_disp_num.ps1)     | Returns the DeviceName of the first VDD screen by matching the monitor instance name against the driver’s own identity; pass -InstancePattern to override the default. The instance name comes from the EDID the display answers with, not from the INF, so the default matches the UID every instance name carries and the script lists the candidates when more than one matches. |
 | [HDRswitch-VDD.ps1](HDRswitch-VDD.ps1)    | Flips the virtual screen between SDR (8-bit) and HDR (10-bit) colour modes in one click. Requires the pinned DisplayConfig module version; `set-dependencies.ps1` enforces it |
 | [modules_install.bat](modules_install.bat)  | Opens an elevated PowerShell session that installs the DisplayConfig and MonitorConfig modules so every helper script has its prerequisites. |
 | [primary-VDD.ps1](primary-VDD.ps1)      | Makes the virtual display the Windows primary so you can stream or remote-desktop from a headless rig. |
@@ -15,6 +15,6 @@ Anyway here is a short description of each script:
 | [scale-VDD.ps1](scale-VDD.ps1)        | Sets or resets DPI scaling on the virtual monitor, respecting Windows’ maximum allowed scale factor. |
 | [set-dependencies.ps1](set-dependencies.ps1) | Verifies the exact module versions required, installs or imports them on demand, and aborts downstream execution if anything is missing. |
 | [silent-install.ps1](silent-install.ps1)   | Silently fetches the latest signed Virtual Display Driver from GitHub and installs it via Nefcon, then tidies up the temp workspace. |
-| [toggle-VDD.ps1](toggle-VDD.ps1)       | A one-click PowerShell switch that first elevates itself to admin, then enables or disables your Virtual Display Driver and immediately flips Windows between Extended and Cloned desktops, perfect for streamers who need to bring a virtual monitor online or offline on demand. |
+| [toggle-VDD.ps1](toggle-VDD.ps1)       | A one-click PowerShell switch that first elevates itself to admin, then enables or disables your Virtual Display Driver, perfect for streamers who need to bring a virtual monitor online or offline on demand. It does not change the desktop topology — [winp-VDD.ps1](winp-VDD.ps1) is the one that flips Windows between Extended and Cloned. |
 | [virtual-driver-manager.ps1](virtual-driver-manager.ps1) | A comprehensive script to manage the Virtual Display Driver. It can install, uninstall, enable, disable, toggle, and check the status of the driver. |
 | [winp-VDD.ps1](winp-VDD.ps1)         | A lightweight companion script that leaves the driver untouched and simply yo-yos Windows between Extend and Clone modes, giving you an instant “presentation toggle” when the virtual display should stay permanently enabled. |

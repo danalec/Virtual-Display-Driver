@@ -221,9 +221,17 @@ try {
         return $device
     }
 
-    #----------------------------------------------------------------------
+    #---------------------------------------------------------------------- 
     # SECTION 5b: HELPER FUNCTION TO PICK THE DRIVER ASSET
-    #----------------------------------------------------------------------
+    #---------------------------------------------------------------------- 
+    # SHA-256 of the driver archives, per release. silent-install.ps1 pins the
+    # same two files for release 25.7.23.
+    $knownDriverHashes = @{
+        '25.7.23' = @{
+            'VirtualDisplayDriver-x86.Driver.Only.zip'   = 'e24210692b442b39af763536330ce78b423f19342b7a7792c26de3944e418b3a'
+            'VirtualDisplayDriver-ARM64.Driver.Only.zip' = 'dcd487161469c726bab60f174a7e7f70ee02afd437cad0d5c0e6755953de5a25'
+        }
+    }
     # The release publishes the driver as "VirtualDisplayDriver-<arch>.Driver.Only.zip".
     # The x86-named asset is the one x64/AMD64 machines use (the name is upstream's);
     # ARM64 has its own. Matching only "x64.zip" - as this script used to - matched no
@@ -247,7 +255,12 @@ try {
         $defaultAsset = $driverAssets | Where-Object { $_.name -like '*-x86.*' } | Select-Object -First 1
         if ($defaultAsset) { return $defaultAsset }
 
-        return ($driverAssets | Select-Object -First 1)
+        # No asset for this architecture. Falling back to the first one would
+        # hand an x64 host the ARM64 package -- the ARM64 asset sorts first by
+        # name -- and a host that cannot load the driver it just installed is
+        # worse than a clear error. The caller reports which assets the
+        # release does have.
+        return $null
     }
 
     #----------------------------------------------------------------------
@@ -400,6 +413,24 @@ try {
             Invoke-WebRequest -Uri $downloadUrl -OutFile $driverZipPath -UseBasicParsing -ErrorAction Stop
             if (-not (Test-Path $driverZipPath)) { throw "Driver archive was not downloaded from: $downloadUrl" }
             Write-Verbose "Driver ZIP file downloaded to $driverZipPath"
+
+            # Verify what was fetched. The DevCon download below is checked
+            # against a hash, and silent-install.ps1 checks all three of its
+            # artifacts; this one did not, which made it the only download in
+            # this file that expanded an archive of unknown provenance. A
+            # release with no hash listed here stops the install and says so.
+            $expectedHash = $null
+            if ($knownDriverHashes.ContainsKey($releaseInfo.tag_name)) {
+                $expectedHash = $knownDriverHashes[$releaseInfo.tag_name][$asset.name]
+            }
+            if (-not $expectedHash) {
+                throw "No known SHA-256 for '$($asset.name)' in release '$($releaseInfo.tag_name)'. This release is newer than the one the hashes were taken from, so the archive cannot be verified. Pin a known release with -DriverVersion, or add the hash to `$knownDriverHashes in this script."
+            }
+            $actualHash = (Get-FileHash -Path $driverZipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($actualHash -ne $expectedHash.ToLowerInvariant()) {
+                throw "The driver archive downloaded from $downloadUrl has SHA-256 $actualHash, expected $expectedHash. The download was not what it claimed to be, and it was not expanded."
+            }
+            Write-Verbose "Driver archive SHA-256 verified: $actualHash"
 
             Expand-Archive -Path $driverZipPath -DestinationPath $tempDir -Force -ErrorAction Stop
             Write-Verbose "Driver archive expanded."

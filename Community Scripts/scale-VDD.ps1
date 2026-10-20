@@ -12,10 +12,25 @@ param(
 if (-Not ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] 'Administrator')) {
 	if ([int](Get-CimInstance -Class Win32_OperatingSystem | Select-Object -ExpandProperty BuildNumber) -ge 6000) {
 		$CommandLine = "-File `"" + $MyInvocation.MyCommand.Path + "`" "
-		$MyInvocation.BoundParameters.GetEnumerator() | ForEach-Object { $CommandLine += "-$($_.Key):$($_.Value) " }
-		Start-Process -WorkingDirectory $PSScriptRoot -FilePath PowerShell.exe -Verb Runas -ArgumentList $CommandLine  
-		exit
-	}
+		# A switch cannot be built from a string under -File: "-reset:True" fails
+		# with "Cannot process argument transformation on parameter 'reset'", and
+		# the elevated child dies before the body runs. Pass the name bare when
+		# it is on, and leave it out when it is off.
+		$MyInvocation.BoundParameters.GetEnumerator() | ForEach-Object {
+		    if ($_.Value -is [System.Management.Automation.SwitchParameter]) {
+		        if ($_.Value.IsPresent) { $CommandLine += "-$($_.Key) " }
+		    }
+		    else {
+		        $CommandLine += "-$($_.Key):$($_.Value) "
+		    }
+		}
+		# Wait for the elevated child and pass its exit code on. Start-Process
+		# without -Wait returns immediately, and a bare exit sets the parent's
+		# exit code to 0 -- so a caller checking $LASTEXITCODE saw success
+		# whether the child had worked or not, and also when the elevation
+		# itself was refused or the child died.
+		$process = Start-Process -WorkingDirectory $PSScriptRoot -FilePath PowerShell.exe -Verb RunAs -ArgumentList $CommandLine -Wait -PassThru
+		exit $process.ExitCode	}
 }
 
 # Install dependencies if required.
@@ -34,14 +49,21 @@ Set-StrictMode -Version 1.0;
 # Throws, with the list of displays it did find, when the driver is not present.
 $disp = Get-VddDisplay
 
-$maxscale = Get-DisplayScale -DisplayId $disp.DisplayId | Select-Object -ExpandProperty MaxScale
 if ( $PSCmdlet.ParameterSetName -eq "UserDefined" ) {
-	Write-Host "Setting scale to $scale"
+	# Only the UserDefined path uses the maximum scale, so only that path asks
+	# for it. The module validates that the display is active and writes an
+	# InactiveDisplay error otherwise -- and a display that is not active is
+	# exactly the state a reset has to work in.
+	$maxscale = Get-DisplayScale -DisplayId $disp.DisplayId | Select-Object -ExpandProperty MaxScale
 	if ( $scale -le $maxscale ) {
+		# Announced only once the value is known to be acceptable. Before, the
+		# console said "Setting scale to 300" and then said it was too large,
+		# which does not tell the user whether anything was applied.
+		Write-Host "Setting scale to $scale"
 		Set-DisplayScale -DisplayId $disp.DisplayId -Scale $scale
 	}
-	else { 
-		Write-Error "Scale percentage $scale is higher than max scale $maxscale" 
+	else {
+		Write-Error "Scale percentage $scale is higher than max scale $maxscale"
 	}
 }
 elseif ( $PSCmdlet.ParameterSetName -eq "Recommended" ) {

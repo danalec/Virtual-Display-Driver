@@ -1,11 +1,27 @@
 param(
     # Instance-name pattern identifying the virtual monitor.
-    # "MTT1337" was an IddSampleDriver leftover that exists nowhere in this project,
-    # so the default follows the driver's own identity instead: the INF DeviceName
-    # "Virtual Display Driver" (MttVDD.inf:71). Override it if your EDID reports
-    # a different monitor description.
+    #
+    # The default was '*Virtual*Display*', justified here as "the INF DeviceName
+    # Virtual Display Driver (MttVDD.inf:71)". That was the wrong premise: the
+    # instance name Get-Monitor reports is derived from the EDID the display
+    # answers with, not from the INF. Its shape is
+    # DISPLAY\<manufacturer><product>\<instance>&UID<n>, and the manufacturer
+    # code comes from bytes 8 and 9 of the EDID. None of the EDIDs in this
+    # repository carries "Virtual" or "Display" there:
+    #
+    #   digihome_edid.bin  0x58 0xB3      lolhero_edid.bin  0x4D 0xD9
+    #   8K240HzHDR.edid    0x05 0xD7      the driver's own  0x36 0x94
+    #
+    # So the pattern could not match the virtual monitor at all. It does not
+    # match a real monitor either, since "Virtual" has to come before
+    # "Display" and the instance name starts with "DISPLAY\".
+    #
+    # The default is now the UID, which every instance name carries -- the
+    # sort key below already depends on it. That finds the display; when more
+    # than one matches, the script says so and lists the candidates, so the
+    # right one can be picked with -InstancePattern.
     [Parameter(Mandatory=$false, Position=0)]
-    [string]$InstancePattern = '*Virtual*Display*'
+    [string]$InstancePattern = '*UID*'
 )
 
 # One-liner to get the logicalname of the first VDD
@@ -47,7 +63,9 @@ if (-not $loadedMonitorConfig) {
 # (a generic DISPLAY\DEFAULTMONITOR-style name is common) sorted as 0 and won -First 1, so the
 # script handed the caller the DeviceName of the wrong display. Disjoint name -> [int]::MaxValue
 # so a nameless instance sorts last instead of first.
-$monitor = Get-Monitor | Where-Object { $_.InstanceName -like $InstancePattern } | Sort-Object { if ($_.InstanceName -match 'UID(\d+)') { [int]$Matches[1] } else { [int]::MaxValue } } | Select-Object -First 1
+$matches = @(Get-Monitor | Where-Object { $_.InstanceName -like $InstancePattern } |
+    Sort-Object { if ($_.InstanceName -match 'UID(\d+)') { [int]$Matches[1] } else { [int]::MaxValue } })
+$monitor = $matches | Select-Object -First 1
 
 if (-not $monitor) {
     Write-Warning "No monitor matched '$InstancePattern'. Run 'Get-Monitor' to list the instance names, then re-run with -InstancePattern <name>."
@@ -58,6 +76,14 @@ if (-not $monitor) {
     exit 1
 }
 else {
+    if ($matches.Count -gt 1) {
+        # The pattern found more than one display, so the one returned may not
+        # be the virtual one. Say so, and show the names, instead of handing
+        # back a DeviceName that may belong to a real monitor.
+        Write-Warning "$($matches.Count) monitors matched '$InstancePattern'; returning the first by UID. Use -InstancePattern to narrow it down:"
+        foreach ($m in $matches) { Write-Warning "  $($m.InstanceName)" }
+    }
+
     $dispnum = $monitor.LogicalDisplay.DeviceName
 
     # Echo the result to the success stream, not to the host. Write-Host does
