@@ -135,7 +135,9 @@ namespace Microsoft
             std::mutex m_ProcessingThreadsMutex;
 
         public:
-            static const DISPLAYCONFIG_VIDEO_SIGNAL_INFO s_KnownMonitorModes[];
+            // The live data is the file-static s_KnownMonitorModes2 in Driver.cpp, together
+    // with s_KnownMonitorModesMutex. This declaration had no definition and no
+    // reference anywhere, so the first odr-use of it would have been an LNK2001.
             static std::vector<BYTE> s_KnownMonitorEdid;
             static std::mutex s_KnownMonitorEdidMutex;
 

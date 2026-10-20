@@ -1,6 +1,7 @@
 #pragma once
 
 #include <wrl/client.h> 	// For ComPtr
+#include <IddCx.h>       	// For IDDCX_ADAPTER, IddCxAdapterSetRenderAdapter
 #include <dxgi.h>       	// For IDXGIAdapter, IDXGIFactory1
 #include <algorithm>    	// For sort
 #include <setupapi.h>
@@ -31,12 +32,12 @@ struct GPUInfo {
 };
 
 // Sort function for GPUs by dedicated video memory
-bool CompareGPUs(const GPUInfo& a, const GPUInfo& b) {
+inline bool CompareGPUs(const GPUInfo& a, const GPUInfo& b) {
     return a.desc.DedicatedVideoMemory > b.desc.DedicatedVideoMemory;
 }
 
 // Get a enumerate list of available GPUs
-vector<GPUInfo> getAvailableGPUs() {
+inline vector<GPUInfo> getAvailableGPUs() {
     vector<GPUInfo> gpus; // Vector to hold all GPU's information
 
     ComPtr<IDXGIFactory1> factory;
@@ -157,7 +158,19 @@ public:
         else {
             string line;
             getline(ifs, line);
-            target_name.assign(line.begin(), line.end());
+            // Decode, do not widen. assign(line.begin(), line.end()) copies one
+            // byte per wchar_t, so a UTF-8 GPU name became a string of
+            // individual code units that never matched the DXGI name, and
+            // findAndSetAdapter fell back to selectBestGPU() -- the user's
+            // explicit choice was dropped with no error.
+            if (!line.empty()) {
+                int needed = MultiByteToWideChar(CP_UTF8, 0, line.c_str(), (int)line.size(), nullptr, 0);
+                if (needed > 0) {
+                    wstring wide(needed, L'\0');
+                    MultiByteToWideChar(CP_UTF8, 0, line.c_str(), (int)line.size(), wide.data(), needed);
+                    target_name = wide;
+                }
+            }
         }
 
         // Find and set the adapter based on the target name
