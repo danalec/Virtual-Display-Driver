@@ -949,6 +949,23 @@ struct VddGammaRamp {
 // === GAMMA AND COLOR SPACE STORAGE ===
 std::map<IDDCX_MONITOR, VddGammaRamp> g_GammaRampStore;
 
+// Locked accessors for the two metadata caches. Every read and write goes through these so a
+// callback running on one IddCx thread cannot observe a map mid-rehash on another.
+bool TryGetGammaRamp(IDDCX_MONITOR monitor, VddGammaRamp& out) {
+	lock_guard<mutex> lock(g_MetadataMutex);
+	auto it = g_GammaRampStore.find(monitor);
+	if (it == g_GammaRampStore.end()) {
+		return false;
+	}
+	out = it->second;
+	return true;
+}
+
+void StoreGammaRamp(IDDCX_MONITOR monitor, const VddGammaRamp& ramp) {
+	lock_guard<mutex> lock(g_MetadataMutex);
+	g_GammaRampStore[monitor] = ramp;
+}
+
 // === COLOR SPACE AND GAMMA CONVERSION FUNCTIONS ===
 
 // Convert gamma value to 3x4 color space transformation matrix
@@ -1100,6 +1117,47 @@ struct VddHdrMetadata {
 // === HDR METADATA STORAGE ===
 std::map<IDDCX_MONITOR, VddHdrMetadata> g_HdrMetadataStore;
 
+// Both caches are keyed by IDDCX_MONITOR, a value the OS hands out afresh on every adapter
+// restart, and the HDR callback only ever added entries. Without this the map grew by one
+// VddHdrMetadata per monitor per restart, and an address the OS later recycled could match an
+// entry left behind by a monitor that no longer exists.
+void ForgetMonitorMetadata(IDDCX_MONITOR monitor) {
+	lock_guard<mutex> lock(g_MetadataMutex);
+	g_HdrMetadataStore.erase(monitor);
+	g_GammaRampStore.erase(monitor);
+}
+
+void ForgetAllMonitorMetadata() {
+	lock_guard<mutex> lock(g_MetadataMutex);
+	g_HdrMetadataStore.clear();
+	g_GammaRampStore.clear();
+}
+bool TryGetHdrMetadata(IDDCX_MONITOR monitor, VddHdrMetadata& out) {
+	lock_guard<mutex> lock(g_MetadataMutex);
+	auto it = g_HdrMetadataStore.find(monitor);
+	if (it == g_HdrMetadataStore.end()) {
+		return false;
+	}
+	out = it->second;
+	return true;
+}
+
+void StoreHdrMetadata(IDDCX_MONITOR monitor, const VddHdrMetadata& metadata) {
+	lock_guard<mutex> lock(g_MetadataMutex);
+	g_HdrMetadataStore[monitor] = metadata;
+}
+
+// The key both caches use for "the profile-level template, before any monitor is assigned".
+IDDCX_MONITOR MetadataTemplateKey() {
+	return reinterpret_cast<IDDCX_MONITOR>(0);
+}
+
+void GetMetadataCacheSizes(size_t& hdrCount, size_t& gammaCount) {
+	lock_guard<mutex> lock(g_MetadataMutex);
+	hdrCount = g_HdrMetadataStore.size();
+	gammaCount = g_GammaRampStore.size();
+}
+
 // === HDR METADATA CONVERSION FUNCTIONS ===
 
 // Convert EDID chromaticity (0.0-1.0) to SMPTE ST.2086 format (0-50000)
@@ -1141,8 +1199,8 @@ VddHdrMetadata ConvertEdidToSmpteMetadata(const EdidProfileData& profile) {
     metadata.min_display_mastering_luminance = ConvertLuminanceToSmpte(profile.minLuminance);
     
     // Use configured content light levels (from vdd_settings.xml)
-    metadata.max_content_light_level = static_cast<UINT16>(maxContentLightLevel);
-    metadata.max_frame_avg_light_level = static_cast<UINT16>(maxFrameAvgLightLevel);
+    metadata.max_content_light_level = ClampToUINT16(maxContentLightLevel);
+    metadata.max_frame_avg_light_level = ClampToUINT16(maxFrameAvgLightLevel);
     
     // Mark as valid if we have HDR10 support
     metadata.isValid = profile.hdr10Supported && hdr10StaticMetadataEnabled;
@@ -1171,8 +1229,8 @@ VddHdrMetadata ConvertManualToSmpteMetadata() {
     metadata.min_display_mastering_luminance = ConvertLuminanceToSmpte(minDisplayMasteringLuminance);
     
     // Use configured content light levels
-    metadata.max_content_light_level = static_cast<UINT16>(maxContentLightLevel);
-    metadata.max_frame_avg_light_level = static_cast<UINT16>(maxFrameAvgLightLevel);
+    metadata.max_content_light_level = ClampToUINT16(maxContentLightLevel);
+    metadata.max_frame_avg_light_level = ClampToUINT16(maxFrameAvgLightLevel);
     
     // Mark as valid if HDR10 metadata is enabled and color primaries are enabled
     metadata.isValid = hdr10StaticMetadataEnabled && colorPrimariesEnabled;
@@ -1596,18 +1654,33 @@ bool ApplyEdidProfile(const EdidProfileData& profile) {
 		}
 	}
 
-	// Apply HDR settings if configured
+	// Apply HDR settings if configured.
+	// overrideManualSettings is the only thing that decides this, and its documented meaning in
+	// vdd_settings.xml is "false = manual settings take priority". Four tests used to sit
+	// alongside it, all meant to read as "unless the user changed this":
+	//
+	//   maxDisplayMasteringLuminance == 1000.0   XML ships 1000.0  -> always true, so a
+	//   minDisplayMasteringLuminance == 0.05     XML ships 0.05    -> configured values were
+	//   primaryColorSpace == L"sRGB"             XML ships sRGB      overwritten by the EDID
+	//                                                                on every load.
+	//   redX == 0.708                            XML ships 0.640   -> false for the shipped
+	//                                                                file, so the guard already
+	//                                                                reduced to the flag. Not a
+	//                                                                live bug: only a user who
+	//                                                                typed exactly 0.708 could
+	//                                                                have made it true.
+	//
+	// Comparing a float to a "default" cannot distinguish a default from a value someone typed,
+	// so the flag is the only honest test. Three of the four were lying; the fourth was noise.
 	if (hdr10StaticMetadataEnabled && profile.hdr10Supported) {
-		if (overrideManualSettings || maxDisplayMasteringLuminance == 1000.0) { // Default value
+		if (overrideManualSettings) {
 			maxDisplayMasteringLuminance = profile.maxLuminance;
-		}
-		if (overrideManualSettings || minDisplayMasteringLuminance == 0.05) { // Default value
 			minDisplayMasteringLuminance = profile.minLuminance;
 		}
 	}
 
 	// Apply color primaries if configured
-	if (colorPrimariesEnabled && (overrideManualSettings || redX == 0.708)) { // Default Rec.2020 values
+	if (colorPrimariesEnabled && overrideManualSettings) {
 		redX = profile.redX;
 		redY = profile.redY;
 		greenX = profile.greenX;
@@ -1619,7 +1692,7 @@ bool ApplyEdidProfile(const EdidProfileData& profile) {
 	}
 
 	// Apply color space settings
-	if (colorSpaceEnabled && (overrideManualSettings || primaryColorSpace == L"sRGB")) { // Default value
+	if (colorSpaceEnabled && overrideManualSettings) {
 		primaryColorSpace = profile.primaryColorSpace;
 		gammaCorrection = profile.gamma;
 	}
@@ -1651,7 +1724,7 @@ bool ApplyEdidProfile(const EdidProfileData& profile) {
 			
 			// Store as template metadata - will be applied to monitors during HDR metadata events
 			// We use a special key (nullptr converted to uintptr_t) to indicate template metadata
-			g_HdrMetadataStore[reinterpret_cast<IDDCX_MONITOR>(0)] = hdrMetadata;
+			StoreHdrMetadata(MetadataTemplateKey(), hdrMetadata);
 		} else {
 			vddlog("w", "Generated HDR metadata is not valid, skipping storage");
 		}
@@ -1680,7 +1753,7 @@ bool ApplyEdidProfile(const EdidProfileData& profile) {
 			
 			// Store as template gamma ramp - will be applied to monitors during gamma ramp events
 			// We use a special key (nullptr converted to uintptr_t) to indicate template gamma ramp
-			g_GammaRampStore[reinterpret_cast<IDDCX_MONITOR>(0)] = gammaRamp;
+			StoreGammaRamp(MetadataTemplateKey(), gammaRamp);
 		} else {
 			vddlog("w", "Generated gamma ramp is not valid, skipping storage");
 		}
