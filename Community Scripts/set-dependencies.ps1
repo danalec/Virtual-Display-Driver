@@ -27,7 +27,11 @@ if (-not (Get-PSRepository -Name $repo.Name -ErrorAction SilentlyContinue)) {
 # nothing asked for, no confirmation, and no mention in the README. Apply the policy only for the
 # duration of the installs below and put the original one back afterwards -- PowerShell runs a
 # finally block even when the body calls exit, so the early `exit 1` paths restore it too.
-$originalPolicy = $repo.InstallationPolicy
+#
+# The original policy has to be read from the repository itself. $repo is a hashtable with Name
+# and Url in it, so $repo.InstallationPolicy was $null, the `if ($originalPolicy)` below was
+# never true, and PSGallery was left Trusted for the rest of the session.
+$originalPolicy = (Get-PSRepository -Name $repo.Name -ErrorAction SilentlyContinue).InstallationPolicy
 try {
     Set-PSRepository -Name $repo.Name -InstallationPolicy Trusted `
         -InformationAction Ignore -WarningAction SilentlyContinue

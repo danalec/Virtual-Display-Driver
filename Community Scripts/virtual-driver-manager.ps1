@@ -151,11 +151,23 @@ if (-Not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdenti
     $psArgs = @("-ExecutionPolicy", "Bypass", "-NoProfile", "-File", "`"$($MyInvocation.MyCommand.Path)`"")
 
     foreach ($key in $PSBoundParameters.Keys) {
-        $psArgs += "-$key"
-        # Parameters with values (e.g., -Action 'install') need their value added.
-        # Switch parameters (e.g., -Json, -Verbose, -Silent) do not have a value.
-        if (-not ($PSBoundParameters[$key] -is [System.Management.Automation.SwitchParameter])) {
-            $psArgs += $PSBoundParameters[$key]
+        $value = $PSBoundParameters[$key]
+        # A switch bound as $false is still a SwitchParameter, so testing the type
+        # lost the value: -Json:$false reached the child as a bare -Json, which
+        # turned JSON mode on, -Verbose:$false skipped the temp-directory
+        # cleanup, and -Confirm:$false made the elevated child stop and ask.
+        # Switches are only passed bare when they are actually on.
+        if ($value -is [System.Management.Automation.SwitchParameter]) {
+            if ($value.IsPresent) {
+                $psArgs += "-$key"
+            }
+            else {
+                $psArgs += "-$key`:$false"
+            }
+        }
+        else {
+            $psArgs += "-$key"
+            $psArgs += $value
         }
     }
 
@@ -195,12 +207,16 @@ try {
     #----------------------------------------------------------------------
     function Get-VirtualDisplayDevice {
         # Find the device by its user-friendly name first for readability.
-        $device = Get-PnpDevice -Class Display -ErrorAction Silentlycontinue | Where-Object {
+        # The query is not silenced: a PnP service that is faulted or a WMI
+        # error made this return $null, and the caller reported "Driver is not
+        # installed" for a driver that was installed and working. A failure to
+        # ask is not an answer of "no".
+        $device = Get-PnpDevice -Class Display -ErrorAction Stop | Where-Object {
             $_.FriendlyName -in ('IddSampleDriver Device HDR', 'Virtual Display Driver')
         }
         # Fallback: If not found by name, use the more specific and stable Hardware ID.
         if (-not $device) {
-            $device = Get-PnpDevice -HardwareID "Root\MttVDD" -ErrorAction Silentlycontinue
+            $device = Get-PnpDevice -HardwareID "Root\MttVDD" -ErrorAction Stop
         }
         return $device
     }

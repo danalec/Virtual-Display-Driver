@@ -24,9 +24,16 @@ Set-StrictMode -Version 1.0;
 # Get-Monitor ships in the MonitorConfig module. Import it explicitly instead of
 # relying on another helper script having loaded it already. The version is pinned
 # to the one set-dependencies.ps1 requires.
-if (-not (Get-Module -Name MonitorConfig)) {
+#
+# The check has to be on the version, not on the name. A bare
+# "Get-Module -Name MonitorConfig" matches any loaded version, so the import
+# below only ran when nothing was loaded at all, and a session that already had
+# MonitorConfig 1.0.x or newer ran against that one's output shape instead.
+$requiredMonitorConfigVersion = [version]'1.0.3'
+$loadedMonitorConfig = Get-Module -Name MonitorConfig | Where-Object { $_.Version -eq $requiredMonitorConfigVersion }
+if (-not $loadedMonitorConfig) {
     try {
-        Import-Module MonitorConfig -RequiredVersion '1.0.3' -ErrorAction Stop
+        Import-Module MonitorConfig -RequiredVersion $requiredMonitorConfigVersion -ErrorAction Stop
     }
     catch {
         throw "The MonitorConfig module is required by this script. Run modules_install.bat (Administrator) or install it with: Install-Module MonitorConfig -RequiredVersion 1.0.3 -Scope CurrentUser. Details: $($_.Exception.Message)"
@@ -44,12 +51,20 @@ $monitor = Get-Monitor | Where-Object { $_.InstanceName -like $InstancePattern }
 
 if (-not $monitor) {
     Write-Warning "No monitor matched '$InstancePattern'. Run 'Get-Monitor' to list the instance names, then re-run with -InstancePattern <name>."
+    # Exiting 0 here told a caller checking $LASTEXITCODE that the script had
+    # succeeded, with an empty result and a warning on the warning stream. The
+    # two are indistinguishable from the outside, and this script exists to
+    # produce a DeviceName.
+    exit 1
 }
 else {
     $dispnum = $monitor.LogicalDisplay.DeviceName
 
-    # Echo the result to console
-    Write-Host $dispnum
+    # Echo the result to the success stream, not to the host. Write-Host does
+    # not go there, so $(.\get_disp_num.ps1) captured nothing and
+    # .\get_disp_num.ps1 > out.txt produced an empty file. A caller that wants
+    # the DeviceName got nothing at all.
+    Write-Output $dispnum
 }
 
 # Pause before closing when run by hand from VDC. This used to fire unconditionally, which

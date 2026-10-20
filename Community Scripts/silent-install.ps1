@@ -165,13 +165,22 @@ try {
     # Write and store the driver certificates on local machine.
     # Each thumbprint is tracked so a failed install does not leave TrustedPublisher
     # populated: those entries require certmgr.msc to remove by hand.
+    #
+    # Only the ones this run actually added. The store is keyed by thumbprint, so
+    # a certificate left there by an earlier successful run was recorded as ours
+    # too, and the rollback deleted it -- leaving an installed driver without its
+    # trusted publisher, which can stop it loading on the next reboot.
     Write-Host "Installing driver certificates on local machine." -ForegroundColor Cyan;
+    $preExistingThumbprints = @(Get-ChildItem -Path "Cert:\LocalMachine\TrustedPublisher" -ErrorAction SilentlyContinue |
+        Select-Object -ExpandProperty Thumbprint);
     foreach ($cert in $certificates) {
         $certFilePath = Join-Path -Path $certsFolder -ChildPath "$($cert.Thumbprint).cer";
         # Set-Content -Encoding Byte was removed in PowerShell 7.
         [System.IO.File]::WriteAllBytes($certFilePath, $cert.Export([System.Security.Cryptography.X509Certificates.X509ContentType]::Cert));
         Import-Certificate -FilePath $certFilePath -CertStoreLocation "Cert:\LocalMachine\TrustedPublisher" | Out-Null;
-        $installedThumbprints += $cert.Thumbprint;
+        if ($preExistingThumbprints -notcontains $cert.Thumbprint) {
+            $installedThumbprints += $cert.Thumbprint;
+        }
     }
 
     # Install VDD

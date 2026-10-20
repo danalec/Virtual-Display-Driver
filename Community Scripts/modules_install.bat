@@ -8,6 +8,12 @@ setlocal
 :: (re-running it recursively) while $args stayed empty. $MyInvocation.MyCommand.Path
 :: is also empty under -Command, which was the original bug: the re-elevated shell
 :: was launched with -File "" and installed nothing while still printing "success".
+::
+:: The re-elevation launches cmd.exe with this .bat, not powershell.exe with -File.
+:: powershell.exe -File refuses any file that is not a .ps1: it fails with
+:: "Processing -File ... failed because the file does not have a '.ps1' extension"
+:: and exit code -196608, so the elevated child died before installing anything
+:: and the parent reported "Elevated module installation failed".
 set "VDD_INSTALL_BAT=%~f0"
 
 :: The versions are pinned to the same ones set-dependencies.ps1 enforces. Installing "latest"
@@ -23,7 +29,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command ^
     "$mcv = $env:VDD_MONITORCONFIG_VERSION;" ^
     "$elevated = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] 'Administrator');" ^
     "if (-not $elevated) {" ^
-        "$p = Start-Process -FilePath PowerShell.exe -Verb RunAs -Wait -PassThru -ArgumentList ('-NoProfile -ExecutionPolicy Bypass -File \"' + $self + '\"');" ^
+        "$p = Start-Process -FilePath cmd.exe -Verb RunAs -Wait -PassThru -ArgumentList ('/c', '\"' + $self + '\"');" ^
         "if ($p.ExitCode -ne 0) { Write-Output ('Elevated module installation failed with exit code ' + $p.ExitCode); exit $p.ExitCode }" ^
         "exit 0" ^
     "} else {" ^
