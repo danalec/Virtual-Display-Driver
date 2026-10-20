@@ -5479,12 +5479,21 @@ NTSTATUS ValidateEdidIntegration()
 	// "Configuration Valid: No" line.
 	if (!edidEnabled) {
 		vddlog("w", "EDID integration is disabled - manual configuration mode");
-		issues++;
 	}
-
-	if (profilePath.empty() || profilePath == L"EDID/monitor_profile.xml") {
-		vddlog("w", "EDID profile path not configured or using default path");
-		issues++;
+	else {
+		// The profile only has to be there when something is actually going to read it.
+		if (autoConfig) {
+			EdidProfileData probe;
+			if (!LoadEdidProfile(profilePath, probe)) {
+				vddlog("e", "AutoConfigureFromEdid is on but the EDID profile could not be loaded");
+				issues++;
+				validationPassed = false;
+			}
+		}
+		else if (profilePath.empty()) {
+			vddlog("w", "EDID integration is on but no profile path is set");
+			issues++;
+		}
 	}
 
 	// Validate HDR configuration
@@ -5507,12 +5516,17 @@ NTSTATUS ValidateEdidIntegration()
 		<< "\n  Source Priority: " << WStringToString(localSourcePriority);
 	vddlog("d", logStream.str().c_str());
 
-	// Update integration status
+	// Update integration status. configurationValid used to be (issues < 3), an arbitrary
+	// threshold that no check could ever cross, so it disagreed with the PASSED/FAILED line and
+	// with the NTSTATUS returned right below. All three now read the same verdict.
 	g_IntegrationStatus.edidParsingEnabled = edidEnabled;
 	g_IntegrationStatus.hdrMetadataValid = hdrEnabled;
 	g_IntegrationStatus.modeManagementActive = autoResEnabled;
-	g_IntegrationStatus.configurationValid = (issues < 3);
+	g_IntegrationStatus.configurationValid = validationPassed;
 	g_IntegrationStatus.warningCount = issues;
+	if (!validationPassed) {
+		g_IntegrationStatus.errorCount = issues;
+	}
 
 	logStream.str("");
 	logStream << "=== VALIDATION SUMMARY ==="
@@ -5532,32 +5546,32 @@ NTSTATUS PerformanceMonitor()
 
 	// Monitor mode generation performance
 	auto start = chrono::high_resolution_clock::now();
-	
-	// Test mode generation with current configuration
-	vector<tuple<DWORD, DWORD, DWORD, DWORD>> testModes;
-	// Use the global monitorModes for performance testing
-	for (const auto& mode : monitorModes) {
-		testModes.push_back(make_tuple(get<0>(mode), get<1>(mode), get<2>(mode), get<3>(mode)));
-	}
-	
+
+	// This never measured mode generation. It copied monitorModes into a local vector and timed
+	// the copy, then reported the copy duration as "Mode Generation Time" and raised a warning
+	// when it exceeded 10ms. Time the real cache rebuild instead.
+	RebuildKnownMonitorModesCache();
+
 	auto end = chrono::high_resolution_clock::now();
 	auto duration = chrono::duration_cast<chrono::microseconds>(end - start);
 
+	const size_t modeCount = monitorModes.size();
+
 	logStream.str("");
 	logStream << "Performance Metrics:"
-		<< "\n  Mode Generation Time: " << duration.count() << " microseconds"
-		<< "\n  Total Modes Generated: " << testModes.size()
-		<< "\n  Memory Usage: ~" << (testModes.size() * sizeof(tuple<DWORD, DWORD, DWORD, DWORD>)) << " bytes";
+		<< "\n  Known Mode Cache Rebuild Time: " << duration.count() << " microseconds"
+		<< "\n  Modes In Current Mode List: " << modeCount
+		<< "\n  Memory Usage: ~" << (modeCount * sizeof(tuple<DWORD, DWORD, DWORD, DWORD>)) << " bytes";
 	vddlog("i", logStream.str().c_str());
 
 	// Performance thresholds
 	if (duration.count() > 10000) { // 10ms threshold
-		vddlog("w", "Mode generation is slower than expected (>10ms)");
+		vddlog("w", "Known mode cache rebuild is slower than expected (>10ms)");
 		g_IntegrationStatus.warningCount++;
 	}
 
-	if (testModes.size() > 100) {
-		vddlog("w", "Large number of modes generated - consider filtering");
+	if (modeCount > 100) {
+		vddlog("w", "Large number of modes in the mode list - consider filtering");
 		g_IntegrationStatus.warningCount++;
 	}
 
@@ -5570,12 +5584,14 @@ NTSTATUS CreateFallbackConfiguration()
 	logStream << "=== CREATING FALLBACK CONFIGURATION ===";
 	vddlog("i", logStream.str().c_str());
 
-	// Create safe fallback modes if EDID parsing fails
+	// Create safe fallback modes if EDID parsing fails.
+	// The 4th field is vsyncDen and was 0 here, which is a division by zero for anything that
+	// consumes these tuples the way the rest of the driver consumes monitorModes.
 	vector<tuple<DWORD, DWORD, DWORD, DWORD>> fallbackModes = {
-		make_tuple(1920, 1080, 60, 0),   // Full HD 60Hz
-		make_tuple(1366, 768, 60, 0),    // Common laptop resolution
-		make_tuple(1280, 720, 60, 0),    // HD 60Hz
-		make_tuple(800, 600, 60, 0)      // Safe fallback
+		make_tuple(1920, 1080, 60, 1),   // Full HD 60Hz
+		make_tuple(1366, 768, 60, 1),    // Common laptop resolution
+		make_tuple(1280, 720, 60, 1),    // HD 60Hz
+		make_tuple(800, 600, 60, 1)      // Safe fallback
 	};
 
 	logStream.str("");
@@ -5608,7 +5624,13 @@ NTSTATUS CreateFallbackConfiguration()
 		<< "\n  Max Content Light: " << fallbackHdr.max_content_light_level << " nits";
 	vddlog("d", logStream.str().c_str());
 
-	vddlog("i", "Fallback configuration ready for emergency use");
+	// Reports what the fallback configuration would contain. It does not install anything: the
+	// modes below are local and the HDR metadata is never stored, so the closing line used to
+	// promise "Fallback configuration ready for emergency use" for a configuration that did not
+	// exist. Making it real would mean overwriting the mode list the user already configured,
+	// which is not something a diagnostic should do behind their back.
+	vddlog("i", "Fallback configuration would provide the modes and sRGB HDR metadata listed above;"
+		" nothing is installed by this diagnostic");
 	return STATUS_SUCCESS;
 }
 
@@ -5664,14 +5686,15 @@ NTSTATUS RunComprehensiveDiagnostics()
 	vddlog("d", logStream.str().c_str());
 
 	// Check global stores
-	size_t hdrStoreSize = g_HdrMetadataStore.size();
-	size_t gammaStoreSize = g_GammaRampStore.size();
+	size_t hdrStoreSize = 0;
+	size_t gammaStoreSize = 0;
+	GetMetadataCacheSizes(hdrStoreSize, gammaStoreSize);
 	
 	logStream.str("");
 	logStream << "Resource Usage:"
 		<< "\n  HDR Metadata Store: " << hdrStoreSize << " entries"
 		<< "\n  Gamma Ramp Store: " << gammaStoreSize << " entries"
-		<< "\n  Known Monitor Modes: " << s_KnownMonitorModes2.size() << " modes";
+		<< "\n  Known Monitor Modes: " << KnownMonitorModesCount() << " modes";
 	vddlog("d", logStream.str().c_str());
 
 	// Final diagnostic summary
@@ -5710,13 +5733,18 @@ NTSTATUS ValidateAndSanitizeConfiguration()
 		sanitizedSettings++;
 	}
 
-	// Validate resolution settings
+	// Validate resolution settings. This runs after loadSettings(), so on the option.txt path --
+	// the one with no XML behind it -- GetIntegerSetting answers -1 for all four and these
+	// locals would land on -1, which is then written back into the globals. Every fallback and
+	// every bound here has to match the positiveOr() calls in DriverEntry and the compiled
+	// the ceiling quietly goes back to a smaller number than the one the mode list was built
+	// against.
 	int minWidth = GetIntegerSetting(L"MinResolutionWidth");
 	int minHeight = GetIntegerSetting(L"MinResolutionHeight");
 	int maxWidth = GetIntegerSetting(L"MaxResolutionWidth");
 	int maxHeight = GetIntegerSetting(L"MaxResolutionHeight");
 
-	if (minWidth < 640 || minWidth > 7680) {
+	if (minWidth < 640 || minWidth > 10240) {
 		vddlog("w", "Invalid min width detected, setting to 640");
 		minWidth = 640;
 		sanitizedSettings++;
@@ -5729,8 +5757,8 @@ NTSTATUS ValidateAndSanitizeConfiguration()
 	}
 
 	if (maxWidth < minWidth || maxWidth > 15360) {
-		vddlog("w", "Invalid max width detected, setting to 7680");
-		maxWidth = 7680;
+		vddlog("w", "Invalid max width detected, setting to 10240");
+		maxWidth = 10240;
 		sanitizedSettings++;
 	}
 	
@@ -5756,7 +5784,20 @@ NTSTATUS ValidateAndSanitizeConfiguration()
 		sanitizedSettings++;
 	}
 
-	// Validate color primaries
+	// Validate gamma correction. Nothing read gamma_correction before this, and
+	// GetDoubleSetting answers 0.0 for a key that is absent, so deleting the element from the
+	// XML left ConvertManualToGammaRamp() building a ramp and a matrix out of gamma 0.
+	double localGamma = GetDoubleSetting(L"GammaCorrection");
+
+	if (localGamma < 1.0 || localGamma > 3.0) {
+		vddlog("w", "Invalid gamma correction detected, setting to 2.2");
+		localGamma = 2.2;
+		sanitizedSettings++;
+	}
+
+	// Validate color primaries. The bound is exclusive at 0 on purpose: GetDoubleSetting
+	// answers 0.0 for an absent key, and 0.0 is inside [0,1], so a deleted <red_x> used to
+	// pass this check unchanged and leave a primary sitting on the corner of the triangle.
 	double localRedX = GetDoubleSetting(L"RedX");
 	double localRedY = GetDoubleSetting(L"RedY");
 	double localGreenX = GetDoubleSetting(L"GreenX");
@@ -5764,19 +5805,54 @@ NTSTATUS ValidateAndSanitizeConfiguration()
 	double localBlueX = GetDoubleSetting(L"BlueX");
 	double localBlueY = GetDoubleSetting(L"BlueY");
 
-	if (localRedX < 0.0 || localRedX > 1.0 || localRedY < 0.0 || localRedY > 1.0) {
+	if (localRedX <= 0.0 || localRedX > 1.0 || localRedY <= 0.0 || localRedY > 1.0) {
 		vddlog("w", "Invalid red primary coordinates, using sRGB defaults");
+		localRedX = 0.708; localRedY = 0.292;
 		sanitizedSettings++;
 	}
-	
-	if (localGreenX < 0.0 || localGreenX > 1.0 || localGreenY < 0.0 || localGreenY > 1.0) {
+
+	if (localGreenX <= 0.0 || localGreenX > 1.0 || localGreenY <= 0.0 || localGreenY > 1.0) {
 		vddlog("w", "Invalid green primary coordinates, using sRGB defaults");
+		localGreenX = 0.170; localGreenY = 0.797;
 		sanitizedSettings++;
 	}
 	
-	if (localBlueX < 0.0 || localBlueX > 1.0 || localBlueY < 0.0 || localBlueY > 1.0) {
+	if (localBlueX <= 0.0 || localBlueX > 1.0 || localBlueY <= 0.0 || localBlueY > 1.0) {
 		vddlog("w", "Invalid blue primary coordinates, using sRGB defaults");
+		localBlueX = 0.131; localBlueY = 0.046;
 		sanitizedSettings++;
+	}
+
+	// The white point is a primary too, and it had no range check at all.
+	double localWhiteX = GetDoubleSetting(L"WhiteX");
+	double localWhiteY = GetDoubleSetting(L"WhiteY");
+
+	if (localWhiteX <= 0.0 || localWhiteX > 1.0 || localWhiteY <= 0.0 || localWhiteY > 1.0) {
+		vddlog("w", "Invalid white point coordinates, using D65 defaults");
+		localWhiteX = 0.3127; localWhiteY = 0.3290;
+		sanitizedSettings++;
+	}
+
+	// Write the sanitized values back. This used to clamp only these locals and log
+	// "setting to ...", so every global kept the out-of-range value the XML asked for and the
+	// clamp had no effect on the driver at all. The globals are the ones the mode, HDR and
+	// colour paths read, so the corrected values only mean something once they land here.
+	// The refresh/resolution globals are ints, so the doubles above are rounded after the
+	// range check rather than truncated.
+	if (sanitizedSettings > 0) {
+		minRefreshRate = static_cast<int>(minRefresh + 0.5);
+		maxRefreshRate = static_cast<int>(maxRefresh + 0.5);
+		minResolutionWidth = minWidth;
+		minResolutionHeight = minHeight;
+		maxResolutionWidth = maxWidth;
+		maxResolutionHeight = maxHeight;
+		maxDisplayMasteringLuminance = maxLuminance;
+		minDisplayMasteringLuminance = minLuminance;
+		redX = localRedX; redY = localRedY;
+		greenX = localGreenX; greenY = localGreenY;
+		blueX = localBlueX; blueY = localBlueY;
+		whiteX = localWhiteX; whiteY = localWhiteY;
+		gammaCorrection = localGamma;
 	}
 
 	logStream.str("");
@@ -5784,7 +5860,8 @@ NTSTATUS ValidateAndSanitizeConfiguration()
 		<< "\n  Settings sanitized: " << sanitizedSettings
 		<< "\n  Refresh rate range: " << minRefresh << "-" << maxRefresh << " Hz"
 		<< "\n  Resolution range: " << minWidth << "x" << minHeight << " to " << maxWidth << "x" << maxHeight
-		<< "\n  Luminance range: " << minLuminance << "-" << maxLuminance << " nits";
+		<< "\n  Luminance range: " << minLuminance << "-" << maxLuminance << " nits"
+		<< "\n  Gamma correction: " << localGamma;
 	vddlog("i", logStream.str().c_str());
 
 	return (sanitizedSettings < 5) ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
