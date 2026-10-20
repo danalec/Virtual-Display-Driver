@@ -63,6 +63,15 @@ param(
     [switch]$Silent
 )
 
+$ErrorActionPreference = 'Stop';
+# Version 1.0 on purpose, not Latest: it enforces one rule -- an unassigned variable
+# raises instead of silently binding $null -- and that is exactly the rule that
+# catches the $rate class of bug. An AST sweep of all 12 helpers found 0 uninitialized
+# reads, so enabling it cannot regress anything that works today. Do NOT raise to
+# 2.0/Latest without auditing property access first: 2.0 also throws on a missing
+# property, and $monitor.LogicalDisplay.DeviceName in get_disp_num.ps1 does.
+Set-StrictMode -Version 1.0;
+
 #----------------------------------------------------------------------
 # SECTION 1: CENTRALIZED LOGGING FUNCTION
 #----------------------------------------------------------------------
@@ -86,7 +95,10 @@ function Write-Log {
         switch ($Status) {
             'Success' { Write-Host $Message -ForegroundColor Green }
             'Warning' { Write-Warning $Message }
-            'Error'   { Write-Error $Message }
+            # -ErrorAction Continue keeps the logger itself from becoming a terminating
+            # error once $ErrorActionPreference is 'Stop': the caller decides how to
+            # react to a failed status, this helper only reports it.
+            'Error'   { Write-Error $Message -ErrorAction Continue }
             default   { Write-Host $Message -ForegroundColor $Color }
         }
     }
@@ -194,6 +206,35 @@ try {
     }
 
     #----------------------------------------------------------------------
+    # SECTION 5b: HELPER FUNCTION TO PICK THE DRIVER ASSET
+    #----------------------------------------------------------------------
+    # The release publishes the driver as "VirtualDisplayDriver-<arch>.Driver.Only.zip".
+    # The x86-named asset is the one x64/AMD64 machines use (the name is upstream's);
+    # ARM64 has its own. Matching only "x64.zip" - as this script used to - matched no
+    # asset in any current release, so -Action install always failed.
+    function Select-DriverAsset {
+        param(
+            [Parameter(Mandatory = $true)]
+            [object]$Release,
+            [Parameter(Mandatory = $false)]
+            [switch]$Arm64
+        )
+
+        $driverAssets = @($Release.assets | Where-Object { $_.name -like 'VirtualDisplayDriver-*.zip' })
+        if ($driverAssets.Count -eq 0) { return $null }
+
+        if ($Arm64) {
+            $armAsset = $driverAssets | Where-Object { $_.name -like '*-ARM64.*' } | Select-Object -First 1
+            if ($armAsset) { return $armAsset }
+        }
+
+        $defaultAsset = $driverAssets | Where-Object { $_.name -like '*-x86.*' } | Select-Object -First 1
+        if ($defaultAsset) { return $defaultAsset }
+
+        return ($driverAssets | Select-Object -First 1)
+    }
+
+    #----------------------------------------------------------------------
     # SECTION 6: MAIN ACTION LOGIC
     #----------------------------------------------------------------------
     if ($Action -in @('install', 'uninstall')) {
@@ -220,7 +261,7 @@ try {
         
         $sourcesUrl = "https://raw.githubusercontent.com/Drawbackz/DevCon-Installer/refs/heads/master/devcon_sources.json"
         Write-Verbose "Fetching DevCon sources from $sourcesUrl"
-        $devconSources = Invoke-RestMethod -Uri $sourcesUrl
+        $devconSources = Invoke-RestMethod -Uri $sourcesUrl -ErrorAction Stop
 
         # Enrich the downloaded source list with a calculated 'BuildNumber' property to make it sortable.
         $enrichedSources = $devconSources | ForEach-Object {
@@ -253,18 +294,42 @@ try {
 
         if (-not $bestMatch) { throw "Could not find any compatible DevCon versions for your OS (Build $osBuild)." }
         
-        $devconHash = ($bestMatch.Sources | Where-Object { $_.Architecture -eq 'X64' }).Sha256
+        # Prefer a DevCon build matching the OS architecture and fall back to X64 rather than
+        # failing: x64 runs through emulation on ARM64. This used to hardcode X64, so the ARM64
+        # path downloaded an emulated installer even when the sources list carries a native one.
+        $osArchName = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
+        $archCandidates = switch ($osArchName) {
+            'Arm64' { @('ARM64', 'Arm64', 'X64') }
+            'X86'   { @('X86', 'x86', 'X64') }
+            default { @('X64', 'x64') }
+        }
+        $devconHash = $null; $devconArch = $null
+        foreach ($candidate in $archCandidates) {
+            $hash = ($bestMatch.Sources | Where-Object { $_.Architecture -eq $candidate }).Sha256
+            if ($hash) { $devconHash = $hash; $devconArch = $candidate; break }
+        }
         Write-Log -Message "Using DevCon Source: $($bestMatch.Name) (Build $($bestMatch.BuildNumber))" -Status 'Success'
-        Write-Verbose "Selected DevCon Hash (X64): $devconHash"
-        if (-not $devconHash) { throw "Could not find a 64-bit DevCon hash in the selected source: $($bestMatch.Name)" }
+        Write-Verbose "Selected DevCon Hash ($devconArch): $devconHash"
+        if (-not $devconHash) {
+            throw "Could not find a DevCon hash for $($archCandidates -join '/') in the selected source: $($bestMatch.Name). Sources offer: $(($bestMatch.Sources.Architecture) -join ', ')"
+        }
 
         #--- 6b. Acquire DevCon Utility ---
         Write-Log -Message "Acquiring secure DevCon utility..."
         $devconInstallerUrl = "https://github.com/Drawbackz/DevCon-Installer/releases/download/1.4-rc/Devcon.Installer.exe"
+        # Devcon.Installer.exe is not Authenticode-signed (Get-AuthenticodeSignature reports
+        # NotSigned), so a pinned SHA-256 is the only integrity control available for it. This
+        # pins the artifact that was reviewed; it does not by itself vouch for the publisher.
+        $devconInstallerSha256 = "02266cbe19253db3b6e4095dca49ff315456415d54ebc8e76650194d91e197c7"
         $devconInstallerPath = Join-Path $tempDir "Devcon.Installer.exe"
         Write-Verbose "Downloading DevCon Installer from $devconInstallerUrl"
-        Invoke-WebRequest -Uri $devconInstallerUrl -OutFile $devconInstallerPath
-        Write-Verbose "DevCon Installer downloaded successfully."
+        Invoke-WebRequest -Uri $devconInstallerUrl -OutFile $devconInstallerPath -UseBasicParsing -ErrorAction Stop
+        $devconInstallerActual = (Get-FileHash -Path $devconInstallerPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($devconInstallerActual -ne $devconInstallerSha256) {
+            Remove-Item -Path $devconInstallerPath -Force -ErrorAction SilentlyContinue
+            throw "Devcon.Installer.exe SHA-256 mismatch: expected $devconInstallerSha256, got $devconInstallerActual. Aborting before executing it."
+        }
+        Write-Verbose "DevCon Installer downloaded and SHA-256 verified."
         
         # Use the hash to ensure the DevCon-Installer utility downloads the correct, secure version of DevCon.
         $devconArgs = "install -hash $devconHash -update -dir `"$tempDir`""
@@ -278,62 +343,146 @@ try {
         #--- 6c. Execute Install or Uninstall ---
         if ($Action -eq 'install') {
             Write-Log -Message "Starting driver installation..."
-            $downloadUrl = $null
-            if ($DriverVersion -eq "latest") {
-                $apiUrl = "https://api.github.com/repos/VirtualDrivers/Virtual-Display-Driver/releases/latest"
-                # Technical Choice: Many APIs, including GitHub's, require a User-Agent header.
-                # Omitting this can lead to connection errors (like 403 Forbidden or 404 Not Found).
-                $headers = @{ "User-Agent" = "PowerShell-VDD-Manager-Script" }
-                
-                Write-Verbose "Querying GitHub API for latest driver release: $apiUrl"
-                $releaseInfo = Invoke-RestMethod -Uri $apiUrl -Headers $headers
-                Write-Verbose "API call successful. Latest release found: $($releaseInfo.tag_name)"
 
-                $asset = $releaseInfo.assets | Where-Object { $_.name -match "x64\.zip$" } | Select-Object -First 1
-                if (-not $asset) { throw "Could not find a 64-bit driver asset (x64.zip) in the latest GitHub release." }
-                
-                $downloadUrl = $asset.browser_download_url
-                Write-Verbose "Found driver asset: $($asset.name)"
-            }
-            else {
-                $downloadUrl = "https://github.com/VirtualDrivers/Virtual-Display-Driver/releases/download/$DriverVersion/Signed-Driver-v$DriverVersion-x64.zip"
+            # Resolve the release through the GitHub API instead of guessing an asset
+            # file name. The old "Signed-Driver-v<version>-x64.zip" URL returns HTTP 404
+            # for every current tag.
+            $apiUrl = "https://api.github.com/repos/VirtualDrivers/Virtual-Display-Driver/releases/latest"
+            if ($DriverVersion -ne "latest") {
+                $apiUrl = "https://api.github.com/repos/VirtualDrivers/Virtual-Display-Driver/releases/tags/$DriverVersion"
                 Write-Verbose "Using specified driver version: $DriverVersion"
             }
 
-            if (-not $downloadUrl) { throw "Could not determine a valid driver download URL for version '$DriverVersion'." }
-            
+            # Technical Choice: Many APIs, including GitHub's, require a User-Agent header.
+            # Omitting this can lead to connection errors (like 403 Forbidden or 404 Not Found).
+            $headers = @{ "User-Agent" = "PowerShell-VDD-Manager-Script" }
+
+            Write-Verbose "Querying GitHub API for driver release: $apiUrl"
+            $releaseInfo = Invoke-RestMethod -Uri $apiUrl -Headers $headers -ErrorAction Stop
+            Write-Verbose "API call successful. Release found: $($releaseInfo.tag_name)"
+
+            # RuntimeInformation.OSArchitecture, not Win32_Processor.Architecture: on ARM64
+            # Windows running an x64-emulated PowerShell the latter can report x64 while the OS
+            # is still ARM64, which then selects the AMD64 asset. The upstream package's x86-named
+            # zip contains an AMD64 MttVDD.dll (PE machine type 0x8664), so no native ARM64 driver
+            # would be installed at all. silent-install.ps1 already documents this exact hazard.
+            $cpuArchitecture = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
+            $arm64 = ($cpuArchitecture -eq 'Arm64')
+            Write-Verbose "OS architecture: $cpuArchitecture (ARM64: $arm64)"
+
+            $asset = Select-DriverAsset -Release $releaseInfo -Arm64:$arm64
+            if (-not $asset) {
+                $available = ($releaseInfo.assets | ForEach-Object { $_.name }) -join ', '
+                throw "Could not find a Virtual Display Driver asset in release '$($releaseInfo.tag_name)'. Available assets: $available"
+            }
+
+            $downloadUrl = $asset.browser_download_url
+            Write-Verbose "Found driver asset: $($asset.name)"
+
             Write-Verbose "Downloading driver from URL: $downloadUrl"
             $driverZipPath = Join-Path $tempDir "driver.zip"
-            Invoke-WebRequest -Uri $downloadUrl -OutFile $driverZipPath
+            Invoke-WebRequest -Uri $downloadUrl -OutFile $driverZipPath -UseBasicParsing -ErrorAction Stop
+            if (-not (Test-Path $driverZipPath)) { throw "Driver archive was not downloaded from: $downloadUrl" }
             Write-Verbose "Driver ZIP file downloaded to $driverZipPath"
-            
-            Expand-Archive -Path $driverZipPath -DestinationPath $tempDir -Force
+
+            Expand-Archive -Path $driverZipPath -DestinationPath $tempDir -Force -ErrorAction Stop
             Write-Verbose "Driver archive expanded."
+
+            # Resolve the INF rather than assuming it sits at the root of the archive.
+            $driverInf = Join-Path $tempDir "MttVDD.inf"
+            if (-not (Test-Path $driverInf)) {
+                $foundInf = Get-ChildItem -Path $tempDir -Filter 'MttVDD.inf' -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First 1
+                if (-not $foundInf) { throw "MttVDD.inf not found in the extracted driver package under $tempDir." }
+                $driverInf = $foundInf.FullName
+            }
 
             # Use DevCon to install the driver by pointing to its INF file and specifying its unique Hardware ID.
             # "Root\MttVDD" identifies this as a root-enumerated virtual device.
             Write-Verbose "Running DevCon to install the driver..."
-            & $devconExe install (Join-Path $tempDir "MttVDD.inf") "Root\MttVDD"
+            if ($PSCmdlet.ShouldProcess("Root\MttVDD", "Install Virtual Display Driver")) {
+                & $devconExe install $driverInf "Root\MttVDD"
+                # A non-zero exit from a native command is not an error for PowerShell 5.1: there
+                # $PSNativeCommandUseErrorActionPreference does not exist there, and the try/catch
+                # below never sees it. Silent-install.ps1 already checks this explicitly; without
+                # it a refused install (Root\MttVDD already in use, INF rejected, driver store
+                # busy) fell through to "completed successfully" with exit code 0, and the runtime
+                # config got copied as if a driver were present.
+                $installExitCode = $LASTEXITCODE
+                if ($installExitCode -ne 0) {
+                    throw "devcon install failed with exit code $installExitCode"
+                }
+            }
+            else { Write-Verbose "Skipped: -WhatIf or -Confirm declined the install." }
+
+            # The INF's [UMDriverCopy] ships only MttVDD.dll, so C:\VirtualDisplayDriver\vdd_settings.xml
+            # would not exist after a DevCon-only install, and every runtime toggle fails because
+            # UpdateXmlToggleSetting() opens that exact path read-write. Place it explicitly.
+            $settingsSource = Join-Path (Split-Path $driverInf -Parent) 'vdd_settings.xml'
+            if (-not (Test-Path $settingsSource)) {
+                $foundSettings = Get-ChildItem -Path $tempDir -Filter 'vdd_settings.xml' -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First 1
+                if ($foundSettings) { $settingsSource = $foundSettings.FullName }
+            }
+            if (-not (Test-Path $settingsSource)) {
+                throw "vdd_settings.xml not found in the extracted driver package under $tempDir. The driver would start with no runtime configuration."
+            }
+            $settingsTargetDir = Join-Path $env:SystemDrive 'VirtualDisplayDriver'
+            if (-not (Test-Path $settingsTargetDir)) {
+                New-Item -ItemType Directory -Path $settingsTargetDir -Force | Out-Null
+            }
+            Copy-Item -Path $settingsSource -Destination (Join-Path $settingsTargetDir 'vdd_settings.xml') -Force
+            Write-Log -Message "Runtime configuration installed at $settingsTargetDir\vdd_settings.xml"
         }
         else { # Action must be 'uninstall'
             Write-Log -Message "Starting driver uninstallation..."
             if (Get-VirtualDisplayDevice) {
                 Write-Verbose "Driver found. Preparing to remove."
-                & $devconExe remove "Root\MttVDD"
+                if ($PSCmdlet.ShouldProcess("Root\MttVDD", "Uninstall Virtual Display Driver")) {
+                    & $devconExe remove "Root\MttVDD"
+                    $removeExitCode = $LASTEXITCODE
+                    if ($removeExitCode -ne 0) {
+                        throw "devcon remove failed with exit code $removeExitCode"
+                    }
+                }
+                else { Write-Verbose "Skipped: -WhatIf or -Confirm declined the removal." }
             }
             else { Write-Log -Message "Driver is not currently installed. Nothing to do." }
         }
     }
     elseif ($Action -in @('enable', 'disable', 'toggle')) {
         $device = Get-VirtualDisplayDevice
-        if (-not $device) { Write-Log -Message "Device not found. Cannot perform '$Action'. Please install the driver first." -Status 'Warning' }
-        elseif ($Action -eq 'enable') { Write-Log -Message "Enabling device: $($device.FriendlyName)..."; $device | Enable-PnpDevice -Confirm:$false }
-        elseif ($Action -eq 'disable') { Write-Log -Message "Disabling device: $($device.FriendlyName)..."; $device | Disable-PnpDevice -Confirm:$false }
-        elseif ($Action -eq 'toggle') {
-            if ($device.Status -in ('OK', 'Degraded', 'Started')) {
-                Write-Log -Message "Device is currently enabled. Disabling..."; $device | Disable-PnpDevice -Confirm:$false
+        # This used to only log a warning and fall through to the unconditional "completed
+        # successfully" at the end of the try, so `disable` against a driver that is not installed
+        # printed both a warning and a success line and exited 0. A caller driving this script
+        # through -Json/-Silent has no other way to tell the two apart.
+        if (-not $device) { throw "Device not found. Cannot perform '$Action'. Please install the driver first." }
+        elseif ($Action -eq 'enable') {
+            if ($PSCmdlet.ShouldProcess($device.FriendlyName, "Enable Virtual Display Driver")) {
+                Write-Log -Message "Enabling device: $($device.FriendlyName)..."
+                $device | Enable-PnpDevice -Confirm:$false
             }
-            else { Write-Log -Message "Device is currently disabled or in an error state. Enabling..."; $device | Enable-PnpDevice -Confirm:$false }
+            else { Write-Verbose "Skipped: -WhatIf or -Confirm declined the enable." }
+        }
+        elseif ($Action -eq 'disable') {
+            if ($PSCmdlet.ShouldProcess($device.FriendlyName, "Disable Virtual Display Driver")) {
+                Write-Log -Message "Disabling device: $($device.FriendlyName)..."
+                $device | Disable-PnpDevice -Confirm:$false
+            }
+            else { Write-Verbose "Skipped: -WhatIf or -Confirm declined the disable." }
+        }
+        elseif ($Action -eq 'toggle') {
+            $enabling = $device.Status -notin ('OK', 'Degraded', 'Started')
+            $verb = if ($enabling) { 'Enable' } else { 'Disable' }
+            if ($PSCmdlet.ShouldProcess($device.FriendlyName, "$verb Virtual Display Driver")) {
+                if ($enabling) {
+                    Write-Log -Message "Device is currently disabled or in an error state. Enabling..."
+                    $device | Enable-PnpDevice -Confirm:$false
+                }
+                else {
+                    Write-Log -Message "Device is currently enabled. Disabling..."
+                    $device | Disable-PnpDevice -Confirm:$false
+                }
+            }
+            else { Write-Verbose "Skipped: -WhatIf or -Confirm declined the toggle." }
         }
     }
     elseif ($Action -eq 'status') {
@@ -390,7 +539,7 @@ finally {
         if (Test-Path $tempDir) {
             # This Write-Verbose message will not be visible without -Verbose, but is good practice.
             Write-Verbose "Cleaning up temporary directory: $tempDir"
-            Remove-Item -Path $tempDir -Recurse -Force
+            Remove-Item -Path $tempDir -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
 }

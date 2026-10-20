@@ -8,7 +8,25 @@
     }
  }
 
-$device =  Get-PnpDevice -Class Display -ErrorAction SilentlyContinue | Where-Object { $_.FriendlyName -eq 'IddSampleDriver Device HDR' -or $_.FriendlyName -eq 'Virtual Display Driver' }
+$ErrorActionPreference = 'Stop';
+# Version 1.0 on purpose, not Latest: it enforces one rule -- an unassigned variable
+# raises instead of silently binding $null -- and that is exactly the rule that
+# catches the $rate class of bug. An AST sweep of all 12 helpers found 0 uninitialized
+# reads, so enabling it cannot regress anything that works today. Do NOT raise to
+# 2.0/Latest without auditing property access first: 2.0 also throws on a missing
+# property, and $monitor.LogicalDisplay.DeviceName in get_disp_num.ps1 does.
+Set-StrictMode -Version 1.0;
+
+# 'Virtual Display Driver' is this repo's INF DeviceName (MttVDD.inf:71), so it matches here.
+# The HardwareID fallback covers the other case: silent-install.ps1 installs the upstream release
+# package, and any build whose INF names the device differently leaves this matching nothing --
+# a silent no-op with only a warning. Root\MttVDD is the ID the INF installs under.
+$device = Get-PnpDevice -Class Display -ErrorAction SilentlyContinue |
+    Where-Object { $_.FriendlyName -eq 'IddSampleDriver Device HDR' -or $_.FriendlyName -eq 'Virtual Display Driver' }
+if (-not $device) {
+    $device = Get-PnpDevice -Class Display -ErrorAction SilentlyContinue |
+        Where-Object { $_.HardwareID -like 'Root\MttVDD*' }
+}
 
 if ($device) {
     if ($device.Status -eq 'OK') {
