@@ -378,20 +378,26 @@ private:
             std::cout << "ERROR: DTD start offset " << (int)dtd_start
                       << " is outside the 4..127 range of a CEA extension block" << std::endl;
             return;
-        }        
+        }
+        // The data blocks start at offset 4 of the extension block. Byte 3 is
+        // NOT the data block collection offset: in the three EDIDs in this
+        // repository it holds 0xF0, 0xF1 and 0x40, and a collection that
+        // starts there would run past the end of the block. Walking the
+        // collection from offset 4 ends exactly at dtd_start in all three.
+        const uint8_t data_block_start = 4;
         std::cout << "=== CEA Extension Block Debug ===" << std::endl;
         std::cout << "CEA revision: " << (int)cea_block[1] << std::endl;
         std::cout << "DTD start offset: " << (int)dtd_start << std::endl;
-        
+
         // Dump the entire data block collection for debugging
-        std::cout << "Data block collection bytes (" << (dtd_start - 4) << " bytes): ";
-        for (uint8_t i = 4; i < dtd_start; i++) {
+        std::cout << "Data block collection bytes (" << (dtd_start - data_block_start) << " bytes): ";
+        for (uint8_t i = data_block_start; i < dtd_start; i++) {
             std::cout << std::hex << std::setw(2) << std::setfill('0') << (int)cea_block[i] << " ";
         }
         std::cout << std::dec << std::endl;
-        
+
         // Parse data block collection
-        for (uint8_t offset = 4; offset < dtd_start; ) {
+        for (uint8_t offset = data_block_start; offset < dtd_start; ) {
             uint8_t tag_length = cea_block[offset];
             uint8_t tag = (tag_length >> 5) & 0x07;
             uint8_t length = tag_length & 0x1F;
@@ -619,15 +625,17 @@ private:
             case 0x05: std::cout << "    → Colorimetry Data Block" << std::endl; break;
             case 0x06:
                 std::cout << "    → HDR Static Metadata Data Block" << std::endl;
-                // The whole payload. The length in the header counts the payload
-                // and not the header byte, so passing length - 1 here dropped
-                // the last byte of the block -- which is where the high byte of
-                // MaxFALL lives.
-                parse_hdr_static_metadata(&etb[1], length);
+                // The length here is the length of the EXTENDED TAG block, and
+                // that count includes the extended tag code byte. The payload
+                // after the code is therefore length - 1 bytes. Treating it as
+                // length would read one byte past the payload -- the first
+                // byte of the next data block -- and take it for the maximum
+                // mastering luminance.
+                parse_hdr_static_metadata(&etb[1], length - 1);
                 break;
             case 0x07:
                 std::cout << "    → HDR Dynamic Metadata Data Block" << std::endl;
-                parse_hdr_dynamic_metadata(&etb[1], length);
+                parse_hdr_dynamic_metadata(&etb[1], length - 1);
                 break;
             case 0x08: std::cout << "    → Video Format Preference Data Block" << std::endl; break;
             case 0x09: std::cout << "    → YCbCr 4:2:0 Video Data Block" << std::endl; break;
