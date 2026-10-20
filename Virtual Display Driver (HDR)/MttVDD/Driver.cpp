@@ -26,6 +26,8 @@ Environment:
 #include <xmllite.h>
 #include <shlwapi.h>
 #include <atlbase.h>
+#include <fcntl.h>
+#include <io.h>
 #include <iostream>
 #include <cstdlib>
 #include <windows.h>
@@ -50,15 +52,152 @@ Environment:
 #pragma comment(lib, "shlwapi.lib")
 
 HANDLE hPipeThread = NULL;
-bool g_Running = true;
+
+// How long the pipe server waits for a client to connect, and how long it waits for that
+// client to send a command, before looping back to re-check g_Running. Both used to block
+// forever, which is what made EvtDriverUnload hang: it waits on the server thread.
+constexpr DWORD PIPE_CONNECT_POLL_MS = 1000;
+constexpr DWORD PIPE_READ_POLL_MS = 5000;
+// Upper bound on waiting for the server thread to wind down at unload. Past this the thread is
+// left to finish on its own; it will notice g_Running within PIPE_CONNECT_POLL_MS.
+constexpr DWORD PIPE_SHUTDOWN_WAIT_MS = 5000;
+
+std::atomic<bool> g_Running{ true }; // written under g_Mutex but read without it in the server loop
 mutex g_Mutex;
+// Guards g_pipeHandle only. A separate mutex from g_Mutex on purpose: vddlog() is called from
+// inside the pipe server while that thread holds g_Mutex, so SendToPipe() cannot take g_Mutex
+// without deadlocking on it.
+mutex g_PipeMutex;
 HANDLE g_pipeHandle = INVALID_HANDLE_VALUE;
+
+// Publish or withdraw the pipe handle. The only sanctioned writers of g_pipeHandle.
+void SetPipeHandle(HANDLE hPipe) {
+	lock_guard<mutex> lock(g_PipeMutex);
+	g_pipeHandle = hPipe;
+}
+
+// Withdraw the pipe handle and hand the previous value back so the caller can close it.
+HANDLE ClearPipeHandle() {
+	lock_guard<mutex> lock(g_PipeMutex);
+	HANDLE previous = g_pipeHandle;
+	g_pipeHandle = INVALID_HANDLE_VALUE; // Whether data goes to the pipe or just the log file
+	return previous;
+}
+
+// Guards g_GammaRampStore and g_HdrMetadataStore. They are written by the settings loader and
+// by the IddCx HDR/gamma callbacks, and std::map is not safe to read while another thread
+// inserts. Distinct from g_Mutex because those callbacks call vddlog() along the way.
+mutex g_MetadataMutex;
 
 using namespace std;
 using namespace Microsoft::IndirectDisp;
 using namespace Microsoft::WRL;
 
 void vddlog(const char* type, const char* message);
+
+// Defined below, but needed by the EDID mode generator which runs earlier in this file.
+void float_to_vsync(float refresh_rate, int& num, int& den);
+
+// vdd_settings.xml, option.txt and monitor_profile.xml are user-editable files, and loadSettings()
+// runs inside the DeviceAdd callback. std::stoi/stof throw std::invalid_argument or
+// std::out_of_range on a malformed value, and an exception leaving a UMDF callback crashes the
+// host. Parse defensively instead: log the offending value and keep the caller's fallback.
+// These light levels come straight from vdd_settings.xml as int. A value above 65535 wrapped
+// silently on the cast, so a typo in the XML turned into a plausible-looking but wrong number.
+UINT16 ClampToUINT16(int value) {
+	if (value < 0) { return 0; }
+	if (value > 65535) { return 65535; }
+	return static_cast<UINT16>(value);
+}
+
+// vdd_settings.xml and monitor_profile.xml are wstring, option.txt is std::string.
+template <typename T>
+int ParseIntSafe(const T& text, int fallback, const wchar_t* what) {
+	try {
+		size_t consumed = 0;
+		int value = stoi(text, &consumed);
+		if (consumed != text.size()) {
+			stringstream ss;
+			ss << "Trailing garbage in " << WStringToString(what) << ", using fallback";
+			vddlog("e", ss.str().c_str());
+			return fallback;
+		}
+		return value;
+	}
+	catch (const exception&) {
+		stringstream ss;
+		ss << "Malformed " << WStringToString(what) << " value, using fallback";
+		vddlog("e", ss.str().c_str());
+		return fallback;
+	}
+}
+
+template <typename T>
+float ParseFloatSafe(const T& text, float fallback, const wchar_t* what) {
+	try {
+		size_t consumed = 0;
+		float value = stof(text, &consumed);
+		if (consumed != text.size()) {
+			stringstream ss;
+			ss << "Trailing garbage in " << WStringToString(what) << ", using fallback";
+			vddlog("e", ss.str().c_str());
+			return fallback;
+		}
+		return value;
+	}
+	catch (const exception&) {
+		stringstream ss;
+		ss << "Malformed " << WStringToString(what) << " value, using fallback";
+		vddlog("e", ss.str().c_str());
+		return fallback;
+	}
+}
+
+// Same contract as ParseFloatSafe, but in double. The EdidProfileData chromaticity and
+// luminance fields are double, and ParseFloatSafe would quietly round them: redX 0.640 read
+// as float and stored back as double is 0.63999998569488525390625, which then differs from the
+// 0.640 the same file computes elsewhere.
+template <typename T>
+double ParseDoubleSafe(const T& text, double fallback, const wchar_t* what) {
+	try {
+		size_t consumed = 0;
+		double value = stod(text, &consumed);
+		if (consumed != text.size()) {
+			stringstream ss;
+			ss << "Trailing garbage in " << WStringToString(what) << ", using fallback";
+			vddlog("e", ss.str().c_str());
+			return fallback;
+		}
+		return value;
+	}
+	catch (const exception&) {
+		stringstream ss;
+		ss << "Malformed " << WStringToString(what) << " value, using fallback";
+		vddlog("e", ss.str().c_str());
+		return fallback;
+	}
+}
+
+// option.txt is a hand-editable file and its mode lines are written "640, 480, 60", with
+// spaces after the commas and whatever else a person types. ParseIntSafe and ParseFloatSafe
+// count anything after the number as trailing garbage and fall back -- stof(" 480 ") consumes
+// the leading space and stops at the trailing one, so a stray trailing space silently turns a
+// hand-written refresh rate into the 60 Hz default and logs an error per mode. Trim here rather
+// than loosening the trailing-garbage check in the two parsers, which the XML and
+// monitor_profile paths use to catch genuinely malformed values.
+//
+// Note the CR is not one of these: the file is CRLF, and std::ifstream in text mode (the
+// default, and what this code opens) translates CRLF to LF, so getline never sees it. Opening
+// the file with ios::binary is what would reintroduce it.
+string TrimAsciiSpace(const string& text) {
+	const char* blanks = " \t\r\n";
+	size_t first = text.find_first_not_of(blanks);
+	if (first == string::npos) {
+		return string();
+	}
+	size_t last = text.find_last_not_of(blanks);
+	return text.substr(first, last - first + 1);
+}
 
 extern "C" DRIVER_INITIALIZE DriverEntry;
 
@@ -89,18 +228,37 @@ struct
 } Options;
 vector<tuple<int, int, int, int>> monitorModes;
 vector< DISPLAYCONFIG_VIDEO_SIGNAL_INFO> s_KnownMonitorModes2;
+// Guards s_KnownMonitorModes2. Both VirtualDisplayDriverParseMonitorDescription and
+// VirtualDisplayDriverParseMonitorDescription2 are IddCx callbacks, and both call
+// RebuildKnownMonitorModesCache. IddCx can run them concurrently, so one can clear and refill
+// this vector while the other is indexing it -- a live data race on a std::vector, which is UB,
+// not merely a stale read. Readers take a snapshot under this lock rather than holding it across
+// the IddCx calls that follow.
+mutex s_KnownMonitorModesMutex;
 UINT numVirtualDisplays;
+// How many virtual displays one adapter may carry. numVirtualDisplays is a UINT feeding
+// AdapterCaps.MaxMonitorsSupported and a CreateMonitor() loop, so a count taken from XML or
+// from the pipe has to be bounded before either sees it. One display is what the driver
+// ships with; a handful is what IddCx realistically carries on one indirect adapter.
+constexpr UINT MIN_VIRTUAL_DISPLAYS = 1;
+constexpr UINT MAX_VIRTUAL_DISPLAYS = 16;
 wstring gpuname;
 wstring confpath = L"C:\\VirtualDisplayDriver";
-bool logsEnabled = false;
-bool debugLogs = false;
+// Atomic because the pipe thread flips these from a command while every other thread reads
+// them on each log line. They were plain bool, which is a data race in the formal model and
+// in practice can hand vddlog a torn decision about whether to log at all.
+std::atomic<bool> logsEnabled{ false };
+std::atomic<bool> debugLogs{ false };
 bool HDRPlus = false;
 bool SDR10 = false;
 bool customEdid = false;
-bool hardwareCursor = false;
+// The compiled value only matters on the path with no vdd_settings.xml, because DriverEntry
+// overwrites it unconditionally on every other path. HardwareCursor ships as true in that file,
+// so true is what this has to say; EnabledOr below is what makes it survive a missing key.
+bool hardwareCursor = true;
 bool preventManufacturerSpoof = false;
 bool edidCeaOverride = false;
-bool sendLogsThroughPipe = true;
+std::atomic<bool> sendLogsThroughPipe{ true };
 
 constexpr DISPLAYCONFIG_VIDEO_SIGNAL_INFO dispinfo(UINT32 h, UINT32 v, UINT32 rn, UINT32 rd);
 
@@ -108,6 +266,7 @@ namespace
 {
 	void RebuildKnownMonitorModesCache()
 	{
+		lock_guard<mutex> lock(s_KnownMonitorModesMutex);
 		s_KnownMonitorModes2.clear();
 		s_KnownMonitorModes2.reserve(monitorModes.size());
 
@@ -120,6 +279,19 @@ namespace
 					std::get<2>(mode),
 					std::get<3>(mode)));
 		}
+	}
+
+	// The two readers below are IddCx callbacks that go on to fill IddCx-owned buffers, so the
+	// lock is held only for the copy. A snapshot is a few dozen DISPLAYCONFIG_VIDEO_SIGNAL_INFO
+	// at most, which is cheap next to the rest of the callback.
+	vector<DISPLAYCONFIG_VIDEO_SIGNAL_INFO> SnapshotKnownMonitorModes() {
+		lock_guard<mutex> lock(s_KnownMonitorModesMutex);
+		return s_KnownMonitorModes2;
+	}
+
+	size_t KnownMonitorModesCount() {
+		lock_guard<mutex> lock(s_KnownMonitorModesMutex);
+		return s_KnownMonitorModes2.size();
 	}
 }
 
