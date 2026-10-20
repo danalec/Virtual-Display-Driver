@@ -630,8 +630,13 @@ bool ResolveEnabledSetting(const std::wstring& settingKey, bool& present) {
 		bool resolvedFromRegistry = false;
 		bool registryValue = false;
 
-		lResult = RegQueryValueExW(hKey, regName.c_str(), NULL, NULL, (LPBYTE)&dwValue, &dwBufferSize);
-		if (lResult == ERROR_SUCCESS) {
+		DWORD dwValueType = 0;
+		lResult = RegQueryValueExW(hKey, regName.c_str(), NULL, &dwValueType, (LPBYTE)&dwValue, &dwBufferSize);
+		// Only a REG_DWORD is a boolean here. A REG_SZ holding "1" is four bytes
+		// with a terminator, which fills the DWORD buffer exactly, and reading it
+		// as a DWORD gives 49 -- neither 1 nor 0, so the value was ignored while
+		// present had already been set. The string form is read below instead.
+		if (lResult == ERROR_SUCCESS && dwValueType == REG_DWORD) {
 			present = true;
 			if (dwValue == 1) {
 				resolvedFromRegistry = true; registryValue = true;
@@ -657,7 +662,7 @@ bool ResolveEnabledSetting(const std::wstring& settingKey, bool& present) {
 			if (lResult == ERROR_SUCCESS && dwBufferSize > 0 && dwBufferSize <= sizeof(path)
 				&& (dwStringType == REG_SZ || dwStringType == REG_EXPAND_SZ)) {
 				size_t chars = dwBufferSize / sizeof(wchar_t);
-				if (path[chars - 1] != L'\0') {
+				if (chars > 0 && path[chars - 1] != L'\0') {
 					LogQueries("d", xmlName + L" - Registry string was not NUL terminated, truncating.");
 					chars -= 1;
 				}
@@ -734,8 +739,12 @@ int GetIntegerSetting(const std::wstring& settingKey) {
 	LONG lResult = RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\MikeTheTech\\VirtualDisplayDriver", 0, KEY_READ, &hKey);
 
 	if (lResult == ERROR_SUCCESS) {
-		lResult = RegQueryValueExW(hKey, regName.c_str(), NULL, NULL, (LPBYTE)&dwValue, &dwBufferSize);
-		if (lResult == ERROR_SUCCESS) {
+		DWORD dwIntType = 0;
+		lResult = RegQueryValueExW(hKey, regName.c_str(), NULL, &dwIntType, (LPBYTE)&dwValue, &dwBufferSize);
+		// Same as the boolean reader: only a REG_DWORD is an integer here. A REG_SZ
+		// holding "12" is four bytes with a terminator, which fills the DWORD
+		// buffer exactly, and reading it as a DWORD gives 12849.
+		if (lResult == ERROR_SUCCESS && dwIntType == REG_DWORD) {
 			RegCloseKey(hKey);
 			LogQueries("d", xmlName + L" - Retrieved integer value: " + std::to_wstring(dwValue));
 			return static_cast<int>(dwValue);
@@ -756,18 +765,22 @@ int GetIntegerSetting(const std::wstring& settingKey) {
 			if (lResult == ERROR_SUCCESS && dwBufferSize > 0 && dwBufferSize <= sizeof(path)
 				&& (dwStringType == REG_SZ || dwStringType == REG_EXPAND_SZ)) {
 				size_t chars = dwBufferSize / sizeof(wchar_t);
-				if (path[chars - 1] != L'\0') {
+				if (chars > 0 && path[chars - 1] != L'\0') {
 					LogQueries("d", xmlName + L" - Registry string was not NUL terminated, truncating.");
 					chars -= 1;
 				}
-				try {
-					int logValue = std::stoi(std::wstring(path, chars).c_str());
+				// stoi accepts a valid prefix and stops there: "80abc" and "80.5" both
+				// come back as 80, with no error. A setting with trailing characters
+				// in it is a typo, and quietly reading the part that happens to be
+				// a number is how a wrong refresh rate gets in. ParseIntSafe takes
+				// the whole value or none of it.
+				constexpr int kParseFailed = INT_MIN;
+				int logValue = ParseIntSafe(std::wstring(path, chars), kParseFailed, xmlName.c_str());
+				if (logValue != kParseFailed) {
 					LogQueries("d", xmlName + L" - Retrieved string value: " + std::to_wstring(logValue));
 					return logValue;
 				}
-				catch (const std::exception&) {
-					LogQueries("d", xmlName + L" - Failed to convert registry string value to integer.");
-				}
+				LogQueries("d", xmlName + L" - Failed to convert registry string value to integer.");
 			}
 		}
 	}
@@ -875,7 +888,11 @@ double GetDoubleSetting(const std::wstring& settingKey) {
 					// Force the terminator: a malformed REG_SZ is not guaranteed to have one.
 					if (dwBufferSize >= sizeof(wchar_t)) {
 						buffer[dwBufferSize / sizeof(wchar_t) - 1] = L'\0';
-						regValue = std::stod(buffer);
+						// stod has the same prefix problem as stoi -- "2.2abc" comes
+						// back as 2.2 -- and this value ends up in the colour primaries,
+						// where a half-read number is a colour that is subtly wrong
+						// rather than one that is obviously wrong.
+						regValue = ParseDoubleSafe(std::wstring(buffer), 0.0, xmlName.c_str());
 					}
 					else {
 						throw std::out_of_range("REG_SZ too small");
@@ -904,7 +921,10 @@ double GetDoubleSetting(const std::wstring& settingKey) {
 
 	double xmlLoggingValue = 0.0;
 	try {
-		xmlLoggingValue = std::stod(xmlValue);
+		// Same prefix problem as the registry branch: stod would accept "2.2abc"
+		// as 2.2. The colour primaries are read through here, and a silently
+		// half-read value is a colour that is subtly wrong.
+		xmlLoggingValue = ParseDoubleSafe(xmlValue, 0.0, xmlName.c_str());
 		LogQueries("i", xmlName + L" - Retrieved from XML: " + std::to_wstring(xmlLoggingValue));
 	}
 	catch (const std::exception&) {
@@ -1547,10 +1567,14 @@ bool LoadEdidProfile(const wstring& profilePath, EdidProfileData& profile) {
 			break;
 
 		case XmlNodeType_EndElement:
-			// Without this the two names below were set on Element and never reset, so they
-			// kept describing the last element opened rather than the one being read.
+			// The text of an element always arrives before its EndElement, so clearing
+			// currentElement here is safe. currentSection is NOT: it is set when the
+			// section opens and has to stay until the section closes, and the reader
+			// does not say which element is closing. Clearing it here meant the first
+			// element of every section was read and the rest were skipped -- the
+			// profile yielded zero modes instead of 26, and no luminance, no
+			// chromaticity, no gamma and the default preferred mode.
 			currentElement.clear();
-			currentSection.clear();
 			break;
 
 		case XmlNodeType_Text:
@@ -1832,6 +1856,14 @@ void float_to_vsync(float refresh_rate, int& num, int& den) {
 
 	num = static_cast<int>(round(static_cast<double>(refresh_rate) * den));
 
+	if (num == 0) {
+		// A rate small enough that the product rounds to zero leaves the mode with
+		// a zero numerator, and a zero numerator divides by zero when the mode is
+		// turned into timings. 0.00001 Hz is a value someone can type.
+		vddlog("e", "Refresh rate rounds to a zero numerator, falling back to 60");
+		num = 60 * den;
+	}
+
 	int divisor = gcd(num, den);
 	num /= divisor;
 	den /= divisor;
@@ -1884,6 +1916,10 @@ void CloseLogFile() {
 	g_LogFilePath.clear();
 }
 
+// Set inside WriteLogLine while g_LogFileMutex is held, read by vddlog() once that
+// lock has been released.
+static bool g_LogDirFailed = false;
+
 void WriteLogLine(const wstring& logPath, const string& line) {
 	lock_guard<mutex> lock(g_LogFileMutex);
 
@@ -1901,7 +1937,11 @@ void WriteLogLine(const wstring& logPath, const string& line) {
 		{
 			const wstring logsDir = confpath + L"\\Logs";
 			if (!CreateDirectoryW(logsDir.c_str(), NULL) && GetLastError() != ERROR_ALREADY_EXISTS) {
-				vddlog("d", "Log directory could not be created; the open below will fail");
+				// Not vddlog() from here: that would re-enter WriteLogLine with
+				// g_LogFileMutex already held, and std::mutex is not recursive, so
+				// the second acquire would block this thread forever. The caller
+				// reports it once the lock is gone.
+				g_LogDirFailed = true;
 			}
 		}
 		g_LogsDirEnsured = true;
@@ -1993,6 +2033,15 @@ void vddlog(const char* type, const char* message) {
 	const string logMessage = ss.str() + " [" + logType + "] " + message + "\n";
 
 	WriteLogLine(logPath, logMessage);
+
+	// The log directory could not be created. WriteLogLine cannot report it: it holds
+	// g_LogFileMutex, and vddlog() from inside it re-enters the same non-recursive
+	// mutex and deadlocks. This is outside the lock, and it goes to the pipe only,
+	// because the file is exactly what could not be opened.
+	if (g_LogDirFailed) {
+		g_LogDirFailed = false;
+		SendToPipe("[d] The log directory could not be created; no log file was written\n");
+	}
 
 	// No unlocked peek at g_pipeHandle here: SendToPipe() takes the pipe lock and checks it.
 	if (sendLogsThroughPipe) {
@@ -3073,6 +3122,23 @@ bool initpath() {
 	if (lResult == ERROR_SUCCESS && dwType != REG_SZ) {
 		lResult = ERROR_INVALID_DATA;
 	}
+	// A REG_SZ is not guaranteed to carry its own terminator: RegSetValueEx can be
+	// handed a character count with the NUL left out. The type check above does
+	// not catch that, and building the string from the raw array would scan the
+	// stack for a NUL that may not be there. Build it from the length the
+	// registry reported, the same way the four settings readers do.
+	if (lResult == ERROR_SUCCESS) {
+		if (dwBufferSize == 0 || dwBufferSize > sizeof(szPath)) {
+			lResult = ERROR_INVALID_DATA;
+		}
+		else {
+			size_t chars = dwBufferSize / sizeof(wchar_t);
+			if (chars > 0 && szPath[chars - 1] != L'\0') {
+				chars -= 1;
+			}
+			confpath = std::wstring(szPath, chars);
+		}
+	}
 	if (lResult != ERROR_SUCCESS) {
 		ostringstream oss;
 		oss << "Failed to open registry key for path. Error code: " << lResult;
@@ -3080,8 +3146,6 @@ bool initpath() {
 		RegCloseKey(hKey);
 		return false;
 	}
-
-	confpath = szPath;
 
 	RegCloseKey(hKey);
 
@@ -3178,8 +3242,8 @@ extern "C" NTSTATUS DriverEntry(
 	hdr10StaticMetadataEnabled = EnabledQuery(L"Hdr10StaticMetadataEnabled");
 	maxDisplayMasteringLuminance = GetDoubleSetting(L"MaxDisplayMasteringLuminance");
 	minDisplayMasteringLuminance = GetDoubleSetting(L"MinDisplayMasteringLuminance");
-	maxContentLightLevel = GetIntegerSetting(L"MaxContentLightLevel");
-	maxFrameAvgLightLevel = GetIntegerSetting(L"MaxFrameAvgLightLevel");
+	maxContentLightLevel = positiveOr(GetIntegerSetting(L"MaxContentLightLevel"), 1000, L"max_content_light_level");
+	maxFrameAvgLightLevel = positiveOr(GetIntegerSetting(L"MaxFrameAvgLightLevel"), 400, L"max_frame_avg_light_level");
 
 	colorPrimariesEnabled = EnabledQuery(L"ColorPrimariesEnabled");
 	redX = GetDoubleSetting(L"RedX");
@@ -3508,7 +3572,23 @@ void loadSettings() {
         if (count.empty() || count[0] == '#') {
             continue;
         }
-        numVirtualDisplays = ParseIntSafe(count, 1, L"option.txt display count");
+        // The other two sources of this count -- the XML and the SETDISPLAYCOUNT
+        // command -- both bound it to [MIN_VIRTUAL_DISPLAYS, MAX_VIRTUAL_DISPLAYS].
+        // This one did not, and numVirtualDisplays is a UINT: a count of -1 became
+        // 4294967295, which went into AdapterCaps.MaxMonitorsSupported and then
+        // into for (i = 0; i < numVirtualDisplays; i++) CreateMonitor(i). That is
+        // four billion monitor creations, and AdapterInitFinished never returns.
+        int parsedCount = ParseIntSafe(count, 1, L"option.txt display count");
+        if (parsedCount < static_cast<int>(MIN_VIRTUAL_DISPLAYS) || parsedCount > static_cast<int>(MAX_VIRTUAL_DISPLAYS)) {
+            stringstream ss;
+            ss << "option.txt display count is " << parsedCount << ", which is outside the supported range of "
+               << MIN_VIRTUAL_DISPLAYS << " to " << MAX_VIRTUAL_DISPLAYS << "; using 1";
+            vddlog("w", ss.str().c_str());
+            numVirtualDisplays = 1;
+        }
+        else {
+            numVirtualDisplays = parsedCount;
+        }
         haveDisplayCount = true;
         break;
     }
@@ -4399,13 +4479,27 @@ vector<BYTE> loadEdid(const string& filePath) {
 	// The EDID base block is 128 bytes. calculateChecksum() below unconditionally reads
 	// edid[0..126] and the caller writes edid[127], so a shorter file would read and
 	// write past the end of the heap buffer.
-	if (size < 128) {
-		vddlog("e", "Custom edid is shorter than the 128-byte base block, ignoring it");
+	//
+	// The upper bound is here for the same reason: an EDID is 128 or 256 bytes,
+	// and a file of tens of gigabytes is not one. Allocating it would let a
+	// sparse file throw std::bad_alloc out of a UMDF callback, which
+	// terminates the host process.
+	constexpr streamsize kMaxEdidBytes = 64 * 1024;
+	if (size < 128 || size > kMaxEdidBytes) {
+		vddlog("e", "Custom edid has an implausible size, ignoring it");
 		vddlog("i", "Using hardcoded edid");
 		return hardcodedEdid;
 	}
 
-	vector<BYTE> buffer(size);
+	vector<BYTE> buffer;
+	try {
+		buffer.resize((size_t)size);
+	}
+	catch (const exception&) {
+		vddlog("e", "Custom edid could not be allocated, ignoring it");
+		vddlog("i", "Using hardcoded edid");
+		return hardcodedEdid;
+	}
 	if (file.read((char*)buffer.data(), size)) {
 		//calculate checksum and compare it to 127 byte, if false then return hardcoded if true then return buffer to prevent loading borked edid.
 		BYTE calculatedChecksum = calculateChecksum(buffer);
@@ -5987,19 +6081,19 @@ NTSTATUS ValidateAndSanitizeConfiguration()
 
 	if (localRedX <= 0.0 || localRedX > 1.0 || localRedY <= 0.0 || localRedY > 1.0) {
 		vddlog("w", "Invalid red primary coordinates, using sRGB defaults");
-		localRedX = 0.708; localRedY = 0.292;
+		localRedX = 0.640; localRedY = 0.330;
 		sanitizedSettings++;
 	}
 
 	if (localGreenX <= 0.0 || localGreenX > 1.0 || localGreenY <= 0.0 || localGreenY > 1.0) {
 		vddlog("w", "Invalid green primary coordinates, using sRGB defaults");
-		localGreenX = 0.170; localGreenY = 0.797;
+		localGreenX = 0.300; localGreenY = 0.600;
 		sanitizedSettings++;
 	}
 	
 	if (localBlueX <= 0.0 || localBlueX > 1.0 || localBlueY <= 0.0 || localBlueY > 1.0) {
 		vddlog("w", "Invalid blue primary coordinates, using sRGB defaults");
-		localBlueX = 0.131; localBlueY = 0.046;
+		localBlueX = 0.150; localBlueY = 0.060;
 		sanitizedSettings++;
 	}
 
