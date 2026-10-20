@@ -188,11 +188,11 @@
     <HDR10Supported>true</HDR10Supported>
     <DolbyVisionSupported>false</DolbyVisionSupported>
     <HDR10PlusSupported>false</HDR10PlusSupported>
-    <MaxLuminance>1670.838</MaxLuminance>
-    <MinLuminance>10.615</MinLuminance>
+    <MaxLuminance>1700.000</MaxLuminance>
+    <MinLuminance>0.003</MinLuminance>
   </HDRCapabilities>
   <ColorProfile>
-    <PrimaryColorSpace>sRGB</PrimaryColorSpace>
+    <PrimaryColorSpace>Rec709</PrimaryColorSpace>
     <Gamma>2.200</Gamma>
     <Chromaticity>
       <RedX>0.6250</RedX>

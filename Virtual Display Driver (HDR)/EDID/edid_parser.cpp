@@ -312,24 +312,30 @@ private:
         const double srgb_red_x = 0.64, srgb_red_y = 0.33;
         const double srgb_green_x = 0.30, srgb_green_y = 0.60;
         const double srgb_blue_x = 0.15, srgb_blue_y = 0.06;
-        
+
         // Rec.2020 coordinates
         const double rec2020_red_x = 0.708, rec2020_red_y = 0.292;
         const double rec2020_green_x = 0.170, rec2020_green_y = 0.797;
         const double rec2020_blue_x = 0.131, rec2020_blue_y = 0.046;
-        
+
         // DCI-P3 coordinates
         const double dcip3_red_x = 0.680, dcip3_red_y = 0.320;
         const double dcip3_green_x = 0.265, dcip3_green_y = 0.690;
         const double dcip3_blue_x = 0.150, dcip3_blue_y = 0.060;
-        
+
         double tolerance = 0.02;
-        
-        // Check for Rec.2020
+
+        // The blue primaries are part of the comparison. They used to be left out
+        // of every test -- and the sRGB coordinates were never used at all --
+        // so a display whose red and green drifted but whose blue did not was
+        // still called Rec.2020, and anything that matched nothing was called
+        // sRGB rather than unknown.
         if (std::abs(color_profile.red_x - rec2020_red_x) < tolerance &&
             std::abs(color_profile.red_y - rec2020_red_y) < tolerance &&
             std::abs(color_profile.green_x - rec2020_green_x) < tolerance &&
-            std::abs(color_profile.green_y - rec2020_green_y) < tolerance) {
+            std::abs(color_profile.green_y - rec2020_green_y) < tolerance &&
+            std::abs(color_profile.blue_x - rec2020_blue_x) < tolerance &&
+            std::abs(color_profile.blue_y - rec2020_blue_y) < tolerance) {
             color_profile.primary_colorspace = ColorProfile::Rec2020;
             color_profile.supported_colorspaces.push_back(ColorProfile::Rec2020);
         }
@@ -337,14 +343,26 @@ private:
         else if (std::abs(color_profile.red_x - dcip3_red_x) < tolerance &&
                  std::abs(color_profile.red_y - dcip3_red_y) < tolerance &&
                  std::abs(color_profile.green_x - dcip3_green_x) < tolerance &&
-                 std::abs(color_profile.green_y - dcip3_green_y) < tolerance) {
+                 std::abs(color_profile.green_y - dcip3_green_y) < tolerance &&
+                 std::abs(color_profile.blue_x - dcip3_blue_x) < tolerance &&
+                 std::abs(color_profile.blue_y - dcip3_blue_y) < tolerance) {
             color_profile.primary_colorspace = ColorProfile::DCI_P3;
             color_profile.supported_colorspaces.push_back(ColorProfile::DCI_P3);
         }
-        // Default to sRGB/Rec.709
+        // sRGB and Rec.709 share their primaries.
+        else if (std::abs(color_profile.red_x - srgb_red_x) < tolerance &&
+                 std::abs(color_profile.red_y - srgb_red_y) < tolerance &&
+                 std::abs(color_profile.green_x - srgb_green_x) < tolerance &&
+                 std::abs(color_profile.green_y - srgb_green_y) < tolerance &&
+                 std::abs(color_profile.blue_x - srgb_blue_x) < tolerance &&
+                 std::abs(color_profile.blue_y - srgb_blue_y) < tolerance) {
+            color_profile.primary_colorspace = ColorProfile::Rec709;
+            color_profile.supported_colorspaces.push_back(ColorProfile::Rec709);
+        }
+        // Not a colour space we know. Say so rather than claiming sRGB.
         else {
-            color_profile.primary_colorspace = ColorProfile::sRGB;
-            color_profile.supported_colorspaces.push_back(ColorProfile::sRGB);
+            color_profile.primary_colorspace = ColorProfile::UNKNOWN;
+            color_profile.supported_colorspaces.push_back(ColorProfile::UNKNOWN);
         }
     }
     
@@ -599,13 +617,17 @@ private:
             case 0x03: std::cout << "    → VESA Video Timing Block Extension" << std::endl; break;
             case 0x04: std::cout << "    → HDMI Video Data Block" << std::endl; break;
             case 0x05: std::cout << "    → Colorimetry Data Block" << std::endl; break;
-            case 0x06: 
+            case 0x06:
                 std::cout << "    → HDR Static Metadata Data Block" << std::endl;
-                parse_hdr_static_metadata(&etb[1], length - 1);
+                // The whole payload. The length in the header counts the payload
+                // and not the header byte, so passing length - 1 here dropped
+                // the last byte of the block -- which is where the high byte of
+                // MaxFALL lives.
+                parse_hdr_static_metadata(&etb[1], length);
                 break;
-            case 0x07: 
+            case 0x07:
                 std::cout << "    → HDR Dynamic Metadata Data Block" << std::endl;
-                parse_hdr_dynamic_metadata(&etb[1], length - 1);
+                parse_hdr_dynamic_metadata(&etb[1], length);
                 break;
             case 0x08: std::cout << "    → Video Format Preference Data Block" << std::endl; break;
             case 0x09: std::cout << "    → YCbCr 4:2:0 Video Data Block" << std::endl; break;
@@ -665,24 +687,42 @@ private:
                 std::cout << "      Min Display Mastering Luminance (raw): " << (int)hdr_data[3] << std::endl;
             }
             if (length >= 5) {
-                hdr_metadata.static_metadata_type1.max_content_light_level = hdr_data[4];
-                std::cout << "      Max Content Light Level (raw): " << (int)hdr_data[4] << std::endl;
-            }
-            if (length >= 6) {
-                hdr_metadata.static_metadata_type1.max_frame_avg_light_level = hdr_data[5];
-                std::cout << "      Max Frame Avg Light Level (raw): " << (int)hdr_data[5] << std::endl;
+                // MaxCLL and MaxFALL are 16-bit fields. Reading one byte of each
+                // gave 16 nits for a display that reports 1040, and the byte
+                // that was read as MaxFALL was really the high byte of MaxCLL.
+                if (length >= 6) {
+                    hdr_metadata.static_metadata_type1.max_content_light_level =
+                        (uint16_t)(hdr_data[4] | (hdr_data[5] << 8));
+                    std::cout << "      Max Content Light Level (raw): "
+                              << hdr_metadata.static_metadata_type1.max_content_light_level << std::endl;
+                }
+                if (length >= 8) {
+                    hdr_metadata.static_metadata_type1.max_frame_avg_light_level =
+                        (uint16_t)(hdr_data[6] | (hdr_data[7] << 8));
+                    std::cout << "      Max Frame Avg Light Level (raw): "
+                              << hdr_metadata.static_metadata_type1.max_frame_avg_light_level << std::endl;
+                }
             }
         }
-        
-        // Convert to actual luminance values
+
+        // Convert to actual luminance values.
+        //
+        // CTA-861.3: Desired Max Display Mastering Luminance is a 6-bit value in
+        // units of 50 nits, and Desired Min Display Mastering Luminance is a
+        // 6-bit value in units of 0.0001 nits. The code used an exponential
+        // formula on the unmasked byte for the maximum and a linear
+        // interpolation for the minimum, which are not the units the field is
+        // in. The top two bits of each byte are reserved and have to be masked
+        // off before the value is read.
         if (hdr_metadata.static_metadata_type1.max_display_mastering_luminance > 0) {
-            hdr_metadata.max_luminance = 50.0 * std::pow(2.0, hdr_metadata.static_metadata_type1.max_display_mastering_luminance / 32.0);
+            hdr_metadata.max_luminance =
+                50.0 * (hdr_metadata.static_metadata_type1.max_display_mastering_luminance & 0x3F);
             std::cout << "      Calculated Max Luminance: " << hdr_metadata.max_luminance << " nits" << std::endl;
         }
-        
+
         if (hdr_metadata.static_metadata_type1.min_display_mastering_luminance > 0) {
-            hdr_metadata.min_luminance = (hdr_metadata.static_metadata_type1.min_display_mastering_luminance / 255.0) * 
-                                        (hdr_metadata.max_luminance / 100.0);
+            hdr_metadata.min_luminance =
+                0.0001 * (hdr_metadata.static_metadata_type1.min_display_mastering_luminance & 0x3F);
             std::cout << "      Calculated Min Luminance: " << hdr_metadata.min_luminance << " nits" << std::endl;
         }
         
