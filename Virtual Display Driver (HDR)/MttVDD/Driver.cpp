@@ -2101,8 +2101,10 @@ void vddlog(const char* type, const char* message) {
 	// mutex and deadlocks. This is outside the lock, and it goes to the pipe only,
 	// because the file is exactly what could not be opened. It comes after the
 	// line itself, so the stream reads in the order the events happened.
-	if (g_LogDirFailed) {
-		g_LogDirFailed = false;
+	// exchange() rather than a test followed by a clear: two threads can both
+	// see the flag set and both report it, and the warning is meant to be
+	// said once.
+	if (g_LogDirFailed.exchange(false)) {
 		SendToPipe("[d] The log directory could not be created; no log file was written\n");
 	}
 }
@@ -3416,6 +3418,68 @@ vector<string> split(string& input, char delimiter)
 }
 
 
+// The mode list the driver falls back on when a configuration produced none. An
+// empty mode list is a driver failure -- ValidateModeList refuses one on purpose --
+// so every path that can come up with nothing has to end up here instead of
+// installing an empty list.
+vector<tuple<int, int, int, int>> BuildFallbackModeList() {
+	vector<tuple<int, int, float>> fallbackRes = {
+		{800, 600, 30.0f},
+		{800, 600, 60.0f},
+		{800, 600, 90.0f},
+		{800, 600, 120.0f},
+		{800, 600, 144.0f},
+		{800, 600, 165.0f},
+		{1280, 720, 30.0f},
+		{1280, 720, 60.0f},
+		{1280, 720, 90.0f},
+		{1280, 720, 130.0f},
+		{1280, 720, 144.0f},
+		{1280, 720, 165.0f},
+		{1366, 768, 30.0f},
+		{1366, 768, 60.0f},
+		{1366, 768, 90.0f},
+		{1366, 768, 120.0f},
+		{1366, 768, 144.0f},
+		{1366, 768, 165.0f},
+		{1920, 1080, 30.0f},
+		{1920, 1080, 60.0f},
+		{1920, 1080, 90.0f},
+		{1920, 1080, 120.0f},
+		{1920, 1080, 144.0f},
+		{1920, 1080, 165.0f},
+		{2560, 1440, 30.0f},
+		{2560, 1440, 60.0f},
+		{2560, 1440, 90.0f},
+		{2560, 1440, 120.0f},
+		{2560, 1440, 144.0f},
+		{2560, 1440, 165.0f},
+		{3840, 2160, 30.0f},
+		{3840, 2160, 60.0f},
+		{3840, 2160, 90.0f},
+		{3840, 2160, 120.0f},
+		{3840, 2160, 144.0f},
+		{3840, 2160, 165.0f}
+	};
+
+	vector<tuple<int, int, int, int>> modes;
+	for (const auto& mode : fallbackRes) {
+		int width, height;
+		float refreshRate;
+		tie(width, height, refreshRate) = mode;
+
+		int vsync_num, vsync_den;
+		float_to_vsync(refreshRate, vsync_num, vsync_den);
+
+		stringstream ss;
+		modes.push_back(make_tuple(width, height, vsync_num, vsync_den));
+
+		ss << "Resolution: " << width << "x" << height << " @ " << vsync_num << "/" << vsync_den << "Hz";
+		vddlog("d", ss.str().c_str());
+	}
+	return modes;
+}
+
 void loadSettings() {
 	const wstring settingsname = confpath + L"\\vdd_settings.xml";
 	const wstring& filename = settingsname;
@@ -3584,6 +3648,14 @@ void loadSettings() {
 
 		numVirtualDisplays = monitorcount;
 		gpuname = gpuFriendlyName;
+		if (res.empty()) {
+			// An empty mode list is a driver failure: ValidateModeList refuses one
+			// on purpose, and the option.txt path falls back on the built-in modes
+			// when its own comes out empty. Fall back on the same list rather than
+			// install an empty one and leave the adapter with no modes at all.
+			vddlog("w", "vdd_settings.xml yielded no usable modes. Enabling Fallback");
+			res = BuildFallbackModeList();
+		}
 		monitorModes = res;
 		RebuildKnownMonitorModesCache();
 		
@@ -3712,62 +3784,8 @@ void loadSettings() {
 
 	numVirtualDisplays = 1;
 	vector<tuple<int, int, int, int>> res;
-	vector<tuple<int, int, float>> fallbackRes = {
-		{800, 600, 30.0f},
-		{800, 600, 60.0f},
-		{800, 600, 90.0f},
-		{800, 600, 120.0f},
-		{800, 600, 144.0f},
-		{800, 600, 165.0f},
-		{1280, 720, 30.0f},
-		{1280, 720, 60.0f},
-		{1280, 720, 90.0f},
-		{1280, 720, 130.0f},
-		{1280, 720, 144.0f},
-		{1280, 720, 165.0f},
-		{1366, 768, 30.0f},
-		{1366, 768, 60.0f},
-		{1366, 768, 90.0f},
-		{1366, 768, 120.0f},
-		{1366, 768, 144.0f},
-		{1366, 768, 165.0f},
-		{1920, 1080, 30.0f},
-		{1920, 1080, 60.0f},
-		{1920, 1080, 90.0f},
-		{1920, 1080, 120.0f},
-		{1920, 1080, 144.0f},
-		{1920, 1080, 165.0f},
-		{2560, 1440, 30.0f},
-		{2560, 1440, 60.0f},
-		{2560, 1440, 90.0f},
-		{2560, 1440, 120.0f},
-		{2560, 1440, 144.0f},
-		{2560, 1440, 165.0f},
-		{3840, 2160, 30.0f},
-		{3840, 2160, 60.0f},
-		{3840, 2160, 90.0f},
-		{3840, 2160, 120.0f},
-		{3840, 2160, 144.0f},
-		{3840, 2160, 165.0f}
-	};
-
 	vddlog("i", "Loading Fallback - no settings found");
-
-	for (const auto& mode : fallbackRes) {
-		int width, height;
-		float refreshRate;
-		tie(width, height, refreshRate) = mode;
-
-		int vsync_num, vsync_den;
-		float_to_vsync(refreshRate, vsync_num, vsync_den);
-
-		stringstream ss;
-		res.push_back(make_tuple(width, height, vsync_num, vsync_den));
-
-
-		ss << "Resolution: " << width << "x" << height << " @ " << vsync_num << "/" << vsync_den << "Hz";
-		vddlog("d", ss.str().c_str());
-	}
+	res = BuildFallbackModeList();
 
 	monitorModes = res;
 	RebuildKnownMonitorModesCache();
@@ -6113,8 +6131,9 @@ NTSTATUS ValidateAndSanitizeConfiguration()
 		// Keep a copy of the list as it was. The limits can exclude every
 		// configured mode -- a range sitting between two resolutions does
 		// exactly that -- and an empty mode list is a driver failure:
-		// ValidateModeList refuses one on purpose, and every other producer
-		// of this list falls back when it comes out empty. This one did not.
+		// ValidateModeList refuses one on purpose, and the producers of this
+		// list fall back on the built-in modes when theirs comes out empty.
+		// This one did not.
 		const auto configuredModes = monitorModes;
 		monitorModes.erase(
 			std::remove_if(monitorModes.begin(), monitorModes.end(),

@@ -152,14 +152,15 @@ jobs:
           #
           # SkipPackageVerification=true turns off the WDK's InfVerif run. Two reasons it
           # cannot be a gate here: the task loads InfVerif.dll from a subfolder named after
-          # the bitness of the host process, and the WDK ships bin\x64 and bin\arm64 but no
-          # bin\x86 -- while the msbuild on PATH is the 32-bit
-          # MSBuild\Current\Bin\MSBuild.exe (the 64-bit one lives in \amd64). Every run then
-          # logs "INF verification exception: Unable to load DLL 'x86\InfVerif.dll'". The
-          # findings it would report are not ours either: infverif flags ERROR(2084) for
-          # the WUDFRd.sys service binary and ERROR(1322) for UMDriverCopy=12,UMDF, and the
-          # INF published upstream produces the same two -- they are inherent to the UMDF
-          # shape, not defects in this driver.
+          # the bitness of the host process, and the DLL it wants exists only as
+          # build\<sdk>\bin\x64\infverif.dll and build\<sdk>\bin\arm64\infverif.dll -- there
+          # is no x86 copy of it anywhere in the Kits tree -- while the msbuild on PATH is
+          # the 32-bit MSBuild\Current\Bin\MSBuild.exe (the 64-bit one lives in \amd64).
+          # Every run then logs "INF verification exception: Unable to load DLL
+          # 'x86\InfVerif.dll'". The findings it would report are not ours either: infverif
+          # flags ERROR(2084) for the WUDFRd.sys service binary and ERROR(1322) for
+          # UMDriverCopy=12,UMDF, and the INF published upstream produces the same two --
+          # they are inherent to the UMDF shape, not defects in this driver.
           msbuild $sln `
             /m `
             /t:Build `
