@@ -18,7 +18,8 @@ if (-Not ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdent
         # without -Wait returns immediately, and a bare `exit` sets the parent's
         # exit code to 0 -- so a caller checking $LASTEXITCODE saw success
         # whether the child had worked or not, and also when the elevation
-        # itself was refused or the child died.        $process = Start-Process -WorkingDirectory $PSScriptRoot -FilePath PowerShell.exe -Verb RunAs -ArgumentList $CommandLine -Wait -PassThru
+        # itself was refused or the child died.
+        $process = Start-Process -WorkingDirectory $PSScriptRoot -FilePath PowerShell.exe -Verb RunAs -ArgumentList $CommandLine -Wait -PassThru
         exit $process.ExitCode
     }
 }

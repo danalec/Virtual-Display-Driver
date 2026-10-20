@@ -53,3 +53,9 @@ if %ERRORLEVEL% neq 0 (
 :: caller that redirects stdin -- exactly the cases where anyone would automate it. `choice`
 :: with a timeout lets a human read the output without making the script unhangable.
 choice /T 10 /D N /M "Press any key to close, or wait 10s..."
+:: `choice` returns 255 when the timeout expires with no keypress, and as the
+:: last line of this .bat that value became the script's exit code. The parent
+:: then saw 255 and reported "Elevated module installation failed" after an
+:: install that had succeeded. The result of the install is what the caller
+:: needs; the pause must not overwrite it.
+exit /b 0

@@ -158,11 +158,14 @@ if (-Not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdenti
         # cleanup, and -Confirm:$false made the elevated child stop and ask.
         # Switches are only passed bare when they are actually on.
         if ($value -is [System.Management.Automation.SwitchParameter]) {
+            # The name, and only when the switch is on. The elevated child
+            # is Windows PowerShell 5.1, and it cannot bind an explicit switch
+            # value under -File: "-Json:False" fails with "Cannot process
+            # argument transformation on parameter 'Json'" and the child dies
+            # before the body runs. An off switch is left out, which is what
+            # the child's own default already says.
             if ($value.IsPresent) {
                 $psArgs += "-$key"
-            }
-            else {
-                $psArgs += "-$key`:$false"
             }
         }
         else {

@@ -30,7 +30,8 @@ if (-Not ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdent
 		# whether the child had worked or not, and also when the elevation
 		# itself was refused or the child died.
 		$process = Start-Process -WorkingDirectory $PSScriptRoot -FilePath PowerShell.exe -Verb RunAs -ArgumentList $CommandLine -Wait -PassThru
-		exit $process.ExitCode	}
+		exit $process.ExitCode
+		}
 }
 
 # Install dependencies if required.

@@ -103,10 +103,14 @@ finally {
 # described by an EDID profile. The pattern below covers the names the driver and its INF can
 # produce.
 #
-# Six helper scripts used to match "VDD by MTT", a string that appears nowhere in this repository
-# and in no file it ships, so all six stopped at "Could not find the virtual display" with the
-# driver installed and working. Match the names the driver can actually produce, and when none of
-# them is present say what was found instead of repeating a guess.
+# Six helper scripts used to match "VDD by MTT" on the grounds that the string appears nowhere
+# in this repository and in no file it ships. That is not true: it is the 0xFC descriptor of
+# the hardcoded EDID in Driver.cpp, which is the EDID the driver reports when EDID integration
+# is off -- the shipped default -- and it is the name Get-DisplayInfo reports for the display.
+# A text search cannot find it because it lives in a hex array, not in a string.
+#
+# Match the names the driver can actually produce, and when none of them is present say what
+# was found instead of repeating a guess.
 #
 # Extend the pattern here, not in the six callers, if a new EDID profile introduces a name
 # outside this set.
@@ -116,8 +120,25 @@ function Get-VddDisplay {
         throw "DisplayConfig reported no displays at all."
     }
 
-    $pattern = 'Virtual\s*Display\s*Driver|VirtualDisplayDriver|MttVDD|IDD\s*Sample|IddSampleDriver'
-    $found = @($all | Where-Object { $_.DisplayName -and $_.DisplayName -match $pattern })
+    # "VDD by MTT" is the monitor name the driver reports: the 0xFC descriptor of the
+    # hardcoded EDID in Driver.cpp. Get-DisplayInfo's DisplayName is that descriptor --
+    # checked against the three monitors attached to this machine, where the registry
+    # EDID 0xFC name and the DisplayConfig DisplayName are the same string every time.
+    #
+    # The endpoint name ("VirtualDisplayDriver Device") is kept as well, in case the
+    # display stack reports the endpoint instead of the EDID.
+    $pattern = 'VDD\s*by\s*MTT|Virtual\s*Display\s*Driver|VirtualDisplayDriver|MttVDD|IDD\s*Sample|IddSampleDriver'
+    
+    # The monitor's own device id is the other half of the identity. The driver forces
+    # its manufacturer and product codes on every EDID it reports -- modifyEdid() in
+    # Driver.cpp writes 0x36 0x94 0x37 0x13 into bytes 8 to 11 -- and Windows renders
+    # that as MTT1337 in the device path. It is what a custom EDID with a name of
+    # its own still shows up as, so it is checked as well.
+    $deviceIdPattern = 'DISPLAY#MTT1337#'
+    $found = @($all | Where-Object {
+        ($_.DisplayName -and $_.DisplayName -match $pattern) -or
+        ($_.DevicePath -and $_.DevicePath -match $deviceIdPattern)
+    })
 
     if ($found.Count -eq 1) {
         return $found[0]

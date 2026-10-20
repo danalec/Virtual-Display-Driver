@@ -16,12 +16,23 @@ param(
     # match a real monitor either, since "Virtual" has to come before
     # "Display" and the instance name starts with "DISPLAY\".
     #
-    # The default is now the UID, which every instance name carries -- the
-    # sort key below already depends on it. That finds the display; when more
-    # than one matches, the script says so and lists the candidates, so the
-    # right one can be picked with -InstancePattern.
+    # The default is the driver's own monitor device id, MTT1337. Windows renders a
+    # monitor's device id as the EDID manufacturer as three letters followed by the
+    # product code as four hex digits, and the product code in the little endian
+    # order the EDID stores it in: the three monitors attached to this machine
+    # register as AVX0056, GSM59F1 and GSM5C9E, and their EDIDs carry exactly
+    # those bytes. The driver forces its own manufacturer and product codes on
+    # every EDID it reports -- modifyEdid() in Driver.cpp writes 0x36 0x94 0x37
+    # 0x13 into bytes 8 to 11 -- so 0x3694 decodes to the letters MTT and 0x3713
+    # renders as 1337. That is the pattern the upstream script used, and it
+    # matches the virtual monitor and no physical one.
+    #
+    # Matching the UID instead matched every monitor on the machine, physical ones
+    # included: the instance name of any display carries &UID<n>, and with a
+    # single match the script handed back a physical monitor's DeviceName with
+    # no warning at all.
     [Parameter(Mandatory=$false, Position=0)]
-    [string]$InstancePattern = '*UID*'
+    [string]$InstancePattern = '*MTT1337*'
 )
 
 # One-liner to get the logicalname of the first VDD
