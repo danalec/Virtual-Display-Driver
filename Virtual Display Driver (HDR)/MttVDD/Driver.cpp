@@ -2572,21 +2572,66 @@ void logAvailableGPUs() {
 
 
 
-void ReloadDriver(HANDLE hPipe) {
-	auto* pContext = WdfObjectGet_IndirectDeviceContextWrapper(hPipe);
-	if (pContext && pContext->pContext) {
-		pContext->pContext->InitAdapter();
-		vddlog("i", "Adapter reinitialized");
-	}
+// This used to take the named-pipe handle and hand it to WdfObjectGet_IndirectDeviceContextWrapper,
+// which expects a WDF object. It never was one, so the lookup yielded nothing and every caller
+// silently did nothing -- fifteen commands that log "Enabled" and then apply nothing.
+//
+// It is not wired to InitAdapter either, and should not be: InitAdapter calls IddCxAdapterInitAsync,
+// which is a one-shot per adapter. Calling it again from here would leave the live adapter in
+// place and bring up a second one, duplicating the monitors FinishInit creates.
+//
+// So this states what actually happened. The setting has been written to vdd_settings.xml; the
+// driver picks it up the next time it starts, which is what the callers' "Restarting Driver"
+// messages describe.
+void ReloadDriver() {
+	vddlog("i", "Setting written to vdd_settings.xml. It takes effect when the driver next starts.");
 }
 
 
 void HandleClient(HANDLE hPipe) {
-	g_pipeHandle = hPipe;
+	SetPipeHandle(hPipe);
 	vddlog("p", "Client Handling Enabled");
-	wchar_t buffer[128];
-	DWORD bytesRead;
-	BOOL result = ReadFile(hPipe, buffer, sizeof(buffer) - sizeof(wchar_t), &bytesRead, NULL);
+	// Zero-initialised: the command dispatch below does wcsncmp against literals up to 15 wchar
+	// long, and the buffer is only NUL-terminated at bytesRead/2. With the rest of the array
+	// left as stack garbage the analysis was right to call those reads of invalid data, and
+	// wcsncmp would have been reading uninitialised memory rather than stopping early.
+	wchar_t buffer[128] = {};
+	DWORD bytesRead = 0;
+
+	// A client that connects and then says nothing used to park this thread in ReadFile
+	// forever, because NULL OVERLAPPED makes it un-interruptible. The command read is now
+	// bounded; after PIPE_READ_POLL_MS with nothing, the client is treated as idle and
+	// dropped, so the server loop always gets back to its g_Running check.
+	BOOL result = FALSE;
+	OVERLAPPED ovRead = {};
+	ovRead.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+
+	if (ovRead.hEvent == nullptr) {
+		vddlog("e", "Pipe client handler could not create its read event; dropping the connection");
+		DisconnectNamedPipe(hPipe);
+		CloseHandle(ClearPipeHandle());
+		return;
+	}
+
+	result = ReadFile(hPipe, buffer, sizeof(buffer) - sizeof(wchar_t), &bytesRead, &ovRead) ? TRUE : FALSE;
+	if (!result && GetLastError() == ERROR_IO_PENDING) {
+		const DWORD waitResult = WaitForSingleObject(ovRead.hEvent, PIPE_READ_POLL_MS);
+		if (waitResult == WAIT_OBJECT_0) {
+			result = GetOverlappedResult(hPipe, &ovRead, &bytesRead, FALSE) ? TRUE : FALSE;
+		}
+		else {
+			vddlog("p", "Client sent no command within the poll window; dropping the connection");
+			// Wait for the cancellation to finish before letting the OVERLAPPED and its event
+			// go out of scope. CancelIoEx only requests it: the kernel still holds a pointer to
+			// this stack structure until the operation completes, and StopNamedPipeServer's
+			// DisconnectNamedPipe is exactly what completes a pending read.
+			CancelIoEx(hPipe, &ovRead);
+			DWORD cancelledBytes = 0;
+			GetOverlappedResult(hPipe, &ovRead, &cancelledBytes, TRUE);
+		}
+	}
+	CloseHandle(ovRead.hEvent);
+
 	if (result && bytesRead != 0) {
 		buffer[bytesRead / sizeof(wchar_t)] = L'\0';
 		wstring bufferwstr(buffer);
@@ -2596,7 +2641,7 @@ void HandleClient(HANDLE hPipe) {
 		vddlog("p", bufferstr.c_str());
 		if (wcsncmp(buffer, L"RELOAD_DRIVER", 13) == 0) {
 			vddlog("c", "Reloading the driver");
-			ReloadDriver(hPipe);
+			ReloadDriver();
 			
 		}
 		else if (wcsncmp(buffer, L"LOG_DEBUG", 9) == 0) {
@@ -2631,12 +2676,12 @@ void HandleClient(HANDLE hPipe) {
 			if (wcsncmp(param, L"true", 4) == 0) {
 				UpdateXmlToggleSetting(true, L"HDRPlus");
 				vddlog("c", "HDR+ Enabled"); 
-				ReloadDriver(hPipe);
+				ReloadDriver();
 			} 
 			else if (wcsncmp(param, L"false", 5) == 0) {
 				UpdateXmlToggleSetting(false, L"HDRPlus");
 				vddlog("c", "HDR+ Disabled");
-				ReloadDriver(hPipe);
+				ReloadDriver();
 			}
 		}
 		else if (wcsncmp(buffer, L"SDR10", 5) == 0) {
@@ -2644,12 +2689,12 @@ void HandleClient(HANDLE hPipe) {
 			if (wcsncmp(param, L"true", 4) == 0) {
 				UpdateXmlToggleSetting(true, L"SDR10bit");
 				vddlog("c", "SDR 10 Bit Enabled");
-				ReloadDriver(hPipe);
+				ReloadDriver();
 			}
 			else if (wcsncmp(param, L"false", 5) == 0) {
 				UpdateXmlToggleSetting(false, L"SDR10bit");
 				vddlog("c", "SDR 10 Bit Disabled");
-				ReloadDriver(hPipe);
+				ReloadDriver();
 			}
 		}
 		else if (wcsncmp(buffer, L"CUSTOMEDID", 10) == 0) {
@@ -2657,12 +2702,12 @@ void HandleClient(HANDLE hPipe) {
 			if (wcsncmp(param, L"true", 4) == 0) {
 				UpdateXmlToggleSetting(true, L"CustomEdid");
 				vddlog("c", "Custom Edid Enabled");
-				ReloadDriver(hPipe);
+				ReloadDriver();
 			}
 			else if (wcsncmp(param, L"false", 5) == 0) {
 				UpdateXmlToggleSetting(false, L"CustomEdid");
 				vddlog("c", "Custom Edid Disabled");
-				ReloadDriver(hPipe);
+				ReloadDriver();
 			}
 		}
 		else if (wcsncmp(buffer, L"PREVENTSPOOF", 12) == 0) {
@@ -2670,12 +2715,12 @@ void HandleClient(HANDLE hPipe) {
 			if (wcsncmp(param, L"true", 4) == 0) {
 				UpdateXmlToggleSetting(true, L"PreventSpoof");
 				vddlog("c", "Prevent Spoof Enabled");
-				ReloadDriver(hPipe);
+				ReloadDriver();
 			}
 			else if (wcsncmp(param, L"false", 5) == 0) {
 				UpdateXmlToggleSetting(false, L"PreventSpoof");
 				vddlog("c", "Prevent Spoof Disabled");
-				ReloadDriver(hPipe);
+				ReloadDriver();
 			}
 		}
 		else if (wcsncmp(buffer, L"CEAOVERRIDE", 11) == 0) {
@@ -2683,12 +2728,12 @@ void HandleClient(HANDLE hPipe) {
 			if (wcsncmp(param, L"true", 4) == 0) {
 				UpdateXmlToggleSetting(true, L"EdidCeaOverride");
 				vddlog("c", "Cea override Enabled");
-				ReloadDriver(hPipe);
+				ReloadDriver();
 			}
 			else if (wcsncmp(param, L"false", 5) == 0) {
 				UpdateXmlToggleSetting(false, L"EdidCeaOverride");
 				vddlog("c", "Cea override Disabled");
-				ReloadDriver(hPipe);
+				ReloadDriver();
 			}
 		}
 		else if (wcsncmp(buffer, L"HARDWARECURSOR", 14) == 0) {
@@ -2696,12 +2741,12 @@ void HandleClient(HANDLE hPipe) {
 			if (wcsncmp(param, L"true", 4) == 0) {
 				UpdateXmlToggleSetting(true, L"HardwareCursor");
 				vddlog("c", "Hardware Cursor Enabled");
-				ReloadDriver(hPipe);
+				ReloadDriver();
 			}
 			else if (wcsncmp(param, L"false", 5) == 0) {
 				UpdateXmlToggleSetting(false, L"HardwareCursor");
 				vddlog("c", "Hardware Cursor Disabled");
-				ReloadDriver(hPipe);
+				ReloadDriver();
 			}
 		}
 		else if (wcsncmp(buffer, L"D3DDEVICEGPU", 12) == 0) {
@@ -2725,38 +2770,65 @@ void HandleClient(HANDLE hPipe) {
 			vddlog("c", "Logged all GPUs");
 		}  
 		else if (wcsncmp(buffer, L"SETGPU", 6) == 0) {
-			std::wstring gpuName = buffer + 7;
-			gpuName = gpuName.substr(1, gpuName.size() - 2); 
-
-			int size_needed = WideCharToMultiByte(CP_UTF8, 0, gpuName.c_str(), static_cast<int>(gpuName.length()), nullptr, 0, nullptr, nullptr);
-			std::string gpuNameNarrow(size_needed, 0);
-			WideCharToMultiByte(CP_UTF8, 0, gpuName.c_str(), static_cast<int>(gpuName.length()), &gpuNameNarrow[0], size_needed, nullptr, nullptr);
-
-			vddlog("c", ("Setting GPU to: " + gpuNameNarrow).c_str());
-			if (UpdateXmlGpuSetting(gpuName.c_str())) {
-				vddlog("c", "Gpu Changed, Restarting Driver");
+			// The value arrives quoted. Reading buffer+7 blindly walked past the NUL when the
+			// message was just "SETGPU", and substr(1, size()-2) threw std::out_of_range on this
+			// pipe thread whenever fewer than two characters followed the command.
+			std::wstring gpuName;
+			size_t cmdLen = wcslen(buffer);
+			if (cmdLen >= 9 && buffer[6] == L'"' && buffer[cmdLen - 1] == L'"') {
+				gpuName.assign(buffer + 7, cmdLen - 8);
 			}
 			else {
-				vddlog("e", "Failed to update GPU setting in XML. Restarting anyway");
+				vddlog("e", "SETGPU expects a quoted name, for example: SETGPU \"NVIDIA GeForce\"");
 			}
-			ReloadDriver(hPipe);
+
+			if (!gpuName.empty()) {
+				int size_needed = WideCharToMultiByte(CP_UTF8, 0, gpuName.c_str(), static_cast<int>(gpuName.length()), nullptr, 0, nullptr, nullptr);
+				std::string gpuNameNarrow(size_needed, 0);
+				WideCharToMultiByte(CP_UTF8, 0, gpuName.c_str(), static_cast<int>(gpuName.length()), &gpuNameNarrow[0], size_needed, nullptr, nullptr);
+
+				vddlog("c", ("Setting GPU to: " + gpuNameNarrow).c_str());
+				if (UpdateXmlGpuSetting(gpuName.c_str())) {
+					vddlog("c", "Gpu Changed, Restarting Driver");
+				}
+				else {
+					vddlog("e", "Failed to update GPU setting in XML. Restarting anyway");
+				}
+				ReloadDriver();
+			}
 		}
 		else if (wcsncmp(buffer, L"SETDISPLAYCOUNT", 15) == 0) {
 			vddlog("i", "Setting Display Count");
 
-			int newDisplayCount = 1;
-			swscanf_s(buffer + 15, L"%d", &newDisplayCount);
+			// The value used to go straight into the XML. numVirtualDisplays is a UINT that
+			// becomes AdapterCaps.MaxMonitorsSupported and a CreateMonitor() loop, so 0 meant
+			// no monitor at all and a negative number meant about four billion. Bound it
+			// here, where there is still a log line left to explain the refusal.
+			int requestedCount = 0;
+			const int fieldsRead = swscanf_s(buffer + 15, L"%d", &requestedCount);
 
-			std::wstring displayLog = L"Setting display count  to " + std::to_wstring(newDisplayCount);
-			vddlog("c", WStringToString(displayLog).c_str());
-
-			if (UpdateXmlDisplayCountSetting(newDisplayCount)){
-				vddlog("c", "Display Count Changed, Restarting Driver");
+			if (fieldsRead != 1) {
+				vddlog("e", "SETDISPLAYCOUNT needs a number, for example: SETDISPLAYCOUNT 2");
+			}
+			else if (requestedCount < static_cast<int>(MIN_VIRTUAL_DISPLAYS) ||
+				requestedCount > static_cast<int>(MAX_VIRTUAL_DISPLAYS)) {
+				stringstream ss;
+				ss << "SETDISPLAYCOUNT of " << requestedCount << " is outside the supported range of "
+					<< MIN_VIRTUAL_DISPLAYS << " to " << MAX_VIRTUAL_DISPLAYS << "; nothing was changed";
+				vddlog("e", ss.str().c_str());
 			}
 			else {
-				vddlog("e", "Failed to update display count setting in XML. Restarting anyway");
+				std::wstring displayLog = L"Setting display count to " + std::to_wstring(requestedCount);
+				vddlog("c", WStringToString(displayLog).c_str());
+
+				if (UpdateXmlDisplayCountSetting(requestedCount)) {
+					vddlog("c", "Display Count Changed, Restarting Driver");
+				}
+				else {
+					vddlog("e", "Failed to update display count setting in XML. Restarting anyway");
+				}
+				ReloadDriver();
 			}
-			ReloadDriver(hPipe);
 		}
 		else if (wcsncmp(buffer, L"GETSETTINGS", 11) == 0) {
 			//query and return settings
@@ -2779,16 +2851,23 @@ void HandleClient(HANDLE hPipe) {
 		else {
 			vddlog("e", "Unknown command");
 
-			size_t size_needed;
-			wcstombs_s(&size_needed, nullptr, 0, buffer, 0);
-			std::string narrowString(size_needed, 0);
-			wcstombs_s(nullptr, &narrowString[0], size_needed, buffer, size_needed);
-			vddlog("e", narrowString.c_str());
+			// buffer is whatever the pipe client sent, so it can hold an invalid multibyte
+			// sequence or a lone surrogate. wcstombs_s fails on that, zeroes size_needed, and
+			// the old code carried on into &narrowString[0] on an empty string with a zero
+			// destination size, having checked neither return value -- which is what the _s
+			// family exists to prevent. WStringToString is what the rest of this file uses for
+			// this conversion, and it handles the empty case.
+			vddlog("e", WStringToString(std::wstring(buffer)).c_str());
 		}
 	}
 	DisconnectNamedPipe(hPipe);
-	CloseHandle(hPipe);
-	g_pipeHandle = INVALID_HANDLE_VALUE; // This value determines whether or not all data gets sent back through the pipe or just the handling pipe data
+	// Withdraw the published handle before closing it, so vddlog() from any other thread stops
+	// seeing it the instant the client goes away. SendToPipe() writes through its own duplicate,
+	// so a log already in flight finishes against a live file object instead of a closed handle.
+	HANDLE previousPipe = ClearPipeHandle();
+	if (previousPipe != INVALID_HANDLE_VALUE) {
+		CloseHandle(previousPipe);
+	}
 }
 
 
@@ -2798,8 +2877,32 @@ DWORD WINAPI NamedPipeServer(LPVOID lpParam) {
 	SECURITY_ATTRIBUTES sa;
 	sa.nLength = sizeof(SECURITY_ATTRIBUTES);
 	sa.bInheritHandle = FALSE;
-	const wchar_t* sddl = L"D:(A;;GA;;;WD)";
-	vddlog("d", "Starting pipe with parameters: D:(A;;GA;;;WD)");
+
+	// Write is keyed to Administrators and SYSTEM; Everyone keeps read only.
+	//
+	// This is one duplex pipe serving two directions: SendToPipe() streams logs to the
+	// client, and the dispatcher reads commands from it. The SDDL below becomes the DACL
+	// on the pipe, and a DACL is checked against the dwDesiredAccess of the CLIENT's
+	// CreateFile -- once that handle exists, ReadFile and WriteFile only honour what the
+	// handle was granted, so refusing the write at open time is what actually gates the
+	// command channel. The server handle is untouched by this: its access comes from
+	// PIPE_ACCESS_DUPLEX in dwOpenMode, not from this descriptor, so log streaming keeps
+	// working. An unprivileged client can therefore still open the pipe to read logs,
+	// while opening it for write fails with ERROR_ACCESS_DENIED and not one command byte
+	// reaches the dispatcher.
+	//
+	// Everyone also no longer gets GENERIC_ALL, which is what FILE_CREATE_PIPE_INSTANCE
+	// (0x0008), DELETE, WRITE_DAC and WRITE_OWNER ride on: with those, any unprivileged
+	// session could spawn extra instances of this named pipe -- the classic named-pipe
+	// squatting route to impersonation -- or rewrite the DACL and then claim full access.
+	//
+	// Every helper in this repo requires an Administrator session and the driver rewrites
+	// vdd_settings.xml as SYSTEM, so requiring elevation to mutate is the intent rather
+	// than a regression. If Virtual Driver Control turns out to connect without
+	// elevation and its controls go dead, the symptom is CreateFile failing on the
+	// client, and the fix is to put the W back on this one ACE. Nothing else depends on it.
+	const wchar_t* sddl = L"D:(A;;GR;;;WD)(A;;GA;;;BA)(A;;GA;;;SY)";
+	vddlog("d", ("Starting pipe with parameters: " + WStringToString(std::wstring(sddl))).c_str());
 	if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
 		sddl, SDDL_REVISION_1, &sa.lpSecurityDescriptor, NULL)) {
 		DWORD ErrorCode = GetLastError();
@@ -2808,10 +2911,19 @@ DWORD WINAPI NamedPipeServer(LPVOID lpParam) {
 		return 1;
 	}
 	HANDLE hPipe;
+	DWORD bytesConnected = 0;
 	while (g_Running) {
+		// FILE_FLAG_OVERLAPPED is required, not optional. I/O mode is a per-handle property fixed
+		// when the handle is created, so without this flag the server handle is synchronous and
+		// handing it an OVERLAPPED structure is not a supported combination: either it is
+		// rejected outright, and the server loop spins forever closing and recreating the pipe
+		// without ever accepting a connection, or the OVERLAPPED is ignored and the call blocks
+		// uninterruptibly, which is the defect this path exists to remove. Declaring the server
+		// side overlapped makes both the bounded connect and the bounded command read well
+		// defined whatever the client chooses.
 		hPipe = CreateNamedPipeW(
 			PIPE_NAME,
-			PIPE_ACCESS_DUPLEX,
+			PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
 			PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
 			PIPE_UNLIMITED_INSTANCES,
 			512, 512,
@@ -2826,7 +2938,41 @@ DWORD WINAPI NamedPipeServer(LPVOID lpParam) {
 			return 1;
 		}
 
-		BOOL connected = ConnectNamedPipe(hPipe, NULL) ? TRUE : (GetLastError() == ERROR_PIPE_CONNECTED);
+		// ConnectNamedPipe blocks until a client shows up. It used to pass NULL for OVERLAPPED,
+		// which made it un-interruptible: g_Running is only tested between connections, so a
+		// stop request could not be noticed until somebody connected. StopNamedPipeServer()
+		// then sat in WaitForSingleObject(INFINITE) on this thread. Overlapped plus a bounded
+		// wait means the loop re-checks g_Running at most PIPE_CONNECT_POLL_MS late.
+		OVERLAPPED ovConnect = {};
+		ovConnect.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+
+		if (ovConnect.hEvent == nullptr) {
+			vddlog("e", "Pipe server could not create its connect event; giving up");
+			CloseHandle(hPipe);
+			LocalFree(sa.lpSecurityDescriptor);
+			return 1;
+		}
+
+		BOOL connected = ConnectNamedPipe(hPipe, &ovConnect) ? TRUE : (GetLastError() == ERROR_PIPE_CONNECTED);
+		if (!connected && GetLastError() == ERROR_IO_PENDING) {
+			const DWORD waitResult = WaitForSingleObject(ovConnect.hEvent, PIPE_CONNECT_POLL_MS);
+			if (waitResult == WAIT_OBJECT_0 && GetOverlappedResult(hPipe, &ovConnect, &bytesConnected, FALSE)) {
+				connected = TRUE;
+			}
+			else if (waitResult == WAIT_TIMEOUT) {
+				vddlog("p", "No client connected within the poll window; re-checking the run flag");
+			}
+			// Wait for the cancellation to finish before letting the OVERLAPPED and its event
+			// go out of scope. CancelIoEx only requests it: the kernel still holds a pointer to
+			// this stack structure until the operation completes. Without this wait the next
+			// loop iteration could CreateNamedPipeW over the same handle while the cancelled
+			// connect is still unwinding.
+			CancelIoEx(hPipe, &ovConnect);
+			DWORD cancelledBytes = 0;
+			GetOverlappedResult(hPipe, &ovConnect, &cancelledBytes, TRUE);
+		}
+		CloseHandle(ovConnect.hEvent);
+
 		if (connected) {
 			vddlog("p", "Client Connected");
 			HandleClient(hPipe);
@@ -2841,7 +2987,15 @@ DWORD WINAPI NamedPipeServer(LPVOID lpParam) {
 
 void StartNamedPipeServer() {
 	vddlog("p", "Starting Pipe");
-	hPipeThread = CreateThread(NULL, 0, NamedPipeServer, NULL, 0, NULL);
+	// Re-arm the run flag and publish the thread handle under g_Mutex. StopNamedPipeServer()
+	// clears g_Running, so without this a stop/start pair would hand the new thread a flag
+	// that is already false and it would exit at the top of the loop. hPipeThread is also read
+	// by StopNamedPipeServer() on another thread.
+	{
+		lock_guard<mutex> lock(g_Mutex);
+		g_Running = true;
+		hPipeThread = CreateThread(NULL, 0, NamedPipeServer, NULL, 0, NULL);
+	}
 	if (hPipeThread == NULL) {
 		DWORD ErrorCode = GetLastError();
 		string errorMessage = to_string(ErrorCode);
@@ -2858,7 +3012,15 @@ void StopNamedPipeServer() {
 		lock_guard<mutex> lock(g_Mutex);
 		g_Running = false;
 	}
-	if (hPipeThread) {
+	// hPipeThread is written by StartNamedPipeServer() and read here, so take it under the same
+	// lock rather than trusting a plain global across two threads.
+	HANDLE thread = NULL;
+	{
+		lock_guard<mutex> lock(g_Mutex);
+		thread = hPipeThread;
+		hPipeThread = NULL;
+	}
+	if (thread) {
 		HANDLE hPipe = CreateFileW(
 			PIPE_NAME,
 			GENERIC_READ | GENERIC_WRITE,
@@ -2873,10 +3035,17 @@ void StopNamedPipeServer() {
 			CloseHandle(hPipe);
 		}
 
-		WaitForSingleObject(hPipeThread, INFINITE);
-		CloseHandle(hPipeThread);
-		hPipeThread = NULL;
-		vddlog("p", "Stopped Pipe");
+		// Bounded rather than INFINITE. The server thread polls its run flag every
+		// PIPE_CONNECT_POLL_MS, so it cannot legitimately need longer than that plus the
+		// in-flight read; waiting forever only turned a slow shutdown into a hung one.
+		const DWORD waitResult = WaitForSingleObject(thread, PIPE_SHUTDOWN_WAIT_MS);
+		if (waitResult == WAIT_TIMEOUT) {
+			vddlog("w", "Pipe server thread did not stop within the shutdown window; leaving it to finish");
+		}
+		else {
+			vddlog("p", "Stopped Pipe");
+		}
+		CloseHandle(thread);
 	}
 }
 
@@ -2894,7 +3063,16 @@ bool initpath() {
 		return false;
 	}
 
-	lResult = RegQueryValueExW(hKey, L"VDDPATH", NULL, NULL, (LPBYTE)szPath, &dwBufferSize);
+	// Ask for the value type and insist it is a string. GetStringSetting already documents this
+	// hazard and defends against it; with lpdwType NULL a REG_BINARY or REG_DWORD VDDPATH leaves
+	// szPath without a terminator, and the std::wstring built from it below scans the stack
+	// until it finds one -- confpath would then carry that scan into every path the driver
+	// builds for the rest of the session.
+	DWORD dwType = 0;
+	lResult = RegQueryValueExW(hKey, L"VDDPATH", NULL, &dwType, (LPBYTE)szPath, &dwBufferSize);
+	if (lResult == ERROR_SUCCESS && dwType != REG_SZ) {
+		lResult = ERROR_INVALID_DATA;
+	}
 	if (lResult != ERROR_SUCCESS) {
 		ostringstream oss;
 		oss << "Failed to open registry key for path. Error code: " << lResult;
@@ -2921,6 +3099,8 @@ EvtDriverUnload(
 	UNREFERENCED_PARAMETER(Driver);
 	StopNamedPipeServer();
 	vddlog("i", "Driver Unloaded");
+	// After this point nothing calls vddlog again, so the cached log handle can go.
+	CloseLogFile();
 }
 
 _Use_decl_annotations_
