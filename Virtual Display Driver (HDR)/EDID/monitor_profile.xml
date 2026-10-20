@@ -81,13 +81,6 @@
     <MonitorMode>
       <Width>1920</Width>
       <Height>1080</Height>
-      <RefreshRate>7.000</RefreshRate>
-      <RefreshRateMultiplier>1000</RefreshRateMultiplier>
-      <NominalRefreshRate>7</NominalRefreshRate>
-    </MonitorMode>
-    <MonitorMode>
-      <Width>1920</Width>
-      <Height>1080</Height>
       <RefreshRate>50.000</RefreshRate>
       <RefreshRateMultiplier>1000</RefreshRateMultiplier>
       <NominalRefreshRate>50</NominalRefreshRate>
@@ -100,18 +93,11 @@
       <NominalRefreshRate>60</NominalRefreshRate>
     </MonitorMode>
     <MonitorMode>
-      <Width>3840</Width>
-      <Height>2160</Height>
-      <RefreshRate>0.000</RefreshRate>
+      <Width>1920</Width>
+      <Height>1080</Height>
+      <RefreshRate>60.000</RefreshRate>
       <RefreshRateMultiplier>1000</RefreshRateMultiplier>
-      <NominalRefreshRate>0</NominalRefreshRate>
-    </MonitorMode>
-    <MonitorMode>
-      <Width>3840</Width>
-      <Height>2160</Height>
-      <RefreshRate>4.000</RefreshRate>
-      <RefreshRateMultiplier>1000</RefreshRateMultiplier>
-      <NominalRefreshRate>4</NominalRefreshRate>
+      <NominalRefreshRate>60</NominalRefreshRate>
     </MonitorMode>
     <MonitorMode>
       <Width>3840</Width>
@@ -137,6 +123,13 @@
     <MonitorMode>
       <Width>3840</Width>
       <Height>2160</Height>
+      <RefreshRate>30.000</RefreshRate>
+      <RefreshRateMultiplier>1000</RefreshRateMultiplier>
+      <NominalRefreshRate>30</NominalRefreshRate>
+    </MonitorMode>
+    <MonitorMode>
+      <Width>3840</Width>
+      <Height>2160</Height>
       <RefreshRate>50.000</RefreshRate>
       <RefreshRateMultiplier>1000</RefreshRateMultiplier>
       <NominalRefreshRate>50</NominalRefreshRate>
@@ -146,6 +139,13 @@
       <Height>2160</Height>
       <RefreshRate>59.940</RefreshRate>
       <RefreshRateMultiplier>999</RefreshRateMultiplier>
+      <NominalRefreshRate>60</NominalRefreshRate>
+    </MonitorMode>
+    <MonitorMode>
+      <Width>3840</Width>
+      <Height>2160</Height>
+      <RefreshRate>60.000</RefreshRate>
+      <RefreshRateMultiplier>1000</RefreshRateMultiplier>
       <NominalRefreshRate>60</NominalRefreshRate>
     </MonitorMode>
     <MonitorMode>

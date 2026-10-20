@@ -267,7 +267,13 @@ private:
             return;
         }
         
-        uint16_t pixel_clock = read_uint16_le(dtd) * 10; // in kHz
+        // 32 bits, not 16: read_uint16_le returns the raw clock in units of
+        // 10 kHz, and multiplying by 10 gives kHz. A 1080p60 DTD is 14850, which
+        // is 148500 kHz -- that does not fit in a uint16_t and wrapped to
+        // 17428, so every refresh rate above 655.35 MHz came out as garbage.
+        // 1920x1080 at 148.5 MHz was reported as 7 Hz, and the profile the tool
+        // wrote that into is the profile the driver reads.
+        uint32_t pixel_clock = static_cast<uint32_t>(read_uint16_le(dtd)) * 10; // in kHz
         uint16_t h_active = dtd[2] | ((dtd[4] & 0xF0) << 4);
         uint16_t h_blanking = dtd[3] | ((dtd[4] & 0x0F) << 8);
         uint16_t v_active = dtd[5] | ((dtd[7] & 0xF0) << 4);
@@ -510,7 +516,7 @@ private:
                 // Parse HDMI capabilities
                 std::cout << "    HDMI capabilities found" << std::endl;
             }
-        } else if (oui == 0x00001A) { // Dolby Laboratories OUI
+        } else if (oui == 0x000D1E) { // Dolby Laboratories OUI (00-0D-1E, stored LSB-first)
             std::cout << "    → Dolby Laboratories Vendor Specific Data Block" << std::endl;
             parse_dolby_vendor_block(&vsdb[3], length - 3);
         } else if (oui == 0x90848B) { // HDR10+ Technologies OUI  
@@ -732,17 +738,49 @@ public:
         }
         
         file.seekg(0, std::ios::end);
-        size_t file_size = file.tellg();
+        std::streampos endPos = file.tellg();
         file.seekg(0, std::ios::beg);
-        
-        edid_data.resize(file_size);
-        file.read(reinterpret_cast<char*>(edid_data.data()), file_size);
-        
+
+        // tellg() answers -1 when the seek is not supported -- a named pipe, a
+        // device, anything that is not a regular file. Converting that to
+        // size_t gives SIZE_MAX, and resizing a vector to SIZE_MAX throws
+        // std::length_error, which nothing here catches, so the process ends in
+        // std::terminate(). An EDID is 128 or 256 bytes, so the upper bound is
+        // generous and the lower bound is the real check.
+        if (endPos <= 0) {
+            std::cerr << "Error: Cannot determine the size of " << filename
+                      << " (the stream is not seekable?)" << std::endl;
+            return false;
+        }
+        size_t file_size = static_cast<size_t>(endPos);
         if (file_size < 128) {
             std::cerr << "Error: EDID file too small" << std::endl;
             return false;
         }
-        
+        if (file_size > 64 * 1024) {
+            std::cerr << "Error: " << filename << " is " << file_size
+                      << " bytes, which is not an EDID" << std::endl;
+            return false;
+        }
+
+        try {
+            edid_data.resize(file_size);
+        }
+        catch (const std::exception& e) {
+            std::cerr << "Error: Could not allocate " << file_size
+                      << " bytes for the EDID: " << e.what() << std::endl;
+            return false;
+        }
+
+        file.read(reinterpret_cast<char*>(edid_data.data()), file_size);
+        if (!file || static_cast<size_t>(file.gcount()) != file_size) {
+            // A short read leaves the tail of edid_data zero-filled, and the
+            // parser would go on to decode a partially-read EDID as if it
+            // were complete.
+            std::cerr << "Error: Could not read all of " << filename << std::endl;
+            return false;
+        }
+
         return true;
     }
     
@@ -998,11 +1036,19 @@ int main(int argc, char* argv[]) {
     
     // Save profile to file
     std::ofstream profile_file("monitor_profile.xml");
-    if (profile_file.is_open()) {
-        profile_file << parser.generate_iddcx_profile();
-        profile_file.close();
-        std::cout << "\nIDDCX profile saved to monitor_profile.xml" << std::endl;
+    if (!profile_file.is_open()) {
+        // Silently keeping the old profile and exiting 0 tells the user
+        // nothing, and the stale file stays in place.
+        std::cerr << "Error: Could not open monitor_profile.xml for writing" << std::endl;
+        return 1;
     }
-    
+    profile_file << parser.generate_iddcx_profile();
+    profile_file.close();
+    if (!profile_file) {
+        std::cerr << "Error: Could not write monitor_profile.xml" << std::endl;
+        return 1;
+    }
+    std::cout << "\nIDDCX profile saved to monitor_profile.xml" << std::endl;
+
     return 0;
 }
