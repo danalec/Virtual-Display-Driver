@@ -6010,9 +6010,8 @@ NTSTATUS ValidateAndSanitizeConfiguration()
 	// Validate resolution settings. This runs after loadSettings(), so on the option.txt path --
 	// the one with no XML behind it -- GetIntegerSetting answers -1 for all four and these
 	// locals would land on -1, which is then written back into the globals. Every fallback and
-	// every bound here has to match the positiveOr() calls in DriverEntry and the compiled
-	// the ceiling quietly goes back to a smaller number than the one the mode list was built
-	// against.
+	// every bound here has to match the positiveOr() calls in DriverEntry, or the ceiling
+	// quietly goes back to a smaller number than the one the mode list was built against.
 	int minWidth = GetIntegerSetting(L"MinResolutionWidth");
 	int minHeight = GetIntegerSetting(L"MinResolutionHeight");
 	int maxWidth = GetIntegerSetting(L"MaxResolutionWidth");
@@ -6023,7 +6022,7 @@ NTSTATUS ValidateAndSanitizeConfiguration()
 		minWidth = 640;
 		sanitizedSettings++;
 	}
-	
+
 	if (minHeight < 480 || minHeight > 4320) {
 		vddlog("w", "Invalid min height detected, setting to 480");
 		minHeight = 480;
@@ -6035,11 +6034,34 @@ NTSTATUS ValidateAndSanitizeConfiguration()
 		maxWidth = 10240;
 		sanitizedSettings++;
 	}
-	
+
 	if (maxHeight < minHeight || maxHeight > 8640) {
 		vddlog("w", "Invalid max height detected, setting to 4320");
 		maxHeight = 4320;
 		sanitizedSettings++;
+	}
+
+	// The mode list was built in loadSettings() against the limits that were in
+	// force then. A limit that has just been corrected leaves that list holding
+	// modes the corrected limit excludes, and the driver would report modes
+	// wider than the ceiling it logged one line above. Rebuild it against the
+	// limits that are now in force.
+	{
+		const size_t before = monitorModes.size();
+		monitorModes.erase(
+			std::remove_if(monitorModes.begin(), monitorModes.end(),
+				[&](const std::tuple<int, int, int, int>& mode) {
+					const int w = std::get<0>(mode);
+					const int h = std::get<1>(mode);
+					return w < minWidth || w > maxWidth || h < minHeight || h > maxHeight;
+				}),
+			monitorModes.end());
+		if (monitorModes.size() != before) {
+			stringstream ss;
+			ss << "The mode list was rebuilt against the corrected resolution limits: "
+			   << before << " -> " << monitorModes.size() << " modes";
+			vddlog("w", ss.str().c_str());
+		}
 	}
 
 	// Validate HDR luminance values
