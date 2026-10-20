@@ -44,12 +44,14 @@ jobs:
       - name: Setup MSBuild
         uses: microsoft/setup-msbuild@30375c66a4eea26614e0d39710365f22f8b0af57  # v3.0.0
 
-      - name: Install Windows Driver Kit (IddCx headers)
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          choco install windowsdriverkit11 -y --no-progress
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      # The windows-2022 image already ships the Windows Driver Kit, the Windows
+      # SDK and the UMDF headers this project needs. The chocolatey package
+      # windowsdriverkit11 has only ever published version 10.0.22000.1, from
+      # October 2021, which predates the UMDF 2.25 headers MttVDD.vcxproj asks
+      # for -- so it contributed nothing the image did not already have, while
+      # adding a way for the job to fail: wdksetup.exe can return 3010 (reboot
+      # required), which the package does not accept as a success code, and
+      # with $ErrorActionPreference = "Stop" that ends the step.
 
       - name: Detect Windows SDK (windows.h)
         shell: pwsh
@@ -72,6 +74,16 @@ jobs:
             throw "Windows Kits Include directory not found: $includeRoot"
           }
 
+          # The import libraries live in Windows Kits\10\Lib\<version>, which is a
+          # SIBLING of Include -- not a child of Include\<version>. Looking for
+          # Include\<version>\Lib finds nothing on any SDK layout, so $best came
+          # out null and every matrix leg failed in this step before compiling
+          # anything.
+          $libRoot = Join-Path $kitsRoot "Lib"
+          if (-not (Test-Path $libRoot)) {
+            throw "Windows Kits Lib directory not found: $libRoot"
+          }
+
           $best =
             Get-ChildItem -Path $includeRoot -Directory -ErrorAction SilentlyContinue |
             Where-Object { $_.Name -match '^\d+\.\d+\.\d+\.\d+$' } |
@@ -80,7 +92,7 @@ jobs:
             # that one produced a version whose Lib\ tree was missing.
             Where-Object {
               (Test-Path (Join-Path $_.FullName "um\Windows.h")) -and
-              (Test-Path (Join-Path $_.FullName "Lib"))
+              (Test-Path (Join-Path (Join-Path $libRoot $_.Name) "um\x64\kernel32.lib"))
             } |
             # Sort numerically, not lexicographically: "10.0.9xxx.0" sorts above "10.0.26100.0"
             # as a string, which handed the build an older SDK than the one installed.
@@ -88,7 +100,7 @@ jobs:
             Select-Object -First 1
 
           if (-not $best) {
-            throw "Could not find an SDK version directory containing um\\Windows.h and Lib\\ under: $includeRoot"
+            throw "Could not find an SDK version directory with um\Windows.h under $includeRoot and matching import libraries under $libRoot"
           }
 
           $sdkVersion = $best.Name
