@@ -143,6 +143,23 @@ jobs:
 
           Write-Output "Using UMDF version: $($umdfRequired.Name) from $($umdfRequired.FullName) (matches MttVDD.vcxproj)"
 
+          # VisualStudioVersion is pinned to 17.0 on purpose. The WDK ships its Driver Kit
+          # build tasks as Microsoft.DriverKit.Build.Tasks.<VisualStudioVersion>.dll and
+          # 10.0.26100.0 only ships the 17.0 one. MSBuild 18 (VS 2026) asks for 18.0.dll and
+          # the build dies with MSB4062 -- "ValidateNTTargetVersion" could not be loaded --
+          # before compiling anything. The runner pinned to windows-2022 already uses 17.0, so
+          # this is a no-op there and only matters if the image moves to VS 2026.
+          #
+          # SkipPackageVerification=true turns off the WDK's InfVerif run. Two reasons it
+          # cannot be a gate here: the task loads InfVerif.dll from a subfolder named after
+          # the bitness of the host process, and the WDK ships bin\x64 and bin\arm64 but no
+          # bin\x86 -- while the msbuild on PATH is the 32-bit
+          # MSBuild\Current\Bin\MSBuild.exe (the 64-bit one lives in \amd64). Every run then
+          # logs "INF verification exception: Unable to load DLL 'x86\InfVerif.dll'". The
+          # findings it would report are not ours either: infverif flags ERROR(2084) for
+          # the WUDFRd.sys service binary and ERROR(1322) for UMDriverCopy=12,UMDF, and the
+          # INF published upstream produces the same two -- they are inherent to the UMDF
+          # shape, not defects in this driver.
           msbuild $sln `
             /m `
             /t:Build `
@@ -150,6 +167,8 @@ jobs:
             /p:Platform="${{ matrix.platform }}" `
             /p:WindowsSdkDir="$env:WINDOWS_SDK_DIR" `
             /p:WindowsTargetPlatformVersion="$env:WINDOWS_TARGET_PLATFORM_VERSION" `
+            /p:VisualStudioVersion=17.0 `
+            /p:SkipPackageVerification=true `
             /verbosity:minimal
 
       - name: Collect outputs
