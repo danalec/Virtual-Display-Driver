@@ -2,6 +2,7 @@
 #include <iostream>
 #include <string>
 #include <map>
+#include <conio.h>
 
 struct IddCxVersionInfo {
     std::string windowsVersion;
@@ -57,9 +58,13 @@ IddCxVersionInfo GetIddCxVersionFromBuild(DWORD buildNumber) {
         return it->second;
     }
     
-    for (auto& pair : versionMap) {
-        if (buildNumber >= pair.first) {
-            return pair.second;
+    // Walk the map from the newest build down. std::map iterates in ascending key order, so
+    // the original forward loop returned the first entry with buildNumber >= pair.first --
+    // which is the oldest entry in the table (10240), reporting IddCx 1.0 for every build
+    // that is not an exact match.
+    for (auto it = versionMap.rbegin(); it != versionMap.rend(); ++it) {
+        if (buildNumber >= it->first) {
+            return it->second;
         }
     }
     
@@ -96,8 +101,17 @@ int main() {
         std::cout << "  display driver development.\n";
     }
     
-    std::cout << "\nPress any key to exit...";
-    std::cin.get();
-    
+    // Wait for a key only when a real console is attached. _getch() reads the console input
+    // buffer directly, so with the output redirected it would block forever; the std::cin.get()
+    // it replaced returned immediately on EOF but required Enter, which is not what the prompt
+    // claimed. Gating on GetConsoleMode gives the intended single-key wait interactively and
+    // keeps the tool usable from a script or a pipe.
+    const HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+    DWORD dwOutMode = 0;
+    if (hOut != INVALID_HANDLE_VALUE && GetConsoleMode(hOut, &dwOutMode)) {
+        std::cout << "\nPress any key to exit...";
+        (void)_getch();
+    }
+
     return 0;
 }
