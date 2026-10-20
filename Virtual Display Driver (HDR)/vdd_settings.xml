@@ -3,7 +3,10 @@
      Virtual Display Driver (HDR) - Minimal Configuration File
      Contains ONLY functional settings (unused settings removed)
      
-     Original file contained 63 settings, this minimal version contains 52 functional settings
+     Every element below is read by the driver. 52 of them are reached through
+     SettingsQueryMap in Driver.cpp; the monitors/count and gpu/friendlyname entries are
+     rewritten by the pipe commands, and the <global>/<monitors> mode lists are read by a
+     separate pass, so counting SettingsQueryMap entries does not count this file.
      Generated: August 16, 2025 based on driver code analysis
      =============================================================================== -->
 <vdd_settings>
@@ -124,7 +127,7 @@
             <exclude_fractional_rates>false</exclude_fractional_rates>
             <min_resolution_width>640</min_resolution_width>
             <min_resolution_height>480</min_resolution_height>
-            <max_resolution_width>7680</max_resolution_width>
+            <max_resolution_width>10240</max_resolution_width>
             <max_resolution_height>4320</max_resolution_height>
         </edid_mode_filtering>
         <preferred_mode>
@@ -140,27 +143,29 @@
         <bit_depth_management>
             <auto_select_from_color_space>false</auto_select_from_color_space> <!-- Manual control -->
             <force_bit_depth>8</force_bit_depth>    <!-- Safe default: 8-bit -->
-            <fp16_surface_support>true</fp16_surface_support> <!-- Keep enabled for compatibility -->
         </bit_depth_management>
-        <color_format_extended>
-            <!-- NOTE: wide_color_gamut and hdr_tone_mapping are loaded but not implemented -->
-            <sdr_white_level>80.0</sdr_white_level>         <!-- Standard SDR white level -->
-        </color_format_extended>
     </color_advanced>
 
     <!-- === REMOVED SECTIONS ===
     
-    The following sections were present in the original vdd_settings.xml but have been 
-    removed because they are loaded but never used in the driver:
-    
-    1. monitor_emulation (8 settings) - All settings loaded but unused
+    These keys were present in the original vdd_settings.xml and were still being parsed
+    by the driver, but nothing ever read the values: editing them here changed no behaviour.
+    They have now been removed from the parser, from the settings alias map and from this
+    file, so a typo in any of them is reported instead of silently ignored.
+
+    1. monitor_emulation (8 keys)
        - enabled, emulate_physical_dimensions, physical_width_mm, physical_height_mm
        - manufacturer_emulation/enabled, manufacturer_name, model_name, serial_number
-       
-    2. color_format_extended partial (2 settings) - Loaded but unused  
-       - wide_color_gamut, hdr_tone_mapping
-       
-    Driver uses hardcoded values instead of these XML settings.
+       The driver reports hardcoded endpoint diagnostics instead.
+
+    2. color_advanced/fp16_surface_support
+       The driver always advertises IDDCX_ADAPTER_FLAGS_CAN_PROCESS_FP16 when
+       IddCxSwapChainReleaseAndAcquireBuffer2 is available.
+
+    3. color_advanced/color_format_extended (3 keys)
+       - sdr_white_level, wide_color_gamut, hdr_tone_mapping
+       The driver always reports IDDCX_TARGET_CAPS_HIGH_COLOR_SPACE and
+       IDDCX_TARGET_CAPS_WIDE_COLOR_SPACE.
     === -->
 
 </vdd_settings>
