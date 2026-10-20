@@ -2,44 +2,70 @@
 #include <iostream>
 #include <string>
 #include <map>
+#include <vector>
+#include <algorithm>
 #include <conio.h>
 
+// What this tool can and cannot tell you.
+//
+// It CAN read the Windows build number, and it CAN read the IddCx headers
+// installed on this machine -- that part is a measurement.
+//
+// It CANNOT read the IddCx version the running system implements. That answer
+// comes from IddCxGetVersion(), which needs an IddDriverGlobals -- a UMDF host
+// -- so it cannot be called from a standalone console program. Everything this
+// tool prints about the runtime is therefore an inference from the build
+// number, and it is labelled as such. IddCx.h documents the API for exactly
+// this question: "the driver can call the IddCxGetVersion() callback ... This
+// helps if IddCx bugs that affect behavior are fixed and released within a
+// given OS release", which is the case a build-number table gets wrong.
+
+// The constants are the SDK's own IDDCX_VERSION_* values:
+//   1.2  RS3              0x1200
+//   1.3  RS4 / RS5        0x1300 / 0x1380
+//   1.4  RS5 (hotfix)     0x1400
+//   1.5  Vibrainium       0x1500
+//   1.6  Manganese        0x1600
+//   1.7  Iron             0x1700
+//   1.8  Cobalt           0x1800, and 0x1801 for the UpdateMode fix
+//   1.9  Cobalt           0x1900
+//   1.10 Iron             0x1A00, and 0x1A80 for the hotfix
+// The SDK spells the two "hotfix" values IDDCX_VERSION_<name>_UPDATEMODE_FIX.
+//
+// Windows 10 Creators Update (15063) is the first build that ships IddCx.
+// Builds before it have no IddCx at all and are not in the table: the old
+// entries claimed "1.0" for builds 10240 and 14393, and 0x1000 is not an
+// IDDCX_VERSION_* constant anywhere in the SDK.
 struct IddCxVersionInfo {
-    std::string windowsVersion;
-    std::string iddcxVersion;
-    ULONG versionValue;
+    std::string windowsVersion;   // the release this build belongs to
+    std::string iddcxVersion;     // the IddCx version expected on that build
+    ULONG versionValue;           // the SDK's IDDCX_VERSION_* constant
 };
 
 std::map<DWORD, IddCxVersionInfo> versionMap = {
     {26100, {"Windows 11 24H2", "1.10", 0x1A80}},
     {22631, {"Windows 11 23H2", "1.10", 0x1A00}},
-    {22621, {"Windows 11 22H2", "1.9", 0x1900}},
-    {22000, {"Windows 11 21H2", "1.8", 0x1800}},
-    {19045, {"Windows 10 22H2", "1.5", 0x1500}},
-    {19044, {"Windows 10 21H2", "1.5", 0x1500}},
-    {19043, {"Windows 10 21H1", "1.5", 0x1500}},
-    {19042, {"Windows 10 20H2", "1.5", 0x1500}},
-    {19041, {"Windows 10 20H1", "1.5", 0x1500}},
-    {18363, {"Windows 10 19H2", "1.4", 0x1400}},
-    {18362, {"Windows 10 19H1", "1.4", 0x1400}},
-    {17763, {"Windows 10 RS5", "1.3", 0x1300}},
-    {17134, {"Windows 10 RS4", "1.3", 0x1300}},
-    {16299, {"Windows 10 RS3", "1.3", 0x1300}},
-    {15063, {"Windows 10 Creators Update", "1.2", 0x1200}},
-    {14393, {"Windows 10 Anniversary Update", "1.0", 0x1000}},
-    {10240, {"Windows 10 RTM", "1.0", 0x1000}}
+    {22621, {"Windows 11 22H2", "1.9",  0x1900}},
+    {22000, {"Windows 11 21H2", "1.8",  0x1800}},
+    {19045, {"Windows 10 22H2", "1.5",  0x1500}},
+    {19044, {"Windows 10 21H2", "1.5",  0x1500}},
+    {19043, {"Windows 10 21H1", "1.5",  0x1500}},
+    {19042, {"Windows 10 20H2", "1.5",  0x1500}},
+    {19041, {"Windows 10 20H1", "1.5",  0x1500}},
+    {18363, {"Windows 10 19H2", "1.4",  0x1400}},
+    {18362, {"Windows 10 19H1", "1.4",  0x1400}},
+    {17763, {"Windows 10 RS5",   "1.3",  0x1380}},  // RS5 is 0x1380; 0x1300 is RS4
+    {17134, {"Windows 10 RS4",   "1.3",  0x1300}},
+    {16299, {"Windows 10 RS3",   "1.3",  0x1200}},
+    {15063, {"Windows 10 Creators Update", "1.2", 0x1200}}
 };
 
 DWORD GetWindowsBuildNumber() {
-    OSVERSIONINFOEX osvi;
-    ZeroMemory(&osvi, sizeof(OSVERSIONINFOEX));
-    osvi.dwOSVersionInfoSize = sizeof(OSVERSIONINFOEX);
-    
     HMODULE hMod = GetModuleHandleW(L"ntdll.dll");
     if (hMod) {
         typedef NTSTATUS(WINAPI* RtlGetVersionPtr)(PRTL_OSVERSIONINFOW);
         RtlGetVersionPtr RtlGetVersion = (RtlGetVersionPtr)GetProcAddress(hMod, "RtlGetVersion");
-        
+
         if (RtlGetVersion) {
             RTL_OSVERSIONINFOW rovi = { 0 };
             rovi.dwOSVersionInfoSize = sizeof(rovi);
@@ -48,7 +74,7 @@ DWORD GetWindowsBuildNumber() {
             }
         }
     }
-    
+
     return 0;
 }
 
@@ -57,41 +83,124 @@ IddCxVersionInfo GetIddCxVersionFromBuild(DWORD buildNumber) {
     if (it != versionMap.end()) {
         return it->second;
     }
-    
-    // Walk the map from the newest build down. std::map iterates in ascending key order, so
-    // the original forward loop returned the first entry with buildNumber >= pair.first --
-    // which is the oldest entry in the table (10240), reporting IddCx 1.0 for every build
-    // that is not an exact match.
+
+    // Walk the map from the newest build down, so a build that is not in the
+    // table gets the newest entry that is not newer than it. A forward walk
+    // returned the oldest entry in the table for every unknown build.
     for (auto it = versionMap.rbegin(); it != versionMap.rend(); ++it) {
         if (buildNumber >= it->first) {
-            return it->second;
+            IddCxVersionInfo info = it->second;
+            // The release name is the nearest one at or below, so it is an
+            // approximation for a build that is not in the table.
+            info.windowsVersion += " or newer";
+            return info;
         }
     }
-    
+
     return {"Unknown Windows Version", "Unknown", 0x0000};
 }
 
-int main() {
+// The newest IddCx header set installed on this machine. This part is a
+// measurement, not an inference: it reads um\iddcx\<version>\IddCx.h out of
+// the Windows Kits.
+std::string GetNewestInstalledIddCxHeaders(const wchar_t* kitsRoot) {
+    if (kitsRoot == nullptr) { return ""; }
+    std::vector<std::wstring> roots;
+    // The versioned layout the Windows SDK actually ships:
+    //   Windows Kits\10\Include\<sdk>\um\iddcx\<version>\IddCx.h
+    {
+        WIN32_FIND_DATAW fd;
+        const std::wstring includeRoot = std::wstring(kitsRoot) + L"\\Include";
+        HANDLE h = FindFirstFileW((includeRoot + L"\\*").c_str(), &fd);
+        if (h != INVALID_HANDLE_VALUE) {
+            do {
+                if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) { continue; }
+                if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+                    roots.push_back(includeRoot + L"\\" + fd.cFileName + L"\\um\\iddcx");
+                }
+            } while (FindNextFileW(h, &fd));
+            FindClose(h);
+        }
+    }
+    // The unversioned layout, in case an SDK ever ships one.
+    roots.push_back(std::wstring(kitsRoot) + L"\\Include\\iddcx");
+
+    for (const auto& root : roots) {
+        WIN32_FIND_DATAW fd;
+        HANDLE h = FindFirstFileW((root + L"\\*").c_str(), &fd);
+        if (h == INVALID_HANDLE_VALUE) { continue; }
+        std::vector<std::wstring> found;
+        do {
+            if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) { continue; }
+            found.push_back(fd.cFileName);
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+        if (found.empty()) { continue; }
+        // Compare major and minor separately. As a double, "1.10" is 1.1 and
+        // sorts BELOW "1.9", which would pick the older header set.
+        std::sort(found.begin(), found.end(), [](const std::wstring& a, const std::wstring& b) {
+            auto parts = [](const std::wstring& s) {
+                const size_t dot = s.find(L'.');
+                if (dot == std::wstring::npos) { return std::make_pair(0, 0); }
+                return std::make_pair(
+                    (int)std::stol(std::wstring(s.substr(0, dot))),
+                    (int)std::stol(std::wstring(s.substr(dot + 1))));
+            };
+            return parts(a) > parts(b);
+        });
+        for (const auto& v : found) {
+            if (GetFileAttributesW((root + L"\\" + v + L"\\IddCx.h").c_str()) != INVALID_FILE_ATTRIBUTES) {
+                return std::string(v.begin(), v.end());
+            }
+        }
+    }
+    return "";
+}
+
+int wmain(int argc, wchar_t** argv) {
     std::cout << "IddCx Version Query Tool\n";
     std::cout << "========================\n\n";
-    
+
     DWORD buildNumber = GetWindowsBuildNumber();
-    
+
     if (buildNumber == 0) {
         std::cout << "Error: Could not retrieve Windows build number.\n";
         return 1;
     }
-    
+
     std::cout << "Windows Build Number: " << buildNumber << "\n";
-    
+
     IddCxVersionInfo versionInfo = GetIddCxVersionFromBuild(buildNumber);
-    
-    std::cout << "Windows Version: " << versionInfo.windowsVersion << "\n";
-    std::cout << "IddCx Version: " << versionInfo.iddcxVersion << "\n";
-    std::cout << "IddCx Version Value: 0x" << std::hex << std::uppercase << versionInfo.versionValue << "\n\n";
-    
+
+    std::cout << "Windows Release (nearest at or below this build): " << versionInfo.windowsVersion << "\n";
+    std::cout << "IddCx version expected on this build: " << versionInfo.iddcxVersion << "\n";
+    std::cout << "IddCx version value (IDDCX_VERSION_*): 0x" << std::hex << std::uppercase << versionInfo.versionValue << "\n\n";
+
+    // The measurement, as opposed to the inference above.
+    const wchar_t* kitsRoot = nullptr;
+    if (argc > 1) {
+        kitsRoot = argv[1];
+    } else {
+        wchar_t buf[MAX_PATH] = { 0 };
+        if (GetEnvironmentVariableW(L"WindowsSdkDir", buf, MAX_PATH) > 0) {
+            kitsRoot = buf;
+        }
+    }
+    const std::string installed = GetNewestInstalledIddCxHeaders(kitsRoot);
+    if (!installed.empty()) {
+        std::cout << "Newest IddCx header set installed on this machine: " << installed << "\n";
+        std::cout << "  (read from the Windows Kits; this is a measurement, not an inference)\n\n";
+    }
+
+    std::cout << "How to read the numbers above:\n";
+    std::cout << "- The build number is read from the running system.\n";
+    std::cout << "- The IddCx version and its constant are INFERRED from the build\n";
+    std::cout << "  number. The table above cannot express every IddCx version, and a\n";
+    std::cout << "  service update can ship a newer IddCx than the release did.\n";
+    std::cout << "- The only authoritative source is IddCxGetVersion(), which needs a\n";
+    std::cout << "  UMDF host and so cannot be called from this tool.\n\n";
+
     if (versionInfo.iddcxVersion == "Unknown") {
-        std::cout << "Note: This Windows build may not support IddCx or uses an unknown version.\n";
         std::cout << "IddCx was introduced in Windows 10 Creators Update (build 15063).\n";
     } else {
         std::cout << "IddCx Framework Information:\n";
@@ -100,7 +209,7 @@ int main() {
         std::cout << "- This version provides specific capabilities and APIs for indirect\n";
         std::cout << "  display driver development.\n";
     }
-    
+
     // Wait for a key only when a real console is attached. _getch() reads the console input
     // buffer directly, so with the output redirected it would block forever; the std::cin.get()
     // it replaced returned immediately on EOF but required Enter, which is not what the prompt
