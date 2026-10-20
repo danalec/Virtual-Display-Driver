@@ -1,20 +1,49 @@
 @echo off
+setlocal
 
-:: Use PowerShell for elevation check and execution
+:: Use PowerShell for elevation check and execution.
+:: The path travels in an environment variable, not as a trailing argument:
+:: under -Command, PowerShell appends extra arguments to the command text itself,
+:: so passing "%~f0" positionally made PowerShell try to *execute* the .bat path
+:: (re-running it recursively) while $args stayed empty. $MyInvocation.MyCommand.Path
+:: is also empty under -Command, which was the original bug: the re-elevated shell
+:: was launched with -File "" and installed nothing while still printing "success".
+set "VDD_INSTALL_BAT=%~f0"
+
+:: The versions are pinned to the same ones set-dependencies.ps1 enforces. Installing "latest"
+:: here installed whichever DisplayConfig happened to be current, and the helper scripts break
+:: against the newer module -- Get-DisplayColorInfo changed its properties between releases,
+:: which is why set-dependencies.ps1 checks the version and not just the name.
+set "VDD_DISPLAYCONFIG_VERSION=1.1.1"
+set "VDD_MONITORCONFIG_VERSION=1.0.3"
+
 powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+    "$self = $env:VDD_INSTALL_BAT;" ^
+    "$dcv = $env:VDD_DISPLAYCONFIG_VERSION;" ^
+    "$mcv = $env:VDD_MONITORCONFIG_VERSION;" ^
     "$elevated = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] 'Administrator');" ^
     "if (-not $elevated) {" ^
-        "$CommandLine = '-File \"' + $MyInvocation.MyCommand.Path + '\" ' + $MyInvocation.UnboundArguments;" ^
-        "Start-Process -FilePath PowerShell.exe -Verb Runas -ArgumentList $CommandLine;" ^
-        "Exit" ^
+        "$p = Start-Process -FilePath PowerShell.exe -Verb RunAs -Wait -PassThru -ArgumentList ('-NoProfile -ExecutionPolicy Bypass -File \"' + $self + '\"');" ^
+        "if ($p.ExitCode -ne 0) { Write-Output ('Elevated module installation failed with exit code ' + $p.ExitCode); exit $p.ExitCode }" ^
+        "exit 0" ^
     "} else {" ^
-        "Install-Module -Name DisplayConfig -Scope AllUsers -Force -AllowClobber;" ^
-        "Install-Module -Name MonitorConfig -Scope AllUsers -Force -AllowClobber;" ^
-        "if ($?) {" ^
-            "Write-Output 'Modules installed successfully.'" ^
-        "} else {" ^
-            "Write-Output 'An error occurred while installing the modules.'" ^
+        "try {" ^
+            "$ErrorActionPreference = 'Stop';" ^
+            "Install-Module -Name DisplayConfig -RequiredVersion $dcv -Scope AllUsers -Force -AllowClobber;" ^
+            "Install-Module -Name MonitorConfig -RequiredVersion $mcv -Scope AllUsers -Force -AllowClobber;" ^
+            "Write-Output ('Modules installed: DisplayConfig ' + $dcv + ', MonitorConfig ' + $mcv);" ^
+        "} catch {" ^
+            "Write-Output ('Module installation failed: ' + $_.Exception.Message);" ^
+            "exit 1" ^
         "}" ^
     "}"
 
-pause
+if %ERRORLEVEL% neq 0 (
+    echo Module installation failed.
+    exit /b %ERRORLEVEL%
+)
+
+:: A bare `pause` blocks forever when this runs from CI, from a scheduled task, or from any
+:: caller that redirects stdin -- exactly the cases where anyone would automate it. `choice`
+:: with a timeout lets a human read the output without making the script unhangable.
+choice /T 10 /D N /M "Press any key to close, or wait 10s..."
