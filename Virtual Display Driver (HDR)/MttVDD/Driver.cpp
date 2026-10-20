@@ -1814,9 +1814,22 @@ int gcd(int a, int b) {
 }
 
 void float_to_vsync(float refresh_rate, int& num, int& den) {
+	// round(NaN) then static_cast<int>(NaN) is undefined behaviour, and a rate large enough to
+	// overflow the multiplication used to feed whatever is on the stack. A zero numerator later
+	// divides by zero when the mode is turned into timings.
+	if (!(refresh_rate > 0.0f)) {
+		// Catches 0, negative values and NaN.
+		vddlog("e", "Invalid refresh rate, falling back to 60");
+		refresh_rate = 60.0f;
+	}
+	else if (refresh_rate > 1000.0f) {
+		vddlog("e", "Refresh rate above 1000 Hz, clamping to 1000");
+		refresh_rate = 1000.0f;
+	}
+
 	den = 10000;
 
-	num = static_cast<int>(round(refresh_rate * den));
+	num = static_cast<int>(round(static_cast<double>(refresh_rate) * den));
 
 	int divisor = gcd(num, den);
 	num /= divisor;
@@ -1824,10 +1837,103 @@ void float_to_vsync(float refresh_rate, int& num, int& den) {
 }
 
 void  SendToPipe(const std::string& logMessage) {
-	if (g_pipeHandle != INVALID_HANDLE_VALUE) {
-		DWORD bytesWritten;
-		DWORD logMessageSize = static_cast<DWORD>(logMessage.size());
-		WriteFile(g_pipeHandle, logMessage.c_str(), logMessageSize, &bytesWritten, NULL);
+	// Write through a duplicate of the handle rather than g_pipeHandle itself. The pipe server
+	// can call ClearPipeHandle() and CloseHandle() on any thread at any moment; holding
+	// g_PipeMutex across WriteFile would fix that race but would also serialise every log line
+	// behind a pipe write that blocks for as long as the client is not reading. DuplicateHandle
+	// keeps the underlying file object alive on its own, so the write is safe without the lock.
+	HANDLE pipe = INVALID_HANDLE_VALUE;
+	{
+		lock_guard<mutex> lock(g_PipeMutex);
+		if (g_pipeHandle == INVALID_HANDLE_VALUE) {
+			return;
+		}
+		if (!DuplicateHandle(GetCurrentProcess(), g_pipeHandle, GetCurrentProcess(), &pipe, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
+			pipe = INVALID_HANDLE_VALUE;
+		}
+	}
+
+	if (pipe == INVALID_HANDLE_VALUE) {
+		return;
+	}
+
+	DWORD bytesWritten;
+	DWORD logMessageSize = static_cast<DWORD>(logMessage.size());
+	WriteFile(pipe, logMessage.c_str(), logMessageSize, &bytesWritten, NULL);
+	CloseHandle(pipe);
+}
+
+// vddlog used to CreateDirectoryW + fopen_s(append) + fclose on every single line, so a boot
+// that logs a few hundred lines did a few hundred directory checks and file opens. The handle
+// is cached and keyed by path instead: the file name carries the date, so crossing midnight
+// changes the path and the cached handle is swapped out then. fflush after every write keeps
+// external tailers (Virtual Driver Control, the community scripts) seeing lines as they land,
+// which is what the per-line fclose used to guarantee.
+mutex g_LogFileMutex;
+FILE* g_LogFile = nullptr;
+wstring g_LogFilePath;
+bool g_LogsDirEnsured = false;
+
+void CloseLogFile() {
+	lock_guard<mutex> lock(g_LogFileMutex);
+	if (g_LogFile != nullptr) {
+		fclose(g_LogFile);
+		g_LogFile = nullptr;
+	}
+	g_LogFilePath.clear();
+}
+
+void WriteLogLine(const wstring& logPath, const string& line) {
+	lock_guard<mutex> lock(g_LogFileMutex);
+
+	if (g_LogFile == nullptr || g_LogFilePath != logPath) {
+		if (g_LogFile != nullptr) {
+			fclose(g_LogFile);
+			g_LogFile = nullptr;
+		}
+		g_LogFilePath.clear();
+
+		// Ensured per open attempt, not latched. The flag used to be set after the first try whatever
+		// the outcome, so if the Logs directory was deleted while the driver ran, the reopen at
+		// the next date boundary failed and logging stayed dead for the rest of the session --
+		// the per-line CreateDirectoryW this replaced used to self-heal.
+		{
+			const wstring logsDir = confpath + L"\\Logs";
+			if (!CreateDirectoryW(logsDir.c_str(), NULL) && GetLastError() != ERROR_ALREADY_EXISTS) {
+				vddlog("d", "Log directory could not be created; the open below will fail");
+			}
+		}
+		g_LogsDirEnsured = true;
+
+		// Opened through CreateFileW rather than fopen_s so the handle is shareable for
+		// deletion. MSVC's fopen uses _SH_DENYNO, which permits read/write but not delete:
+		// holding one of those for the whole session would make "delete the old log" fail
+		// with a sharing violation while the driver is running, which it did not before.
+		// FILE_APPEND_DATA keeps every writer at end-of-file without an explicit seek.
+		HANDLE hLog = CreateFileW(logPath.c_str(), FILE_APPEND_DATA,
+			FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+			nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+		if (hLog != INVALID_HANDLE_VALUE) {
+			const int fd = _open_osfhandle((intptr_t)hLog, _O_APPEND | _O_TEXT);
+			if (fd < 0) {
+				CloseHandle(hLog);
+			}
+			else {
+				g_LogFile = _fdopen(fd, "a");
+				if (g_LogFile == nullptr) {
+					_close(fd);
+				}
+				else {
+					g_LogFilePath = logPath;
+				}
+			}
+		}
+
+	}
+
+	if (g_LogFile != nullptr) {
+		fputs(line.c_str(), g_LogFile);
+		fflush(g_LogFile);
 	}
 }
 
@@ -1840,66 +1946,56 @@ void vddlog(const char* type, const char* message) {
 		return;
 	}
 
-	FILE* logFile;
 	wstring logsDir = confpath + L"\\Logs";
 
 	auto now = chrono::system_clock::now();
 	auto in_time_t = chrono::system_clock::to_time_t(now);
 	tm tm_buf;
 	localtime_s(&tm_buf, &in_time_t);
-	wchar_t date_str[11]; 
+	wchar_t date_str[11];
 	wcsftime(date_str, sizeof(date_str) / sizeof(wchar_t), L"%Y-%m-%d", &tm_buf);
 
 	wstring logPath = logsDir + L"\\log_" + date_str + L".txt";
 
-	if (!CreateDirectoryW(logsDir.c_str(), NULL) && GetLastError() != ERROR_ALREADY_EXISTS) {
-		// Best effort only.
+	stringstream ss;
+	ss << put_time(&tm_buf, "%Y-%m-%d %X");
+
+	const char logTypeCode = (type != nullptr) ? type[0] : '\0';
+	string logType;
+	switch (logTypeCode) {
+	case 'e':
+		logType = "ERROR";
+		break;
+	case 'i':
+		logType = "INFO";
+		break;
+	case 'p':
+		logType = "PIPE";
+		break;
+	case 'd':
+		logType = "DEBUG";
+		break;
+	case 'w':
+		logType = "WARNING";
+		break;
+	case 't':
+		logType = "TESTING";
+		break;
+	case 'c':
+		logType = "COMPANION";
+		break;
+	default:
+		logType = "UNKNOWN";
+		break;
 	}
 
-	string narrow_logPath = WStringToString(logPath);
-	const char* mode = "a";
-	errno_t err = fopen_s(&logFile, narrow_logPath.c_str(), mode);
-	if (err == 0 && logFile != nullptr) {
-		stringstream ss;
-		ss << put_time(&tm_buf, "%Y-%m-%d %X");
+	const string logMessage = ss.str() + " [" + logType + "] " + message + "\n";
 
-		const char logTypeCode = (type != nullptr) ? type[0] : '\0';
-		string logType;
-		switch (logTypeCode) {
-		case 'e':
-			logType = "ERROR";
-			break; 
-		case 'i':
-			logType = "INFO";
-			break;
-		case 'p':
-			logType = "PIPE";
-			break;
-		case 'd':
-			logType = "DEBUG";
-			break;
-		case 'w':
-			logType = "WARNING";
-			break;
-		case 't':
-			logType = "TESTING";
-			break;
-		case 'c':
-			logType = "COMPANION";
-			break;
-		default:
-			logType = "UNKNOWN";
-			break;
-		}
+	WriteLogLine(logPath, logMessage);
 
-		fprintf(logFile, "[%s] [%s] %s\n", ss.str().c_str(), logType.c_str(), message);
-
-		fclose(logFile);
-
-		if (sendLogsThroughPipe && g_pipeHandle != INVALID_HANDLE_VALUE) {
-			string logMessage = ss.str() + " [" + logType + "] " + message + "\n";
-			SendToPipe(logMessage);
-		}
+	// No unlocked peek at g_pipeHandle here: SendToPipe() takes the pipe lock and checks it.
+	if (sendLogsThroughPipe) {
+		SendToPipe(logMessage);
 	}
 }
 
@@ -2057,6 +2153,11 @@ bool UpdateXmlToggleSetting(bool toggle, const wchar_t* variable) {
 		case XmlNodeType_EndElement:
 			pReader->GetLocalName(&pwszLocalName, nullptr);
 			pWriter->WriteEndElement();
+			// An empty target element never produces a Text node, so the flag set below would
+			// survive past it and the *next* element's text in the document would be replaced
+			// by this toggle. vdd_settings.xml is user-editable, so <logging/> is one edit away;
+			// clearing here too is what keeps the rewrite confined to the element asked for.
+			variableElementFound = false;
 			break;
 
 		case XmlNodeType_Text:
@@ -2073,6 +2174,25 @@ bool UpdateXmlToggleSetting(bool toggle, const wchar_t* variable) {
 		case XmlNodeType_Whitespace:
 			pReader->GetValue(&pwszValue, nullptr);
 			pWriter->WriteWhitespace(pwszValue);
+			break;
+
+		case XmlNodeType_Attribute:
+		{
+			// These three rewriters switched only on Element/EndElement/Text/Whitespace/
+			// Comment, so any attribute in vdd_settings.xml was dropped from the rewritten
+			// file the first time a runtime toggle ran. The file is user-editable, so that
+			// was silent data loss on someone else's settings. xmllite's IXmlWriter exposes
+			// WriteAttributeString as prefix/localName/namespace/value, four arguments.
+			const wchar_t* attrLocalName = nullptr;
+			pReader->GetLocalName(&attrLocalName, nullptr);
+			pReader->GetValue(&pwszValue, nullptr);
+			pWriter->WriteAttributeString(nullptr, attrLocalName, nullptr, pwszValue);
+		}
+			break;
+
+		case XmlNodeType_CDATA:
+			pReader->GetValue(&pwszValue, nullptr);
+			pWriter->WriteCData(pwszValue);
 			break;
 
 		case XmlNodeType_Comment:
@@ -2108,6 +2228,8 @@ bool UpdateXmlToggleSetting(bool toggle, const wchar_t* variable) {
 	if (!MoveFileExW(tempFileName.c_str(), settingsname.c_str(), MOVEFILE_REPLACE_EXISTING)) {
 		return false;
 	}
+	// The file just changed on disk, so the parsed copy the getters read from is stale.
+	InvalidateSettingsCache();
 	return true;
 }
 
@@ -2173,6 +2295,10 @@ bool UpdateXmlGpuSetting(const wchar_t* gpuName) {
 		case XmlNodeType_EndElement:
 			pReader->GetLocalName(&pwszLocalName, nullptr);
 			pWriter->WriteEndElement();
+			// Same trap as the toggle rewriter: an empty gpu/friendlyname element produces no
+			// Text node, so the flag would survive it and this writer would overwrite the next
+			// element's text in the file. Clear it on the way out as well.
+			gpuElementFound = false;
 			break;
 
 		case XmlNodeType_Text:
@@ -2189,6 +2315,25 @@ bool UpdateXmlGpuSetting(const wchar_t* gpuName) {
 		case XmlNodeType_Whitespace:
 			pReader->GetValue(&pwszValue, nullptr);
 			pWriter->WriteWhitespace(pwszValue);
+			break;
+
+		case XmlNodeType_Attribute:
+		{
+			// These three rewriters switched only on Element/EndElement/Text/Whitespace/
+			// Comment, so any attribute in vdd_settings.xml was dropped from the rewritten
+			// file the first time a runtime toggle ran. The file is user-editable, so that
+			// was silent data loss on someone else's settings. xmllite's IXmlWriter exposes
+			// WriteAttributeString as prefix/localName/namespace/value, four arguments.
+			const wchar_t* attrLocalName = nullptr;
+			pReader->GetLocalName(&attrLocalName, nullptr);
+			pReader->GetValue(&pwszValue, nullptr);
+			pWriter->WriteAttributeString(nullptr, attrLocalName, nullptr, pwszValue);
+		}
+			break;
+
+		case XmlNodeType_CDATA:
+			pReader->GetValue(&pwszValue, nullptr);
+			pWriter->WriteCData(pwszValue);
 			break;
 
 		case XmlNodeType_Comment:
@@ -2217,6 +2362,8 @@ bool UpdateXmlGpuSetting(const wchar_t* gpuName) {
 	if (!MoveFileExW(tempFileName.c_str(), settingsname.c_str(), MOVEFILE_REPLACE_EXISTING)) {
 		return false;
 	}
+	// The file just changed on disk, so the parsed copy the getters read from is stale.
+	InvalidateSettingsCache();
 	return true;
 }
 
@@ -2281,6 +2428,10 @@ bool UpdateXmlDisplayCountSetting(int displayCount) {
 		case XmlNodeType_EndElement:
 			pReader->GetLocalName(&pwszLocalName, nullptr);
 			pWriter->WriteEndElement();
+			// Same trap as the toggle rewriter: an empty monitors/count element produces no
+			// Text node, so the flag would survive it and this writer would overwrite the next
+			// element's text in the file. Clear it on the way out as well.
+			displayCountElementFound = false;
 			break;
 
 		case XmlNodeType_Text:
@@ -2297,6 +2448,25 @@ bool UpdateXmlDisplayCountSetting(int displayCount) {
 		case XmlNodeType_Whitespace:
 			pReader->GetValue(&pwszValue, nullptr);
 			pWriter->WriteWhitespace(pwszValue);
+			break;
+
+		case XmlNodeType_Attribute:
+		{
+			// These three rewriters switched only on Element/EndElement/Text/Whitespace/
+			// Comment, so any attribute in vdd_settings.xml was dropped from the rewritten
+			// file the first time a runtime toggle ran. The file is user-editable, so that
+			// was silent data loss on someone else's settings. xmllite's IXmlWriter exposes
+			// WriteAttributeString as prefix/localName/namespace/value, four arguments.
+			const wchar_t* attrLocalName = nullptr;
+			pReader->GetLocalName(&attrLocalName, nullptr);
+			pReader->GetValue(&pwszValue, nullptr);
+			pWriter->WriteAttributeString(nullptr, attrLocalName, nullptr, pwszValue);
+		}
+			break;
+
+		case XmlNodeType_CDATA:
+			pReader->GetValue(&pwszValue, nullptr);
+			pWriter->WriteCData(pwszValue);
 			break;
 
 		case XmlNodeType_Comment:
@@ -2326,6 +2496,8 @@ bool UpdateXmlDisplayCountSetting(int displayCount) {
 	if (!MoveFileExW(tempFileName.c_str(), settingsname.c_str(), MOVEFILE_REPLACE_EXISTING)) {
 		return false;
 	}
+	// The file just changed on disk, so the parsed copy the getters read from is stale.
+	InvalidateSettingsCache();
 	return true;
 }
 
