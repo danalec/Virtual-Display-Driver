@@ -1291,7 +1291,12 @@ vector<tuple<int, int, int, int>> GenerateModesFromEdid(const EdidProfileData& p
                 vddlog("d", ss.str().c_str());
             }
             
-            generatedModes.push_back(mode);
+            // profile.modes carry the EDID (multiplier, nominal) pair. Everything downstream -
+            // and monitorModes itself - reads slots 2 and 3 as (vsyncNum, vsyncDen), so pushing
+            // the raw EDID tuple reported 1000/60 as 16.67 Hz to the OS.
+            int vsyncNum = 0, vsyncDen = 1;
+            float_to_vsync(static_cast<float>(nominalRefreshRate) * refreshRateMultiplier / 1000.0f, vsyncNum, vsyncDen);
+            generatedModes.push_back(make_tuple(width, height, vsyncNum, vsyncDen));
         }
     }
     
@@ -1303,8 +1308,10 @@ vector<tuple<int, int, int, int>> GenerateModesFromEdid(const EdidProfileData& p
              int areaB = get<0>(b) * get<1>(b);
              if (areaA != areaB) return areaA > areaB;  // Larger resolution first
              
-             // Secondary sort: refresh rate
-             return get<3>(a) > get<3>(b);  // Higher refresh rate first
+             // Secondary sort: refresh rate, now read from the vsync fraction
+             double rateA = get<3>(a) ? static_cast<double>(get<2>(a)) / get<3>(a) : 0.0;
+             double rateB = get<3>(b) ? static_cast<double>(get<2>(b)) / get<3>(b) : 0.0;
+             return rateA > rateB;  // Higher refresh rate first
          });
     
     stringstream ss;
@@ -1334,7 +1341,7 @@ tuple<int, int, int, int> FindPreferredModeFromEdid(const EdidProfileData& profi
             
             stringstream ss;
             ss << "Found EDID preferred mode: " << profile.preferredWidth << "x" << profile.preferredHeight 
-               << "@" << get<3>(mode) << "Hz";
+               << "@" << (get<3>(mode) ? static_cast<double>(get<2>(mode)) / get<3>(mode) : 0.0) << "Hz";
             vddlog("i", ss.str().c_str());
             break;
         }
@@ -1366,6 +1373,7 @@ vector<tuple<int, int, int, int>> MergeAndOptimizeModes(const vector<tuple<int, 
             for (const auto& manualMode : manualModes) {
                 if (get<0>(edidMode) == get<0>(manualMode) && 
                     get<1>(edidMode) == get<1>(manualMode) && 
+                    get<2>(edidMode) == get<2>(manualMode) && 
                     get<3>(edidMode) == get<3>(manualMode)) {
                     isDuplicate = true;
                     break;
@@ -1381,7 +1389,30 @@ vector<tuple<int, int, int, int>> MergeAndOptimizeModes(const vector<tuple<int, 
            << (mergedModes.size() - manualModes.size()) << " unique EDID = " << mergedModes.size() << " total";
         vddlog("i", ss.str().c_str());
     }
-    
+    else {
+        // An unrecognised value used to fall out of the chain and leave mergedModes empty,
+        // which collapsed the whole advertised list down to the single fallback mode without
+        // saying so. Fall back to "combined" because it is the superset: a mistyped "edid"
+        // then gets more modes than asked for rather than silently losing the EDID ones.
+        stringstream ss;
+        ss << "source_priority is \"" << WStringToString(sourcePriority) << "\", which is not one of"
+           << " edid/manual/combined; falling back to \"combined\"";
+        vddlog("w", ss.str().c_str());
+        mergedModes = manualModes;
+        for (const auto& edidMode : edidModes) {
+            bool isDuplicate = false;
+            for (const auto& manualMode : manualModes) {
+                if (edidMode == manualMode) {
+                    isDuplicate = true;
+                    break;
+                }
+            }
+            if (!isDuplicate) {
+                mergedModes.push_back(edidMode);
+            }
+        }
+        vddlog("i", "Using combined mode list after the source_priority fallback");
+    }
     return mergedModes;
 }
 
@@ -1390,28 +1421,32 @@ vector<tuple<int, int, int, int>> OptimizeModeList(const vector<tuple<int, int, 
                                                    const tuple<int, int, int, int>& preferredMode) {
     vector<tuple<int, int, int, int>> optimizedModes = modes;
     
-    // Remove preferred mode from list if it exists, we'll add it at the front
-    optimizedModes.erase(
-        remove_if(optimizedModes.begin(), optimizedModes.end(),
-                  [&preferredMode](const tuple<int, int, int, int>& mode) {
-                      return get<0>(mode) == get<0>(preferredMode) && 
-                             get<1>(mode) == get<1>(preferredMode) &&
-                             get<3>(mode) == get<3>(preferredMode);
-                  }),
-        optimizedModes.end());
-    
-    // Insert preferred mode at the beginning
-    optimizedModes.insert(optimizedModes.begin(), preferredMode);
-    
-    // Remove duplicate modes (same resolution and refresh rate)
+    // Remove duplicate modes (same resolution and vsync fraction)
+    // NOTE: this sort used to run *after* the preferred mode was inserted at the front, which
+    // shuffled it straight back into resolution order and defeated the prioritisation entirely.
     sort(optimizedModes.begin(), optimizedModes.end());
     optimizedModes.erase(unique(optimizedModes.begin(), optimizedModes.end(),
                                 [](const tuple<int, int, int, int>& a, const tuple<int, int, int, int>& b) {
-                                    return get<0>(a) == get<0>(b) && 
-                                           get<1>(a) == get<1>(b) && 
+                                    return get<0>(a) == get<0>(b) &&
+                                           get<1>(a) == get<1>(b) &&
+                                           get<2>(a) == get<2>(b) &&
                                            get<3>(a) == get<3>(b);
                                 }),
                          optimizedModes.end());
+
+    // Only now drop any surviving copy and put the preferred mode at the front, where the sort
+    // above cannot touch it any more.
+    optimizedModes.erase(
+        remove_if(optimizedModes.begin(), optimizedModes.end(),
+                  [&preferredMode](const tuple<int, int, int, int>& mode) {
+                      return get<0>(mode) == get<0>(preferredMode) &&
+                             get<1>(mode) == get<1>(preferredMode) &&
+                             get<2>(mode) == get<2>(preferredMode) &&
+                             get<3>(mode) == get<3>(preferredMode);
+                  }),
+        optimizedModes.end());
+
+    optimizedModes.insert(optimizedModes.begin(), preferredMode);
     
     // Limit total number of modes for performance (Windows typically supports 20-50 modes)
     const size_t maxModes = 32;
@@ -1509,7 +1544,14 @@ bool LoadEdidProfile(const wstring& profilePath, EdidProfileData& profile) {
 				currentSection = currentElement;
 			}
 			break;
-			
+
+		case XmlNodeType_EndElement:
+			// Without this the two names below were set on Element and never reset, so they
+			// kept describing the last element opened rather than the one being read.
+			currentElement.clear();
+			currentSection.clear();
+			break;
+
 		case XmlNodeType_Text:
 			hr = pReader->GetValue(&pwszValue, &cwchValue);
 			if (FAILED(hr)) return false;
@@ -1519,16 +1561,16 @@ bool LoadEdidProfile(const wstring& profilePath, EdidProfileData& profile) {
 			// Parse monitor modes
 			if (currentSection == L"MonitorModes") {
 				if (currentElement == L"Width") {
-					tempWidth = stoi(value);
+					tempWidth = ParseIntSafe(value, tempWidth, L"EDID profile Width");
 				}
 				else if (currentElement == L"Height") {
-					tempHeight = stoi(value);
+					tempHeight = ParseIntSafe(value, tempHeight, L"EDID profile Height");
 				}
 				else if (currentElement == L"RefreshRateMultiplier") {
-					tempRefreshRateMultiplier = stoi(value);
+					tempRefreshRateMultiplier = ParseIntSafe(value, tempRefreshRateMultiplier, L"EDID profile RefreshRateMultiplier");
 				}
 				else if (currentElement == L"NominalRefreshRate") {
-					tempNominalRefreshRate = stoi(value);
+					tempNominalRefreshRate = ParseIntSafe(value, tempNominalRefreshRate, L"EDID profile NominalRefreshRate");
 					// Complete mode entry
 					if (tempWidth > 0 && tempHeight > 0) {
 						profile.modes.push_back(make_tuple(tempWidth, tempHeight, tempRefreshRateMultiplier, tempNominalRefreshRate));
@@ -1550,10 +1592,10 @@ bool LoadEdidProfile(const wstring& profilePath, EdidProfileData& profile) {
 					profile.hdr10PlusSupported = (value == L"true");
 				}
 				else if (currentElement == L"MaxLuminance") {
-					profile.maxLuminance = stod(value);
+					profile.maxLuminance = ParseDoubleSafe(value, profile.maxLuminance, L"EDID profile MaxLuminance");
 				}
 				else if (currentElement == L"MinLuminance") {
-					profile.minLuminance = stod(value);
+					profile.minLuminance = ParseDoubleSafe(value, profile.minLuminance, L"EDID profile MinLuminance");
 				}
 			}
 			// Parse color profile
@@ -1562,43 +1604,43 @@ bool LoadEdidProfile(const wstring& profilePath, EdidProfileData& profile) {
 					profile.primaryColorSpace = value;
 				}
 				else if (currentElement == L"Gamma") {
-					profile.gamma = stod(value);
+					profile.gamma = ParseDoubleSafe(value, profile.gamma, L"EDID profile Gamma");
 				}
 				else if (currentElement == L"RedX") {
-					profile.redX = stod(value);
+					profile.redX = ParseDoubleSafe(value, profile.redX, L"EDID profile RedX");
 				}
 				else if (currentElement == L"RedY") {
-					profile.redY = stod(value);
+					profile.redY = ParseDoubleSafe(value, profile.redY, L"EDID profile RedY");
 				}
 				else if (currentElement == L"GreenX") {
-					profile.greenX = stod(value);
+					profile.greenX = ParseDoubleSafe(value, profile.greenX, L"EDID profile GreenX");
 				}
 				else if (currentElement == L"GreenY") {
-					profile.greenY = stod(value);
+					profile.greenY = ParseDoubleSafe(value, profile.greenY, L"EDID profile GreenY");
 				}
 				else if (currentElement == L"BlueX") {
-					profile.blueX = stod(value);
+					profile.blueX = ParseDoubleSafe(value, profile.blueX, L"EDID profile BlueX");
 				}
 				else if (currentElement == L"BlueY") {
-					profile.blueY = stod(value);
+					profile.blueY = ParseDoubleSafe(value, profile.blueY, L"EDID profile BlueY");
 				}
 				else if (currentElement == L"WhiteX") {
-					profile.whiteX = stod(value);
+					profile.whiteX = ParseDoubleSafe(value, profile.whiteX, L"EDID profile WhiteX");
 				}
 				else if (currentElement == L"WhiteY") {
-					profile.whiteY = stod(value);
+					profile.whiteY = ParseDoubleSafe(value, profile.whiteY, L"EDID profile WhiteY");
 				}
 			}
 			// Parse preferred mode
 			else if (currentSection == L"PreferredMode") {
 				if (currentElement == L"Width") {
-					profile.preferredWidth = stoi(value);
+					profile.preferredWidth = ParseIntSafe(value, profile.preferredWidth, L"EDID profile PreferredMode Width");
 				}
 				else if (currentElement == L"Height") {
-					profile.preferredHeight = stoi(value);
+					profile.preferredHeight = ParseIntSafe(value, profile.preferredHeight, L"EDID profile PreferredMode Height");
 				}
 				else if (currentElement == L"RefreshRate") {
-					profile.preferredRefresh = stod(value);
+					profile.preferredRefresh = ParseDoubleSafe(value, profile.preferredRefresh, L"EDID profile PreferredMode RefreshRate");
 				}
 			}
 			break;
@@ -1646,7 +1688,7 @@ bool ApplyEdidProfile(const EdidProfileData& profile) {
 			   << "  Generated EDID modes: " << edidModes.size() << "\n"
 			   << "  Final optimized modes: " << finalModes.size() << "\n"
 			   << "  Preferred mode: " << get<0>(preferredMode) << "x" << get<1>(preferredMode) 
-			   << "@" << get<3>(preferredMode) << "Hz\n"
+			   << "@" << (get<3>(preferredMode) ? static_cast<double>(get<2>(preferredMode)) / get<3>(preferredMode) : 0.0) << "Hz\n"
 			   << "  Source priority: " << WStringToString(sourcePriority);
 			vddlog("i", ss.str().c_str());
 		} else {
@@ -2945,10 +2987,20 @@ void loadSettings() {
 					return;
 				}
 				if (currentElement == L"count") {
-					monitorcount = stoi(wstring(pwszValue, cwchValue));
-					if (monitorcount == 0) {
+					monitorcount = ParseIntSafe(wstring(pwszValue, cwchValue), 1, L"monitor count");
+					// The guard used to be "== 0" only. numVirtualDisplays is a UINT and goes
+					// straight into AdapterCaps.MaxMonitorsSupported and then into
+					// for (i = 0; i < numVirtualDisplays; i++) CreateMonitor(i), so a negative
+					// count became roughly four billion and the loop asked for four billion
+					// monitors. SETDISPLAYCOUNT wrote any integer the client sent, so this was
+					// reachable from the pipe.
+					if (monitorcount < MIN_VIRTUAL_DISPLAYS || monitorcount > MAX_VIRTUAL_DISPLAYS) {
+						stringstream ss;
+						ss << "monitors/count of " << monitorcount << " is outside the supported range of "
+						   << MIN_VIRTUAL_DISPLAYS << " to " << MAX_VIRTUAL_DISPLAYS
+						   << "; loading a single monitor";
+						vddlog("w", ss.str().c_str());
 						monitorcount = 1;
-						vddlog("i", "Loading singular monitor (Monitor Count is not valid)");
 					}
 				}
 				else if (currentElement == L"friendlyname") {
@@ -2965,7 +3017,14 @@ void loadSettings() {
 					if (height.empty()) {
 						height = L"600";
 					}
-					resolutions.insert(make_tuple(stoi(width), stoi(height)));
+					int parsedWidth = ParseIntSafe(width, 0, L"resolution width");
+					int parsedHeight = ParseIntSafe(height, 0, L"resolution height");
+					if (parsedWidth > 0 && parsedHeight > 0) {
+						resolutions.insert(make_tuple(parsedWidth, parsedHeight));
+					}
+					else {
+						vddlog("e", "Skipping resolution with invalid width or height");
+					}
 				}
 				else if (currentElement == L"refresh_rate") {
 					refreshRate = wstring(pwszValue, cwchValue);
@@ -2973,15 +3032,28 @@ void loadSettings() {
 						refreshRate = L"30";
 					}
 					int vsync_num, vsync_den;
-					float_to_vsync(stof(refreshRate), vsync_num, vsync_den);
+					float_to_vsync(ParseFloatSafe(refreshRate, 30.0f, L"resolution refresh_rate"), vsync_num, vsync_den);
 
-					res.push_back(make_tuple(stoi(width), stoi(height), vsync_num, vsync_den));
-					stringstream ss;
-					ss << "Added: " << stoi(width) << "x" << stoi(height) << " @ " << vsync_num << "/" << vsync_den << "Hz";
-					vddlog("d", ss.str().c_str());
+					int parsedWidth = ParseIntSafe(width, 0, L"resolution width");
+					int parsedHeight = ParseIntSafe(height, 0, L"resolution height");
+					if (parsedWidth > 0 && parsedHeight > 0) {
+						res.push_back(make_tuple(parsedWidth, parsedHeight, vsync_num, vsync_den));
+						stringstream ss;
+						ss << "Added: " << parsedWidth << "x" << parsedHeight << " @ " << vsync_num << "/" << vsync_den << "Hz";
+						vddlog("d", ss.str().c_str());
+					}
+					else {
+						vddlog("e", "Skipping mode with invalid width or height");
+					}
 				}
 				else if (currentElement == L"g_refresh_rate") {
-					globalRefreshRates.push_back(stoi(wstring(pwszValue, cwchValue)));
+					int globalRate = ParseIntSafe(wstring(pwszValue, cwchValue), 0, L"global refresh rate");
+					if (globalRate > 0) {
+						globalRefreshRates.push_back(globalRate);
+					}
+					else {
+						vddlog("e", "Skipping invalid global refresh rate");
+					}
 				}
 				break;
 			}
@@ -3061,19 +3133,73 @@ void loadSettings() {
 	ifstream ifs(optionsname);
 	if (ifs.is_open()) {
     string line;
-    if (getline(ifs, line) && !line.empty()) {
-        numVirtualDisplays = stoi(line);
-        vector<tuple<int, int, int, int>> res; 
 
-        while (getline(ifs, line)) {
-            vector<string> strvec = split(line, ',');
-            if (strvec.size() == 3 && strvec[0].substr(0, 1) != "#") {
-                int vsync_num, vsync_den;
-                float_to_vsync(stof(strvec[2]), vsync_num, vsync_den); 
-                res.push_back({ stoi(strvec[0]), stoi(strvec[1]), vsync_num, vsync_den });
+    // The count is the first line that carries one, not literally the first line: '#' lines are
+    // skipped exactly as they are on a mode line, so the file can carry a header explaining what
+    // the count is, and without the skip the shipped file (a header of comment lines, then the
+	// count) would announce "opens with a comment" on every load and silently ignore anyone who
+	// edited the count.
+    // would announce "opens with a comment" on every load and silently ignore anyone who edited
+    // the count. The fallback is 1 on both paths -- numVirtualDisplays is zero-initialised, so
+    // leaving it alone would hand the adapter zero monitors, which is not the one the caller is
+    // about to get either way.
+    //
+    // Known trap, unchanged by this: a file with no count line at all whose first non-comment
+    // line is a mode. "640, 480, 60" is read as the count, ParseIntSafe takes it as trailing
+    // garbage, haveDisplayCount is still set, so the mode is lost with only a misattributed
+    // "Trailing garbage in option.txt display count" to explain it.
+    numVirtualDisplays = 1;
+    bool haveDisplayCount = false;
+    while (getline(ifs, line)) {
+        const string count = TrimAsciiSpace(line);
+        if (count.empty() || count[0] == '#') {
+            continue;
+        }
+        numVirtualDisplays = ParseIntSafe(count, 1, L"option.txt display count");
+        haveDisplayCount = true;
+        break;
+    }
+    if (!haveDisplayCount) {
+        vddlog("w", "option.txt has no display count before its mode lines, assuming 1 virtual display");
+    }
+
+    vector<tuple<int, int, int, int>> res; 
+
+    while (getline(ifs, line)) {
+        string trimmed = TrimAsciiSpace(line);
+        if (trimmed.empty() || trimmed[0] == '#') {
+            continue;
+        }
+        vector<string> strvec = split(trimmed, ',');
+        if (strvec.size() == 3) {
+            int vsync_num, vsync_den;
+            float_to_vsync(ParseFloatSafe(TrimAsciiSpace(strvec[2]), 60.0f, L"option.txt refresh rate"), vsync_num, vsync_den);
+            int modeWidth = ParseIntSafe(TrimAsciiSpace(strvec[0]), 0, L"option.txt width");
+            int modeHeight = ParseIntSafe(TrimAsciiSpace(strvec[1]), 0, L"option.txt height");
+            if (modeWidth > 0 && modeHeight > 0) {
+                // The same bounds the EDID profile filter applies. option.txt used to
+                // accept any positive size, so a hand-edited line produced a mode the
+                // rest of the driver considers out of range.
+                if (modeWidth < minResolutionWidth || modeWidth > maxResolutionWidth ||
+                    modeHeight < minResolutionHeight || modeHeight > maxResolutionHeight) {
+                    stringstream ss;
+                    ss << "option.txt mode " << modeWidth << "x" << modeHeight
+                       << " is outside the configured range, skipping";
+                    vddlog("w", ss.str().c_str());
+                    continue;
+                }
+                res.push_back({ modeWidth, modeHeight, vsync_num, vsync_den });
+            }
+            else {
+                vddlog("e", "Skipping malformed option.txt mode line");
             }
         }
+    }
 
+    if (res.empty()) {
+        vddlog("w", "option.txt yielded no usable modes. Enabling Fallback");
+    }
+    else {
         vddlog("i", "Using option.txt");
         monitorModes = res;
         RebuildKnownMonitorModesCache();
@@ -3084,11 +3210,9 @@ void loadSettings() {
             ss << "Resolution: " << width << "x" << height << " @ " << vsync_num << "/" << vsync_den << "Hz";
             vddlog("d", ss.str().c_str());
         }
-		return;
-    } else {
-        vddlog("w", "option.txt is empty or the first line is invalid. Enabling Fallback");
+        return;
     }
-}
+	}
 
 
 	numVirtualDisplays = 1;
@@ -5054,6 +5178,11 @@ NTSTATUS ValidateEdidIntegration()
 		<< "\n  Profile Path: " << WStringToString(profilePath);
 	vddlog("d", logStream.str().c_str());
 
+	// Manual configuration is a supported mode, not a defect, so a disabled integration is
+	// reported and not counted. This check used to add an issue for it, which meant the shipped
+	// default always scored 2 issues, and validationPassed -- which was initialised to true and
+	// never reassigned -- still returned STATUS_SUCCESS and logged PASSED next to a
+	// "Configuration Valid: No" line.
 	if (!edidEnabled) {
 		vddlog("w", "EDID integration is disabled - manual configuration mode");
 		issues++;
