@@ -76,9 +76,12 @@ git submodule update --init --recursive
    - **Device Manager:** Check "Device Manager" under "Display Adapters."
    - **Settings:** Check display settings under system settings and see if the virtual displays show.
 
-While VDC is a good and friendly way to work with VDD, you can also do a a lot manually. Like adding or removing resolutions or enable/disable 
+While VDC is a good and friendly way to work with VDD, you can also do a lot manually. Like adding or removing resolutions or enable/disable 
 functions, which is done by editing vdd_settings.xml. You should be able to locate the file at the default location: 
-```C:\VirtualDisplayDriver\vdd_settings.xml ```
+
+```text
+C:\VirtualDisplayDriver\vdd_settings.xml
+```
 
 For more information about manual installation, uninstallation and "personalization", please check out the [Wiki](https://github.com/VirtualDrivers/Virtual-Display-Driver/wiki) here on 
 the project GitHub repository. If you are into tinkering, check out the Powershell scripts in [Community scripts](https://github.com/VirtualDrivers/Virtual-Display-Driver/tree/master/Community%20Scripts).
@@ -90,14 +93,22 @@ projects.
 
 | Project | Iddcx version | Signed | SDR | HDR | H-Cursor | Tweakable | ARM64 Support | Custom EDID | Floating Point Refresh Rates |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| [Virtual-Display-Driver (HDR)] | 1.10 (latest) | ✅ | ✅ (8/10bit) | ✅ (10/12bit) | ✅ | ✅ | ✅¹ | ✅ | ✅ |
-| [usbmmid_v2] |  | ✅ | ✅ (8bit) |  |  |  |  |  |  |
+| [Virtual-Display-Driver (HDR)] | 1.10 (latest) | ✅ | ✅ (8/10bit) | ✅ (10/12bit)² | ✅ | ✅ | ✅¹ | ✅ | ✅ |
+| `usbmmid_v2`³ |  | ✅ | ✅ (8bit) |  |  |  |  |  |  |
 | [virtual-display-rs] | 1.5 |  | ✅ (8bit) |  | ✅ | ✅ |  |  |  |
 | [parsec-vdd]| 1.5 | ✅ | ✅ (8bit) |  | ✅ | ✅ |  |  |  |
 | [lddSampleDriver] | 1.2 |  | ✅ (8bit) |  |  |  |  |  |  |
 | [RustDesklddDriver] | 1.2 |  | ✅ (8bit) |  |  |  |  |  |  |
 
 ¹ ARM64 Support in Windows 11 24H2 or later may require test signing be enabled.
+² HDR 10/12-bit output requires raising `force_bit_depth` in `vdd_settings.xml`; the shipped default is 8-bit with HDR10 static metadata disabled.
+³ The upstream repository for this project is no longer published, so no link is given.
+
+[Virtual-Display-Driver (HDR)]: https://github.com/VirtualDrivers/Virtual-Display-Driver
+[virtual-display-rs]: https://github.com/MolotovCherry/virtual-display-rs
+[parsec-vdd]: https://github.com/nomi-san/parsec-vdd
+[lddSampleDriver]: https://github.com/roshkins/IddSampleDriver
+[RustDesklddDriver]: https://github.com/rustdesk-org/RustDeskIddDriver
 
 HDR Support Now Available for Windows 11 23H2+ 
 
@@ -107,7 +118,11 @@ HDR Support Now Available for Windows 11 23H2+
 
 [![Thumbnail24 (1)](https://github.com/user-attachments/assets/383d840c-8327-439b-a89b-84b271320371)](https://youtu.be/jN5YnHlC0fE)
 
-![Powerpoint](https://github.com/user-attachments/assets/9ac05776-36e1-4ba1-ac52-3f189dbd7730)
+### Verifying the installation
+
+Once the driver is loaded, Device Manager lists the virtual display under **Display adapters**:
+
+![Device Manager showing "Virtual Display Driver by MTT" selected, with its properties dialog open](https://github.com/user-attachments/assets/9ac05776-36e1-4ba1-ac52-3f189dbd7730)
 
 ## Troubleshooting 
 ### ⚠️ Important: GPU/Chipset Driver Updates

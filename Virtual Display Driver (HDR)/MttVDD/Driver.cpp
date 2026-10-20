@@ -26,6 +26,8 @@ Environment:
 #include <xmllite.h>
 #include <shlwapi.h>
 #include <atlbase.h>
+#include <fcntl.h>
+#include <io.h>
 #include <iostream>
 #include <cstdlib>
 #include <windows.h>
@@ -50,15 +52,152 @@ Environment:
 #pragma comment(lib, "shlwapi.lib")
 
 HANDLE hPipeThread = NULL;
-bool g_Running = true;
+
+// How long the pipe server waits for a client to connect, and how long it waits for that
+// client to send a command, before looping back to re-check g_Running. Both used to block
+// forever, which is what made EvtDriverUnload hang: it waits on the server thread.
+constexpr DWORD PIPE_CONNECT_POLL_MS = 1000;
+constexpr DWORD PIPE_READ_POLL_MS = 5000;
+// Upper bound on waiting for the server thread to wind down at unload. Past this the thread is
+// left to finish on its own; it will notice g_Running within PIPE_CONNECT_POLL_MS.
+constexpr DWORD PIPE_SHUTDOWN_WAIT_MS = 5000;
+
+std::atomic<bool> g_Running{ true }; // written under g_Mutex but read without it in the server loop
 mutex g_Mutex;
+// Guards g_pipeHandle only. A separate mutex from g_Mutex on purpose: vddlog() is called from
+// inside the pipe server while that thread holds g_Mutex, so SendToPipe() cannot take g_Mutex
+// without deadlocking on it.
+mutex g_PipeMutex;
 HANDLE g_pipeHandle = INVALID_HANDLE_VALUE;
+
+// Publish or withdraw the pipe handle. The only sanctioned writers of g_pipeHandle.
+void SetPipeHandle(HANDLE hPipe) {
+	lock_guard<mutex> lock(g_PipeMutex);
+	g_pipeHandle = hPipe;
+}
+
+// Withdraw the pipe handle and hand the previous value back so the caller can close it.
+HANDLE ClearPipeHandle() {
+	lock_guard<mutex> lock(g_PipeMutex);
+	HANDLE previous = g_pipeHandle;
+	g_pipeHandle = INVALID_HANDLE_VALUE; // Whether data goes to the pipe or just the log file
+	return previous;
+}
+
+// Guards g_GammaRampStore and g_HdrMetadataStore. They are written by the settings loader and
+// by the IddCx HDR/gamma callbacks, and std::map is not safe to read while another thread
+// inserts. Distinct from g_Mutex because those callbacks call vddlog() along the way.
+mutex g_MetadataMutex;
 
 using namespace std;
 using namespace Microsoft::IndirectDisp;
 using namespace Microsoft::WRL;
 
 void vddlog(const char* type, const char* message);
+
+// Defined below, but needed by the EDID mode generator which runs earlier in this file.
+void float_to_vsync(float refresh_rate, int& num, int& den);
+
+// vdd_settings.xml, option.txt and monitor_profile.xml are user-editable files, and loadSettings()
+// runs inside the DeviceAdd callback. std::stoi/stof throw std::invalid_argument or
+// std::out_of_range on a malformed value, and an exception leaving a UMDF callback crashes the
+// host. Parse defensively instead: log the offending value and keep the caller's fallback.
+// These light levels come straight from vdd_settings.xml as int. A value above 65535 wrapped
+// silently on the cast, so a typo in the XML turned into a plausible-looking but wrong number.
+UINT16 ClampToUINT16(int value) {
+	if (value < 0) { return 0; }
+	if (value > 65535) { return 65535; }
+	return static_cast<UINT16>(value);
+}
+
+// vdd_settings.xml and monitor_profile.xml are wstring, option.txt is std::string.
+template <typename T>
+int ParseIntSafe(const T& text, int fallback, const wchar_t* what) {
+	try {
+		size_t consumed = 0;
+		int value = stoi(text, &consumed);
+		if (consumed != text.size()) {
+			stringstream ss;
+			ss << "Trailing garbage in " << WStringToString(what) << ", using fallback";
+			vddlog("e", ss.str().c_str());
+			return fallback;
+		}
+		return value;
+	}
+	catch (const exception&) {
+		stringstream ss;
+		ss << "Malformed " << WStringToString(what) << " value, using fallback";
+		vddlog("e", ss.str().c_str());
+		return fallback;
+	}
+}
+
+template <typename T>
+float ParseFloatSafe(const T& text, float fallback, const wchar_t* what) {
+	try {
+		size_t consumed = 0;
+		float value = stof(text, &consumed);
+		if (consumed != text.size()) {
+			stringstream ss;
+			ss << "Trailing garbage in " << WStringToString(what) << ", using fallback";
+			vddlog("e", ss.str().c_str());
+			return fallback;
+		}
+		return value;
+	}
+	catch (const exception&) {
+		stringstream ss;
+		ss << "Malformed " << WStringToString(what) << " value, using fallback";
+		vddlog("e", ss.str().c_str());
+		return fallback;
+	}
+}
+
+// Same contract as ParseFloatSafe, but in double. The EdidProfileData chromaticity and
+// luminance fields are double, and ParseFloatSafe would quietly round them: redX 0.640 read
+// as float and stored back as double is 0.63999998569488525390625, which then differs from the
+// 0.640 the same file computes elsewhere.
+template <typename T>
+double ParseDoubleSafe(const T& text, double fallback, const wchar_t* what) {
+	try {
+		size_t consumed = 0;
+		double value = stod(text, &consumed);
+		if (consumed != text.size()) {
+			stringstream ss;
+			ss << "Trailing garbage in " << WStringToString(what) << ", using fallback";
+			vddlog("e", ss.str().c_str());
+			return fallback;
+		}
+		return value;
+	}
+	catch (const exception&) {
+		stringstream ss;
+		ss << "Malformed " << WStringToString(what) << " value, using fallback";
+		vddlog("e", ss.str().c_str());
+		return fallback;
+	}
+}
+
+// option.txt is a hand-editable file and its mode lines are written "640, 480, 60", with
+// spaces after the commas and whatever else a person types. ParseIntSafe and ParseFloatSafe
+// count anything after the number as trailing garbage and fall back -- stof(" 480 ") consumes
+// the leading space and stops at the trailing one, so a stray trailing space silently turns a
+// hand-written refresh rate into the 60 Hz default and logs an error per mode. Trim here rather
+// than loosening the trailing-garbage check in the two parsers, which the XML and
+// monitor_profile paths use to catch genuinely malformed values.
+//
+// Note the CR is not one of these: the file is CRLF, and std::ifstream in text mode (the
+// default, and what this code opens) translates CRLF to LF, so getline never sees it. Opening
+// the file with ios::binary is what would reintroduce it.
+string TrimAsciiSpace(const string& text) {
+	const char* blanks = " \t\r\n";
+	size_t first = text.find_first_not_of(blanks);
+	if (first == string::npos) {
+		return string();
+	}
+	size_t last = text.find_last_not_of(blanks);
+	return text.substr(first, last - first + 1);
+}
 
 extern "C" DRIVER_INITIALIZE DriverEntry;
 
@@ -89,18 +228,37 @@ struct
 } Options;
 vector<tuple<int, int, int, int>> monitorModes;
 vector< DISPLAYCONFIG_VIDEO_SIGNAL_INFO> s_KnownMonitorModes2;
+// Guards s_KnownMonitorModes2. Both VirtualDisplayDriverParseMonitorDescription and
+// VirtualDisplayDriverParseMonitorDescription2 are IddCx callbacks, and both call
+// RebuildKnownMonitorModesCache. IddCx can run them concurrently, so one can clear and refill
+// this vector while the other is indexing it -- a live data race on a std::vector, which is UB,
+// not merely a stale read. Readers take a snapshot under this lock rather than holding it across
+// the IddCx calls that follow.
+mutex s_KnownMonitorModesMutex;
 UINT numVirtualDisplays;
+// How many virtual displays one adapter may carry. numVirtualDisplays is a UINT feeding
+// AdapterCaps.MaxMonitorsSupported and a CreateMonitor() loop, so a count taken from XML or
+// from the pipe has to be bounded before either sees it. One display is what the driver
+// ships with; a handful is what IddCx realistically carries on one indirect adapter.
+constexpr UINT MIN_VIRTUAL_DISPLAYS = 1;
+constexpr UINT MAX_VIRTUAL_DISPLAYS = 16;
 wstring gpuname;
 wstring confpath = L"C:\\VirtualDisplayDriver";
-bool logsEnabled = false;
-bool debugLogs = false;
+// Atomic because the pipe thread flips these from a command while every other thread reads
+// them on each log line. They were plain bool, which is a data race in the formal model and
+// in practice can hand vddlog a torn decision about whether to log at all.
+std::atomic<bool> logsEnabled{ false };
+std::atomic<bool> debugLogs{ false };
 bool HDRPlus = false;
 bool SDR10 = false;
 bool customEdid = false;
-bool hardwareCursor = false;
+// The compiled value only matters on the path with no vdd_settings.xml, because DriverEntry
+// overwrites it unconditionally on every other path. HardwareCursor ships as true in that file,
+// so true is what this has to say; EnabledOr below is what makes it survive a missing key.
+bool hardwareCursor = true;
 bool preventManufacturerSpoof = false;
 bool edidCeaOverride = false;
-bool sendLogsThroughPipe = true;
+std::atomic<bool> sendLogsThroughPipe{ true };
 
 constexpr DISPLAYCONFIG_VIDEO_SIGNAL_INFO dispinfo(UINT32 h, UINT32 v, UINT32 rn, UINT32 rd);
 
@@ -108,6 +266,7 @@ namespace
 {
 	void RebuildKnownMonitorModesCache()
 	{
+		lock_guard<mutex> lock(s_KnownMonitorModesMutex);
 		s_KnownMonitorModes2.clear();
 		s_KnownMonitorModes2.reserve(monitorModes.size());
 
@@ -120,6 +279,19 @@ namespace
 					std::get<2>(mode),
 					std::get<3>(mode)));
 		}
+	}
+
+	// The two readers below are IddCx callbacks that go on to fill IddCx-owned buffers, so the
+	// lock is held only for the copy. A snapshot is a few dozen DISPLAYCONFIG_VIDEO_SIGNAL_INFO
+	// at most, which is cheap next to the rest of the callback.
+	vector<DISPLAYCONFIG_VIDEO_SIGNAL_INFO> SnapshotKnownMonitorModes() {
+		lock_guard<mutex> lock(s_KnownMonitorModesMutex);
+		return s_KnownMonitorModes2;
+	}
+
+	size_t KnownMonitorModesCount() {
+		lock_guard<mutex> lock(s_KnownMonitorModesMutex);
+		return s_KnownMonitorModes2.size();
 	}
 }
 
@@ -151,13 +323,20 @@ int maxContentLightLevel = 1000;
 int maxFrameAvgLightLevel = 400;
 
 bool colorPrimariesEnabled = false;
-double redX = 0.708, redY = 0.292;
-double greenX = 0.170, greenY = 0.797;
-double blueX = 0.131, blueY = 0.046;
+// Rec.709 / sRGB, matching vdd_settings.xml's <color_primaries>, which annotates exactly these
+// numbers "sRGB color space (safe defaults)". These used to be BT.2020 (0.708/0.292,
+// 0.170/0.797, 0.131/0.046), so the no-settings-file path answered a different colour gamut
+// than the shipped one -- the same class as the gammaCorrection, forceBitDepth, hardwareCursor
+// and maxResolutionWidth drifts, and the only one of the five still standing.
+double redX = 0.640, redY = 0.330;
+double greenX = 0.300, greenY = 0.600;
+double blueX = 0.150, blueY = 0.060;
 double whiteX = 0.3127, whiteY = 0.3290;
 
 bool colorSpaceEnabled = false;
-double gammaCorrection = 2.4;
+// 2.2, not 2.4: this is the value vdd_settings.xml ships, and the XML always wins at
+// runtime, so a default of 2.4 only ever showed up when the XML was missing.
+double gammaCorrection = 2.2;
 wstring primaryColorSpace = L"sRGB";
 bool enableMatrixTransform = false;
 
@@ -169,7 +348,9 @@ int maxRefreshRate = 240;
 bool excludeFractionalRates = false;
 int minResolutionWidth = 640;
 int minResolutionHeight = 480;
-int maxResolutionWidth = 7680;
+// 10240, not 7680: option.txt ships 10240x4320 and 8640 modes, and the bound is the ceiling
+// for every reported mode. A ceiling the shipped mode list violates is not a ceiling.
+int maxResolutionWidth = 10240;
 int maxResolutionHeight = 4320;
 bool useEdidPreferred = false;
 int fallbackWidth = 1920;
@@ -177,22 +358,19 @@ int fallbackHeight = 1080;
 int fallbackRefresh = 60;
 
 // === COLOR ADVANCED SETTINGS ===
+// fp16_surface_support, wide_color_gamut, hdr_tone_mapping and sdr_white_level used to be
+// parsed here and then never read, so a value in vdd_settings.xml silently did nothing.
+// They are gone from the parser, the alias map and the XML; see the "REMOVED SECTIONS"
+// note at the end of vdd_settings.xml. The monitor_emulation block (enabled,
+// emulate_physical_dimensions, physical_width_mm, physical_height_mm,
+// manufacturer_emulation/enabled, manufacturer_name, model_name, serial_number) went the
+// same way: the driver reports hardcoded endpoint diagnostics instead.
 bool autoSelectFromColorSpace = false;
-wstring forceBitDepth = L"auto";
-bool fp16SurfaceSupport = true;
-bool wideColorGamut = false;
-bool hdrToneMapping = false;
-double sdrWhiteLevel = 80.0;
-
-// === MONITOR EMULATION SETTINGS ===
-bool monitorEmulationEnabled = false;
-bool emulatePhysicalDimensions = false;
-int physicalWidthMm = 510;
-int physicalHeightMm = 287;
-bool manufacturerEmulationEnabled = false;
-wstring manufacturerName = L"Generic";
-wstring modelName = L"Virtual Display";
-wstring serialNumber = L"VDD001";
+// "8", not "auto": vdd_settings.xml ships 8 and README.md documents 8-bit as the shipped
+// default, so the path with no settings file has to behave like the shipped configuration.
+// DriverEntry reads this over unconditionally and used to leave an empty string behind on
+// path, which then failed the "must be 8, 10, 12 or auto" check and logged an error every boot.
+wstring forceBitDepth = L"8";
 
 std::map<std::wstring, std::pair<std::wstring, std::wstring>> SettingsQueryMap = {
 	{L"LoggingEnabled", {L"LOGS", L"logging"}},
@@ -218,7 +396,7 @@ std::map<std::wstring, std::pair<std::wstring, std::wstring>> SettingsQueryMap =
 	//Colour End
 	
 	//EDID Integration Begin
-	{L"EdidIntegrationEnabled", {L"EDIDINTEGRATION", L"enabled"}},
+	{L"EdidIntegrationEnabled", {L"EDIDINTEGRATION", L"edid_integration/enabled"}},
 	{L"AutoConfigureFromEdid", {L"AUTOCONFIGFROMEDID", L"auto_configure_from_edid"}},
 	{L"EdidProfilePath", {L"EDIDPROFILEPATH", L"edid_profile_path"}},
 	{L"OverrideManualSettings", {L"OVERRIDEMANUALSETTINGS", L"override_manual_settings"}},
@@ -226,12 +404,12 @@ std::map<std::wstring, std::pair<std::wstring, std::wstring>> SettingsQueryMap =
 	//EDID Integration End
 	
 	//HDR Advanced Begin
-	{L"Hdr10StaticMetadataEnabled", {L"HDR10STATICMETADATA", L"enabled"}},
+	{L"Hdr10StaticMetadataEnabled", {L"HDR10STATICMETADATA", L"hdr10_static_metadata/enabled"}},
 	{L"MaxDisplayMasteringLuminance", {L"MAXLUMINANCE", L"max_display_mastering_luminance"}},
 	{L"MinDisplayMasteringLuminance", {L"MINLUMINANCE", L"min_display_mastering_luminance"}},
 	{L"MaxContentLightLevel", {L"MAXCONTENTLIGHT", L"max_content_light_level"}},
 	{L"MaxFrameAvgLightLevel", {L"MAXFRAMEAVGLIGHT", L"max_frame_avg_light_level"}},
-	{L"ColorPrimariesEnabled", {L"COLORPRIMARIES", L"enabled"}},
+	{L"ColorPrimariesEnabled", {L"COLORPRIMARIES", L"color_primaries/enabled"}},
 	{L"RedX", {L"REDX", L"red_x"}},
 	{L"RedY", {L"REDY", L"red_y"}},
 	{L"GreenX", {L"GREENX", L"green_x"}},
@@ -240,14 +418,14 @@ std::map<std::wstring, std::pair<std::wstring, std::wstring>> SettingsQueryMap =
 	{L"BlueY", {L"BLUEY", L"blue_y"}},
 	{L"WhiteX", {L"WHITEX", L"white_x"}},
 	{L"WhiteY", {L"WHITEY", L"white_y"}},
-	{L"ColorSpaceEnabled", {L"COLORSPACE", L"enabled"}},
+	{L"ColorSpaceEnabled", {L"COLORSPACE", L"color_space/enabled"}},
 	{L"GammaCorrection", {L"GAMMA", L"gamma_correction"}},
 	{L"PrimaryColorSpace", {L"PRIMARYCOLORSPACE", L"primary_color_space"}},
 	{L"EnableMatrixTransform", {L"MATRIXTRANSFORM", L"enable_matrix_transform"}},
 	//HDR Advanced End
 	
 	//Auto Resolutions Begin
-	{L"AutoResolutionsEnabled", {L"AUTORESOLUTIONS", L"enabled"}},
+	{L"AutoResolutionsEnabled", {L"AUTORESOLUTIONS", L"auto_resolutions/enabled"}},
 	{L"SourcePriority", {L"SOURCEPRIORITY", L"source_priority"}},
 	{L"MinRefreshRate", {L"MINREFRESHRATE", L"min_refresh_rate"}},
 	{L"MaxRefreshRate", {L"MAXREFRESHRATE", L"max_refresh_rate"}},
@@ -265,22 +443,9 @@ std::map<std::wstring, std::pair<std::wstring, std::wstring>> SettingsQueryMap =
 	//Color Advanced Begin
 	{L"AutoSelectFromColorSpace", {L"AUTOSELECTCOLOR", L"auto_select_from_color_space"}},
 	{L"ForceBitDepth", {L"FORCEBITDEPTH", L"force_bit_depth"}},
-	{L"Fp16SurfaceSupport", {L"FP16SUPPORT", L"fp16_surface_support"}},
-	{L"WideColorGamut", {L"WIDECOLORGAMUT", L"wide_color_gamut"}},
-	{L"HdrToneMapping", {L"HDRTONEMAPPING", L"hdr_tone_mapping"}},
-	{L"SdrWhiteLevel", {L"SDRWHITELEVEL", L"sdr_white_level"}},
 	//Color Advanced End
-	
-	//Monitor Emulation Begin
-	{L"MonitorEmulationEnabled", {L"MONITOREMULATION", L"enabled"}},
-	{L"EmulatePhysicalDimensions", {L"EMULATEPHYSICAL", L"emulate_physical_dimensions"}},
-	{L"PhysicalWidthMm", {L"PHYSICALWIDTH", L"physical_width_mm"}},
-	{L"PhysicalHeightMm", {L"PHYSICALHEIGHT", L"physical_height_mm"}},
-	{L"ManufacturerEmulationEnabled", {L"MANUFACTUREREMULATION", L"enabled"}},
-	{L"ManufacturerName", {L"MANUFACTURERNAME", L"manufacturer_name"}},
-	{L"ModelName", {L"MODELNAME", L"model_name"}},
-	{L"SerialNumber", {L"SERIALNUMBER", L"serial_number"}},
-	//Monitor Emulation End
+	//Monitor Emulation has no entries: all eight of its settings were removed from the
+	//parser because nothing ever read them.
 };
 
 const char* XorCursorSupportLevelToString(IDDCX_XOR_CURSOR_SUPPORT level) {
@@ -300,6 +465,7 @@ const char* XorCursorSupportLevelToString(IDDCX_XOR_CURSOR_SUPPORT level) {
 
 
 vector<unsigned char> Microsoft::IndirectDisp::IndirectDeviceContext::s_KnownMonitorEdid; //Changed to support static vector
+std::mutex Microsoft::IndirectDisp::IndirectDeviceContext::s_KnownMonitorEdidMutex; // Guards the reassignment/read of s_KnownMonitorEdid across threads
 
 std::map<LUID, std::shared_ptr<Direct3DDevice>, Microsoft::IndirectDisp::LuidComparator> Microsoft::IndirectDisp::IndirectDeviceContext::s_DeviceCache;
 std::mutex Microsoft::IndirectDisp::IndirectDeviceContext::s_DeviceCacheMutex;
@@ -334,7 +500,112 @@ string WStringToString(const wstring& wstr) { //basically just a function for co
 	return str;
 }
 
-bool EnabledQuery(const std::wstring& settingKey) {
+// === vdd_settings.xml, parsed once ===
+//
+// Each of the four getters below used to open vdd_settings.xml and walk the whole document
+// on its own, and DriverEntry calls them 52 times, so every boot did 52 full parses of the
+// same file. The parsed result is cached here instead. InvalidateSettingsCache() is called
+// by the runtime rewriters, which are the only things that change the file after boot.
+mutex g_SettingsCacheMutex;
+map<wstring, wstring> g_SettingsCache;
+bool g_SettingsCacheReady = false;
+
+void InvalidateSettingsCache() {
+	lock_guard<mutex> lock(g_SettingsCacheMutex);
+	g_SettingsCacheReady = false;
+	g_SettingsCache.clear();
+}
+
+static void RecordSettingLocked(const wstring& parent, const wstring& name, const wstring& text) {
+	if (!parent.empty()) {
+		const wstring qualified = parent + L"/" + name;
+		g_SettingsCache.emplace(qualified, text);
+	}
+	// First match wins, which is what the old per-getter loops did: they stopped at the first
+	// element whose name matched.
+	g_SettingsCache.emplace(name, text);
+}
+
+static void BuildSettingsCacheLocked() {
+	if (g_SettingsCacheReady) {
+		return;
+	}
+	// Not marked ready until the parse completes. Latching it up front meant a transient failure
+	// to open the file -- the driver starting before the install script finished copying it --
+	// froze an empty cache for the whole session, where the old per-getter code retried every
+	// call and picked the file up as soon as it appeared.
+	g_SettingsCache.clear();
+
+	const wstring settingsname = confpath + L"\\vdd_settings.xml";
+
+	CComPtr<IStream> pFileStream;
+	HRESULT hr = SHCreateStreamOnFileEx(settingsname.c_str(), STGM_READ, FILE_ATTRIBUTE_NORMAL, FALSE, nullptr, &pFileStream);
+	if (FAILED(hr)) {
+		vddlog("d", "Settings cache: failed to open vdd_settings.xml");
+		return;
+	}
+
+	CComPtr<IXmlReader> pReader;
+	hr = CreateXmlReader(__uuidof(IXmlReader), (void**)&pReader, nullptr);
+	if (FAILED(hr) || FAILED(pReader->SetInput(pFileStream))) {
+		vddlog("d", "Settings cache: failed to create or feed the XML reader");
+		return;
+	}
+
+	XmlNodeType nodeType;
+	const wchar_t* pwszLocalName = nullptr;
+	const wchar_t* pwszValue = nullptr;
+	vector<wstring> path;
+
+	while (S_OK == pReader->Read(&nodeType)) {
+		if (nodeType == XmlNodeType_Element) {
+			pReader->GetLocalName(&pwszLocalName, nullptr);
+			path.push_back(pwszLocalName ? wstring(pwszLocalName) : wstring());
+		}
+		else if (nodeType == XmlNodeType_EndElement) {
+			if (!path.empty()) {
+				path.pop_back();
+			}
+		}
+		else if (nodeType == XmlNodeType_Text && !path.empty()) {
+			pReader->GetValue(&pwszValue, nullptr);
+			if (pwszValue) {
+				const wstring parent = path.size() >= 2 ? path[path.size() - 2] : wstring();
+				RecordSettingLocked(parent, path.back(), wstring(pwszValue));
+			}
+		}
+	}
+
+	g_SettingsCacheReady = true;
+}
+
+// Looks a setting up in vdd_settings.xml.
+//
+// "parent/element" selects by immediate parent. That qualifier is what makes the five
+// settings that all resolve to the bare name "enabled" work: the file has five <enabled>
+// elements in five different sections, and EdidIntegrationEnabled, Hdr10StaticMetadataEnabled,
+// ColorPrimariesEnabled, ColorSpaceEnabled and AutoResolutionsEnabled were all reading the
+// first one, so turning on any of the other four silently turned on all of them. A bare name
+// keeps meaning "first match".
+bool ReadSettingFromXml(const std::wstring& xmlName, std::wstring& value) {
+	lock_guard<mutex> lock(g_SettingsCacheMutex);
+	BuildSettingsCacheLocked();
+	auto it = g_SettingsCache.find(xmlName);
+	if (it == g_SettingsCache.end()) {
+		return false;
+	}
+	value = it->second;
+	return true;
+}
+
+// Resolve a boolean setting. present reports whether the key exists in the registry or the XML
+// at all, which EnabledQuery cannot tell apart from "it exists and is false" -- it collapses
+// both to false. DriverEntry needs the distinction for the settings whose compiled default is
+// true: HardwareCursor ships as <HardwareCursor>true</HardwareCursor>, and answering false for
+// "no settings file" turned the hardware cursor off on exactly the configuration nobody had
+// configured.
+bool ResolveEnabledSetting(const std::wstring& settingKey, bool& present) {
+	present = false;
 	auto it = SettingsQueryMap.find(settingKey);
 	if (it == SettingsQueryMap.end()) {
 		vddlog("e", "requested data not found in xml, consider updating xml!");
@@ -344,89 +615,107 @@ bool EnabledQuery(const std::wstring& settingKey) {
 	std::wstring regName = it->second.first;
 	std::wstring xmlName = it->second.second;
 
-	std::wstring settingsname = confpath + L"\\vdd_settings.xml";
 	HKEY hKey;
 	DWORD dwValue;
 	DWORD dwBufferSize = sizeof(dwValue);
 	LONG lResult = RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\MikeTheTech\\VirtualDisplayDriver", 0, KEY_READ, &hKey);
 
 	if (lResult == ERROR_SUCCESS) {
+		// Resolve fully before closing, and close exactly once. The previous shape closed the
+		// key inside the "registry string" branch and then again on the way out, so a registry
+		// string that was neither true/1 nor false/0 double-closed the handle. (A DWORD that was
+		// neither 0 nor 1 was already safe: that branch closed before testing the value.) The
+		// value now resolves into resolvedFromRegistry/registryValue, the key closes once, and
+		// the function returns early only when the registry actually settled it.
+		bool resolvedFromRegistry = false;
+		bool registryValue = false;
+
 		lResult = RegQueryValueExW(hKey, regName.c_str(), NULL, NULL, (LPBYTE)&dwValue, &dwBufferSize);
 		if (lResult == ERROR_SUCCESS) {
-			RegCloseKey(hKey);
+			present = true;
 			if (dwValue == 1) {
+				resolvedFromRegistry = true; registryValue = true;
 				LogQueries("d", xmlName + L" - is enabled (value = 1).");
-				return true;
 			}
 			else if (dwValue == 0) {
-				goto check_xml;
+				resolvedFromRegistry = true; registryValue = false;
+				LogQueries("d", xmlName + L" - is disabled (value = 0).");
 			}
 		}
 		else {
 			LogQueries("d", xmlName + L" - Failed to retrieve value from registry. Attempting to read as string.");
+			// Uninitialised buffer, unchecked type, then a NUL scan over the raw array:
+			// a REG_BINARY filling the buffer, or a REG_SZ written without its terminator,
+			// leaves nothing to terminate the scan and it runs off the end of the array.
+			// Same guard as GetStringSetting and GetDoubleSetting -- check the type, and
+			// build the string from the length the registry reported instead of from the
+			// raw array.
 			wchar_t path[MAX_PATH];
+			DWORD dwStringType = 0;
 			dwBufferSize = sizeof(path);
-			lResult = RegQueryValueExW(hKey, regName.c_str(), NULL, NULL, (LPBYTE)path, &dwBufferSize);
-			if (lResult == ERROR_SUCCESS) {
-				std::wstring logValue(path);
-				RegCloseKey(hKey);
+			lResult = RegQueryValueExW(hKey, regName.c_str(), NULL, &dwStringType, (LPBYTE)path, &dwBufferSize);
+			if (lResult == ERROR_SUCCESS && dwBufferSize > 0 && dwBufferSize <= sizeof(path)
+				&& (dwStringType == REG_SZ || dwStringType == REG_EXPAND_SZ)) {
+				size_t chars = dwBufferSize / sizeof(wchar_t);
+				if (path[chars - 1] != L'\0') {
+					LogQueries("d", xmlName + L" - Registry string was not NUL terminated, truncating.");
+					chars -= 1;
+				}
+				std::wstring logValue(path, chars);
+				present = true;
 				if (logValue == L"true" || logValue == L"1") {
+					resolvedFromRegistry = true; registryValue = true;
 					LogQueries("d", xmlName + L" - is enabled (string value).");
-					return true;
 				}
 				else if (logValue == L"false" || logValue == L"0") {
-					goto check_xml;
+					resolvedFromRegistry = true; registryValue = false;
+					LogQueries("d", xmlName + L" - is disabled (string value).");
 				}
 			}
-			RegCloseKey(hKey);
-			LogQueries("d", xmlName + L" - Failed to retrieve string value from registry.");
+			else {
+				LogQueries("d", xmlName + L" - Failed to retrieve string value from registry.");
+			}
+		}
+		RegCloseKey(hKey);
+		if (resolvedFromRegistry) {
+			return registryValue;
 		}
 	}
 
-check_xml:
-	CComPtr<IStream> pFileStream;
-	HRESULT hr = SHCreateStreamOnFileEx(settingsname.c_str(), STGM_READ, FILE_ATTRIBUTE_NORMAL, FALSE, nullptr, &pFileStream);
-	if (FAILED(hr)) {
-		LogQueries("d", xmlName + L" - Failed to create file stream for XML settings.");
-		return false;
-	}
-
-	CComPtr<IXmlReader> pReader;
-	hr = CreateXmlReader(__uuidof(IXmlReader), (void**)&pReader, nullptr);
-	if (FAILED(hr)) {
-		LogQueries("d", xmlName + L" - Failed to create XML reader.");
-		return false;
-	}
-
-	hr = pReader->SetInput(pFileStream);
-	if (FAILED(hr)) {
-		LogQueries("d", xmlName + L" - Failed to set input for XML reader.");
-		return false;
-	}
-
-	XmlNodeType nodeType;
-	const wchar_t* pwszLocalName;
-	bool xmlLoggingValue = false;
-
-	while (S_OK == pReader->Read(&nodeType)) {
-		if (nodeType == XmlNodeType_Element) {
-			pReader->GetLocalName(&pwszLocalName, nullptr);
-			if (pwszLocalName && wcscmp(pwszLocalName, xmlName.c_str()) == 0) {
-				pReader->Read(&nodeType);
-				if (nodeType == XmlNodeType_Text) {
-					const wchar_t* pwszValue;
-					pReader->GetValue(&pwszValue, nullptr);
-					if (pwszValue) {
-						xmlLoggingValue = (wcscmp(pwszValue, L"true") == 0);
-					}
-					LogQueries("i", xmlName + (xmlLoggingValue ? L" is enabled." : L" is disabled."));
-					break;
-				}
-			}
+	{
+		std::wstring xmlValue;
+		if (!ReadSettingFromXml(xmlName, xmlValue)) {
+			LogQueries("d", xmlName + L" - not present in XML.");
+			return false;
 		}
-	}
+		present = true;
 
-	return xmlLoggingValue;
+		bool xmlLoggingValue = (xmlValue == L"true" || xmlValue == L"1");
+		LogQueries("i", xmlName + (xmlLoggingValue ? L" is enabled." : L" is disabled."));
+
+		return xmlLoggingValue;
+	}
+}
+
+// EnabledQuery's original contract, kept for every caller that does not care why the answer is
+// false: a key that is absent and a key that says false both answer false.
+bool EnabledQuery(const std::wstring& settingKey) {
+	bool present = false;
+	return ResolveEnabledSetting(settingKey, present);
+}
+
+// EnabledQuery's contract with the missing-key case routed to a caller-chosen default.
+bool EnabledOr(const std::wstring& settingKey, bool fallback) {
+	bool present = false;
+	bool value = ResolveEnabledSetting(settingKey, present);
+	if (!present) {
+		stringstream ss;
+		ss << WStringToString(settingKey) << " is not set in the registry or the settings XML, using the built-in default of "
+		   << (fallback ? "true" : "false");
+		vddlog("w", ss.str().c_str());
+		return fallback;
+	}
+	return value;
 }
 
 int GetIntegerSetting(const std::wstring& settingKey) {
@@ -439,7 +728,6 @@ int GetIntegerSetting(const std::wstring& settingKey) {
 	std::wstring regName = it->second.first;
 	std::wstring xmlName = it->second.second;
 
-	std::wstring settingsname = confpath + L"\\vdd_settings.xml";
 	HKEY hKey;
 	DWORD dwValue;
 	DWORD dwBufferSize = sizeof(dwValue);
@@ -454,13 +742,26 @@ int GetIntegerSetting(const std::wstring& settingKey) {
 		}
 		else {
 			LogQueries("d", xmlName + L" - Failed to retrieve integer value from registry. Attempting to read as string.");
+			// Uninitialised buffer, unchecked type, then a NUL scan over the raw array:
+			// a REG_BINARY filling the buffer, or a REG_SZ written without its terminator,
+			// leaves nothing to terminate the scan and it runs off the end of the array.
+			// Same guard as GetStringSetting and GetDoubleSetting -- check the type, and
+			// build the string from the length the registry reported instead of from the
+			// raw array.
 			wchar_t path[MAX_PATH];
+			DWORD dwStringType = 0;
 			dwBufferSize = sizeof(path);
-			lResult = RegQueryValueExW(hKey, regName.c_str(), NULL, NULL, (LPBYTE)path, &dwBufferSize);
+			lResult = RegQueryValueExW(hKey, regName.c_str(), NULL, &dwStringType, (LPBYTE)path, &dwBufferSize);
 			RegCloseKey(hKey);
-			if (lResult == ERROR_SUCCESS) {
+			if (lResult == ERROR_SUCCESS && dwBufferSize > 0 && dwBufferSize <= sizeof(path)
+				&& (dwStringType == REG_SZ || dwStringType == REG_EXPAND_SZ)) {
+				size_t chars = dwBufferSize / sizeof(wchar_t);
+				if (path[chars - 1] != L'\0') {
+					LogQueries("d", xmlName + L" - Registry string was not NUL terminated, truncating.");
+					chars -= 1;
+				}
 				try {
-					int logValue = std::stoi(path);
+					int logValue = std::stoi(std::wstring(path, chars).c_str());
 					LogQueries("d", xmlName + L" - Retrieved string value: " + std::to_wstring(logValue));
 					return logValue;
 				}
@@ -471,51 +772,19 @@ int GetIntegerSetting(const std::wstring& settingKey) {
 		}
 	}
 
-	CComPtr<IStream> pFileStream;
-	HRESULT hr = SHCreateStreamOnFileEx(settingsname.c_str(), STGM_READ, FILE_ATTRIBUTE_NORMAL, FALSE, nullptr, &pFileStream);
-	if (FAILED(hr)) {
-		LogQueries("d", xmlName + L" - Failed to create file stream for XML settings.");
+	std::wstring xmlValue;
+	if (!ReadSettingFromXml(xmlName, xmlValue)) {
+		LogQueries("d", xmlName + L" - not present in XML.");
 		return -1;
 	}
 
-	CComPtr<IXmlReader> pReader;
-	hr = CreateXmlReader(__uuidof(IXmlReader), (void**)&pReader, nullptr);
-	if (FAILED(hr)) {
-		LogQueries("d", xmlName + L" - Failed to create XML reader.");
-		return -1;
-	}
-
-	hr = pReader->SetInput(pFileStream);
-	if (FAILED(hr)) {
-		LogQueries("d", xmlName + L" - Failed to set input for XML reader.");
-		return -1;
-	}
-
-	XmlNodeType nodeType;
-	const wchar_t* pwszLocalName;
 	int xmlLoggingValue = -1;
-
-	while (S_OK == pReader->Read(&nodeType)) {
-		if (nodeType == XmlNodeType_Element) {
-			pReader->GetLocalName(&pwszLocalName, nullptr);
-			if (pwszLocalName && wcscmp(pwszLocalName, xmlName.c_str()) == 0) {
-				pReader->Read(&nodeType);
-				if (nodeType == XmlNodeType_Text) {
-					const wchar_t* pwszValue;
-					pReader->GetValue(&pwszValue, nullptr);
-					if (pwszValue) {
-						try {
-							xmlLoggingValue = std::stoi(pwszValue);
-							LogQueries("i", xmlName + L" - Retrieved from XML: " + std::to_wstring(xmlLoggingValue));
-						}
-						catch (const std::exception&) {
-							LogQueries("d", xmlName + L" - Failed to convert XML string value to integer.");
-						}
-					}
-					break;
-				}
-			}
-		}
+	try {
+		xmlLoggingValue = ParseIntSafe(xmlValue, -1, L"XML setting value");
+		LogQueries("i", xmlName + L" - Retrieved from XML: " + std::to_wstring(xmlLoggingValue));
+	}
+	catch (const std::exception&) {
+		LogQueries("d", xmlName + L" - Failed to convert XML string value to integer.");
 	}
 
 	return xmlLoggingValue;
@@ -531,68 +800,43 @@ std::wstring GetStringSetting(const std::wstring& settingKey) {
 	std::wstring regName = it->second.first;
 	std::wstring xmlName = it->second.second;
 
-	std::wstring settingsname = confpath + L"\\vdd_settings.xml";
 	HKEY hKey;
-	DWORD dwBufferSize = MAX_PATH;
+	DWORD dwBufferSize = MAX_PATH * sizeof(wchar_t);
 	wchar_t buffer[MAX_PATH];
 
+	DWORD dwType = 0;
 	LONG lResult = RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\MikeTheTech\\VirtualDisplayDriver", 0, KEY_READ, &hKey);
 	if (lResult == ERROR_SUCCESS) {
-		lResult = RegQueryValueExW(hKey, regName.c_str(), NULL, NULL, (LPBYTE)buffer, &dwBufferSize);
+		lResult = RegQueryValueExW(hKey, regName.c_str(), NULL, &dwType, (LPBYTE)buffer, &dwBufferSize);
 		RegCloseKey(hKey);
 
-		if (lResult == ERROR_SUCCESS) {
-			LogQueries("d", xmlName + L" - Retrieved string value from registry: " + buffer);
-			return std::wstring(buffer);  
+		// std::wstring(buffer) scans for a NUL that a malformed REG_SZ is not guaranteed to
+		// have, and REG_DWORD writes 4 raw bytes with no terminator at all. Build the string
+		// from the length the registry reported and force the terminator.
+		if (lResult == ERROR_SUCCESS && dwBufferSize > 0 && dwBufferSize <= MAX_PATH * sizeof(wchar_t)
+			&& (dwType == REG_SZ || dwType == REG_EXPAND_SZ)) {
+			size_t chars = dwBufferSize / sizeof(wchar_t);
+			if (buffer[chars - 1] != L'\0') {
+				LogQueries("d", xmlName + L" - Registry string was not NUL terminated, truncating.");
+				chars -= 1;
+			}
+			std::wstring value(buffer, chars);
+			LogQueries("d", xmlName + L" - Retrieved string value from registry: " + value);
+			return value;
 		}
 		else {
 			LogQueries("d", xmlName + L" - Failed to retrieve string value from registry. Attempting to read as XML.");
 		}
 	}
 
-	CComPtr<IStream> pFileStream;
-	HRESULT hr = SHCreateStreamOnFileEx(settingsname.c_str(), STGM_READ, FILE_ATTRIBUTE_NORMAL, FALSE, nullptr, &pFileStream);
-	if (FAILED(hr)) {
-		LogQueries("d", xmlName + L" - Failed to create file stream for XML settings.");
-		return L""; 
+	std::wstring xmlValue;
+	if (!ReadSettingFromXml(xmlName, xmlValue)) {
+		LogQueries("d", xmlName + L" - not present in XML.");
+		return L"";
 	}
 
-	CComPtr<IXmlReader> pReader;
-	hr = CreateXmlReader(__uuidof(IXmlReader), (void**)&pReader, nullptr);
-	if (FAILED(hr)) {
-		LogQueries("d", xmlName + L" - Failed to create XML reader.");
-		return L""; 
-	}
-
-	hr = pReader->SetInput(pFileStream);
-	if (FAILED(hr)) {
-		LogQueries("d", xmlName + L" - Failed to set input for XML reader.");
-		return L"";  
-	}
-
-	XmlNodeType nodeType;
-	const wchar_t* pwszLocalName;
-	std::wstring xmlLoggingValue = L"";  
-
-	while (S_OK == pReader->Read(&nodeType)) {
-		if (nodeType == XmlNodeType_Element) {
-			pReader->GetLocalName(&pwszLocalName, nullptr);
-			if (pwszLocalName && wcscmp(pwszLocalName, xmlName.c_str()) == 0) {
-				pReader->Read(&nodeType);
-				if (nodeType == XmlNodeType_Text) {
-					const wchar_t* pwszValue;
-					pReader->GetValue(&pwszValue, nullptr);
-					if (pwszValue) {
-						xmlLoggingValue = pwszValue;
-					}
-					LogQueries("i", xmlName + L" - Retrieved from XML: " + xmlLoggingValue);
-					break;
-				}
-			}
-		}
-	}
-
-	return xmlLoggingValue;  
+	LogQueries("i", xmlName + L" - Retrieved from XML: " + xmlValue);
+	return xmlValue;
 }
 
 double GetDoubleSetting(const std::wstring& settingKey) {
@@ -605,18 +849,41 @@ double GetDoubleSetting(const std::wstring& settingKey) {
 	std::wstring regName = it->second.first;
 	std::wstring xmlName = it->second.second;
 
-	std::wstring settingsname = confpath + L"\\vdd_settings.xml";
 	HKEY hKey;
-	DWORD dwBufferSize = MAX_PATH;
+	DWORD dwBufferSize = MAX_PATH * sizeof(wchar_t);
 	wchar_t buffer[MAX_PATH];
 
+	DWORD dwType = 0;
 	LONG lResult = RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\MikeTheTech\\VirtualDisplayDriver", 0, KEY_READ, &hKey);
 	if (lResult == ERROR_SUCCESS) {
-		lResult = RegQueryValueExW(hKey, regName.c_str(), NULL, NULL, (LPBYTE)buffer, &dwBufferSize);
+		lResult = RegQueryValueExW(hKey, regName.c_str(), NULL, &dwType, (LPBYTE)buffer, &dwBufferSize);
 		if (lResult == ERROR_SUCCESS) {
 			RegCloseKey(hKey);
 			try {
-				double regValue = std::stod(buffer);
+				double regValue = 0.0;
+				if (dwType == REG_DWORD) {
+					// REG_DWORD is 4 raw bytes with no NUL terminator. Passing that buffer
+					// straight to stod() read past the value into uninitialised stack memory.
+					if (dwBufferSize < sizeof(DWORD)) {
+						throw std::out_of_range("REG_DWORD too small");
+					}
+					DWORD dwordValue = 0;
+					memcpy(&dwordValue, buffer, sizeof(DWORD));
+					regValue = static_cast<double>(dwordValue);
+				}
+				else if (dwType == REG_SZ || dwType == REG_EXPAND_SZ) {
+					// Force the terminator: a malformed REG_SZ is not guaranteed to have one.
+					if (dwBufferSize >= sizeof(wchar_t)) {
+						buffer[dwBufferSize / sizeof(wchar_t) - 1] = L'\0';
+						regValue = std::stod(buffer);
+					}
+					else {
+						throw std::out_of_range("REG_SZ too small");
+					}
+				}
+				else {
+					throw std::out_of_range("unsupported registry value type");
+				}
 				LogQueries("d", xmlName + L" - Retrieved from registry: " + std::to_wstring(regValue));
 				return regValue;
 			}
@@ -629,51 +896,19 @@ double GetDoubleSetting(const std::wstring& settingKey) {
 		}
 	}
 
-	CComPtr<IStream> pFileStream;
-	HRESULT hr = SHCreateStreamOnFileEx(settingsname.c_str(), STGM_READ, FILE_ATTRIBUTE_NORMAL, FALSE, nullptr, &pFileStream);
-	if (FAILED(hr)) {
-		LogQueries("d", xmlName + L" - Failed to create file stream for XML settings.");
+	std::wstring xmlValue;
+	if (!ReadSettingFromXml(xmlName, xmlValue)) {
+		LogQueries("d", xmlName + L" - not present in XML.");
 		return 0.0;
 	}
 
-	CComPtr<IXmlReader> pReader;
-	hr = CreateXmlReader(__uuidof(IXmlReader), (void**)&pReader, nullptr);
-	if (FAILED(hr)) {
-		LogQueries("d", xmlName + L" - Failed to create XML reader.");
-		return 0.0;
-	}
-
-	hr = pReader->SetInput(pFileStream);
-	if (FAILED(hr)) {
-		LogQueries("d", xmlName + L" - Failed to set input for XML reader.");
-		return 0.0;
-	}
-
-	XmlNodeType nodeType;
-	const wchar_t* pwszLocalName;
 	double xmlLoggingValue = 0.0;
-
-	while (S_OK == pReader->Read(&nodeType)) {
-		if (nodeType == XmlNodeType_Element) {
-			pReader->GetLocalName(&pwszLocalName, nullptr);
-			if (pwszLocalName && wcscmp(pwszLocalName, xmlName.c_str()) == 0) {
-				pReader->Read(&nodeType);
-				if (nodeType == XmlNodeType_Text) {
-					const wchar_t* pwszValue;
-					pReader->GetValue(&pwszValue, nullptr);
-					if (pwszValue) {
-						try {
-							xmlLoggingValue = std::stod(pwszValue);
-							LogQueries("i", xmlName + L" - Retrieved from XML: " + std::to_wstring(xmlLoggingValue));
-						}
-						catch (const std::exception&) {
-							LogQueries("d", xmlName + L" - Failed to convert XML value to double.");
-						}
-					}
-					break;
-				}
-			}
-		}
+	try {
+		xmlLoggingValue = std::stod(xmlValue);
+		LogQueries("i", xmlName + L" - Retrieved from XML: " + std::to_wstring(xmlLoggingValue));
+	}
+	catch (const std::exception&) {
+		LogQueries("d", xmlName + L" - Failed to convert XML value to double.");
 	}
 
 	return xmlLoggingValue;
@@ -714,6 +949,23 @@ struct VddGammaRamp {
 
 // === GAMMA AND COLOR SPACE STORAGE ===
 std::map<IDDCX_MONITOR, VddGammaRamp> g_GammaRampStore;
+
+// Locked accessors for the two metadata caches. Every read and write goes through these so a
+// callback running on one IddCx thread cannot observe a map mid-rehash on another.
+bool TryGetGammaRamp(IDDCX_MONITOR monitor, VddGammaRamp& out) {
+	lock_guard<mutex> lock(g_MetadataMutex);
+	auto it = g_GammaRampStore.find(monitor);
+	if (it == g_GammaRampStore.end()) {
+		return false;
+	}
+	out = it->second;
+	return true;
+}
+
+void StoreGammaRamp(IDDCX_MONITOR monitor, const VddGammaRamp& ramp) {
+	lock_guard<mutex> lock(g_MetadataMutex);
+	g_GammaRampStore[monitor] = ramp;
+}
 
 // === COLOR SPACE AND GAMMA CONVERSION FUNCTIONS ===
 
@@ -866,6 +1118,47 @@ struct VddHdrMetadata {
 // === HDR METADATA STORAGE ===
 std::map<IDDCX_MONITOR, VddHdrMetadata> g_HdrMetadataStore;
 
+// Both caches are keyed by IDDCX_MONITOR, a value the OS hands out afresh on every adapter
+// restart, and the HDR callback only ever added entries. Without this the map grew by one
+// VddHdrMetadata per monitor per restart, and an address the OS later recycled could match an
+// entry left behind by a monitor that no longer exists.
+void ForgetMonitorMetadata(IDDCX_MONITOR monitor) {
+	lock_guard<mutex> lock(g_MetadataMutex);
+	g_HdrMetadataStore.erase(monitor);
+	g_GammaRampStore.erase(monitor);
+}
+
+void ForgetAllMonitorMetadata() {
+	lock_guard<mutex> lock(g_MetadataMutex);
+	g_HdrMetadataStore.clear();
+	g_GammaRampStore.clear();
+}
+bool TryGetHdrMetadata(IDDCX_MONITOR monitor, VddHdrMetadata& out) {
+	lock_guard<mutex> lock(g_MetadataMutex);
+	auto it = g_HdrMetadataStore.find(monitor);
+	if (it == g_HdrMetadataStore.end()) {
+		return false;
+	}
+	out = it->second;
+	return true;
+}
+
+void StoreHdrMetadata(IDDCX_MONITOR monitor, const VddHdrMetadata& metadata) {
+	lock_guard<mutex> lock(g_MetadataMutex);
+	g_HdrMetadataStore[monitor] = metadata;
+}
+
+// The key both caches use for "the profile-level template, before any monitor is assigned".
+IDDCX_MONITOR MetadataTemplateKey() {
+	return reinterpret_cast<IDDCX_MONITOR>(0);
+}
+
+void GetMetadataCacheSizes(size_t& hdrCount, size_t& gammaCount) {
+	lock_guard<mutex> lock(g_MetadataMutex);
+	hdrCount = g_HdrMetadataStore.size();
+	gammaCount = g_GammaRampStore.size();
+}
+
 // === HDR METADATA CONVERSION FUNCTIONS ===
 
 // Convert EDID chromaticity (0.0-1.0) to SMPTE ST.2086 format (0-50000)
@@ -907,8 +1200,8 @@ VddHdrMetadata ConvertEdidToSmpteMetadata(const EdidProfileData& profile) {
     metadata.min_display_mastering_luminance = ConvertLuminanceToSmpte(profile.minLuminance);
     
     // Use configured content light levels (from vdd_settings.xml)
-    metadata.max_content_light_level = static_cast<UINT16>(maxContentLightLevel);
-    metadata.max_frame_avg_light_level = static_cast<UINT16>(maxFrameAvgLightLevel);
+    metadata.max_content_light_level = ClampToUINT16(maxContentLightLevel);
+    metadata.max_frame_avg_light_level = ClampToUINT16(maxFrameAvgLightLevel);
     
     // Mark as valid if we have HDR10 support
     metadata.isValid = profile.hdr10Supported && hdr10StaticMetadataEnabled;
@@ -937,8 +1230,8 @@ VddHdrMetadata ConvertManualToSmpteMetadata() {
     metadata.min_display_mastering_luminance = ConvertLuminanceToSmpte(minDisplayMasteringLuminance);
     
     // Use configured content light levels
-    metadata.max_content_light_level = static_cast<UINT16>(maxContentLightLevel);
-    metadata.max_frame_avg_light_level = static_cast<UINT16>(maxFrameAvgLightLevel);
+    metadata.max_content_light_level = ClampToUINT16(maxContentLightLevel);
+    metadata.max_frame_avg_light_level = ClampToUINT16(maxFrameAvgLightLevel);
     
     // Mark as valid if HDR10 metadata is enabled and color primaries are enabled
     metadata.isValid = hdr10StaticMetadataEnabled && colorPrimariesEnabled;
@@ -999,7 +1292,12 @@ vector<tuple<int, int, int, int>> GenerateModesFromEdid(const EdidProfileData& p
                 vddlog("d", ss.str().c_str());
             }
             
-            generatedModes.push_back(mode);
+            // profile.modes carry the EDID (multiplier, nominal) pair. Everything downstream -
+            // and monitorModes itself - reads slots 2 and 3 as (vsyncNum, vsyncDen), so pushing
+            // the raw EDID tuple reported 1000/60 as 16.67 Hz to the OS.
+            int vsyncNum = 0, vsyncDen = 1;
+            float_to_vsync(static_cast<float>(nominalRefreshRate) * refreshRateMultiplier / 1000.0f, vsyncNum, vsyncDen);
+            generatedModes.push_back(make_tuple(width, height, vsyncNum, vsyncDen));
         }
     }
     
@@ -1011,8 +1309,10 @@ vector<tuple<int, int, int, int>> GenerateModesFromEdid(const EdidProfileData& p
              int areaB = get<0>(b) * get<1>(b);
              if (areaA != areaB) return areaA > areaB;  // Larger resolution first
              
-             // Secondary sort: refresh rate
-             return get<3>(a) > get<3>(b);  // Higher refresh rate first
+             // Secondary sort: refresh rate, now read from the vsync fraction
+             double rateA = get<3>(a) ? static_cast<double>(get<2>(a)) / get<3>(a) : 0.0;
+             double rateB = get<3>(b) ? static_cast<double>(get<2>(b)) / get<3>(b) : 0.0;
+             return rateA > rateB;  // Higher refresh rate first
          });
     
     stringstream ss;
@@ -1042,7 +1342,7 @@ tuple<int, int, int, int> FindPreferredModeFromEdid(const EdidProfileData& profi
             
             stringstream ss;
             ss << "Found EDID preferred mode: " << profile.preferredWidth << "x" << profile.preferredHeight 
-               << "@" << get<3>(mode) << "Hz";
+               << "@" << (get<3>(mode) ? static_cast<double>(get<2>(mode)) / get<3>(mode) : 0.0) << "Hz";
             vddlog("i", ss.str().c_str());
             break;
         }
@@ -1074,6 +1374,7 @@ vector<tuple<int, int, int, int>> MergeAndOptimizeModes(const vector<tuple<int, 
             for (const auto& manualMode : manualModes) {
                 if (get<0>(edidMode) == get<0>(manualMode) && 
                     get<1>(edidMode) == get<1>(manualMode) && 
+                    get<2>(edidMode) == get<2>(manualMode) && 
                     get<3>(edidMode) == get<3>(manualMode)) {
                     isDuplicate = true;
                     break;
@@ -1089,7 +1390,30 @@ vector<tuple<int, int, int, int>> MergeAndOptimizeModes(const vector<tuple<int, 
            << (mergedModes.size() - manualModes.size()) << " unique EDID = " << mergedModes.size() << " total";
         vddlog("i", ss.str().c_str());
     }
-    
+    else {
+        // An unrecognised value used to fall out of the chain and leave mergedModes empty,
+        // which collapsed the whole advertised list down to the single fallback mode without
+        // saying so. Fall back to "combined" because it is the superset: a mistyped "edid"
+        // then gets more modes than asked for rather than silently losing the EDID ones.
+        stringstream ss;
+        ss << "source_priority is \"" << WStringToString(sourcePriority) << "\", which is not one of"
+           << " edid/manual/combined; falling back to \"combined\"";
+        vddlog("w", ss.str().c_str());
+        mergedModes = manualModes;
+        for (const auto& edidMode : edidModes) {
+            bool isDuplicate = false;
+            for (const auto& manualMode : manualModes) {
+                if (edidMode == manualMode) {
+                    isDuplicate = true;
+                    break;
+                }
+            }
+            if (!isDuplicate) {
+                mergedModes.push_back(edidMode);
+            }
+        }
+        vddlog("i", "Using combined mode list after the source_priority fallback");
+    }
     return mergedModes;
 }
 
@@ -1098,28 +1422,32 @@ vector<tuple<int, int, int, int>> OptimizeModeList(const vector<tuple<int, int, 
                                                    const tuple<int, int, int, int>& preferredMode) {
     vector<tuple<int, int, int, int>> optimizedModes = modes;
     
-    // Remove preferred mode from list if it exists, we'll add it at the front
-    optimizedModes.erase(
-        remove_if(optimizedModes.begin(), optimizedModes.end(),
-                  [&preferredMode](const tuple<int, int, int, int>& mode) {
-                      return get<0>(mode) == get<0>(preferredMode) && 
-                             get<1>(mode) == get<1>(preferredMode) &&
-                             get<3>(mode) == get<3>(preferredMode);
-                  }),
-        optimizedModes.end());
-    
-    // Insert preferred mode at the beginning
-    optimizedModes.insert(optimizedModes.begin(), preferredMode);
-    
-    // Remove duplicate modes (same resolution and refresh rate)
+    // Remove duplicate modes (same resolution and vsync fraction)
+    // NOTE: this sort used to run *after* the preferred mode was inserted at the front, which
+    // shuffled it straight back into resolution order and defeated the prioritisation entirely.
     sort(optimizedModes.begin(), optimizedModes.end());
     optimizedModes.erase(unique(optimizedModes.begin(), optimizedModes.end(),
                                 [](const tuple<int, int, int, int>& a, const tuple<int, int, int, int>& b) {
-                                    return get<0>(a) == get<0>(b) && 
-                                           get<1>(a) == get<1>(b) && 
+                                    return get<0>(a) == get<0>(b) &&
+                                           get<1>(a) == get<1>(b) &&
+                                           get<2>(a) == get<2>(b) &&
                                            get<3>(a) == get<3>(b);
                                 }),
                          optimizedModes.end());
+
+    // Only now drop any surviving copy and put the preferred mode at the front, where the sort
+    // above cannot touch it any more.
+    optimizedModes.erase(
+        remove_if(optimizedModes.begin(), optimizedModes.end(),
+                  [&preferredMode](const tuple<int, int, int, int>& mode) {
+                      return get<0>(mode) == get<0>(preferredMode) &&
+                             get<1>(mode) == get<1>(preferredMode) &&
+                             get<2>(mode) == get<2>(preferredMode) &&
+                             get<3>(mode) == get<3>(preferredMode);
+                  }),
+        optimizedModes.end());
+
+    optimizedModes.insert(optimizedModes.begin(), preferredMode);
     
     // Limit total number of modes for performance (Windows typically supports 20-50 modes)
     const size_t maxModes = 32;
@@ -1217,7 +1545,14 @@ bool LoadEdidProfile(const wstring& profilePath, EdidProfileData& profile) {
 				currentSection = currentElement;
 			}
 			break;
-			
+
+		case XmlNodeType_EndElement:
+			// Without this the two names below were set on Element and never reset, so they
+			// kept describing the last element opened rather than the one being read.
+			currentElement.clear();
+			currentSection.clear();
+			break;
+
 		case XmlNodeType_Text:
 			hr = pReader->GetValue(&pwszValue, &cwchValue);
 			if (FAILED(hr)) return false;
@@ -1227,16 +1562,16 @@ bool LoadEdidProfile(const wstring& profilePath, EdidProfileData& profile) {
 			// Parse monitor modes
 			if (currentSection == L"MonitorModes") {
 				if (currentElement == L"Width") {
-					tempWidth = stoi(value);
+					tempWidth = ParseIntSafe(value, tempWidth, L"EDID profile Width");
 				}
 				else if (currentElement == L"Height") {
-					tempHeight = stoi(value);
+					tempHeight = ParseIntSafe(value, tempHeight, L"EDID profile Height");
 				}
 				else if (currentElement == L"RefreshRateMultiplier") {
-					tempRefreshRateMultiplier = stoi(value);
+					tempRefreshRateMultiplier = ParseIntSafe(value, tempRefreshRateMultiplier, L"EDID profile RefreshRateMultiplier");
 				}
 				else if (currentElement == L"NominalRefreshRate") {
-					tempNominalRefreshRate = stoi(value);
+					tempNominalRefreshRate = ParseIntSafe(value, tempNominalRefreshRate, L"EDID profile NominalRefreshRate");
 					// Complete mode entry
 					if (tempWidth > 0 && tempHeight > 0) {
 						profile.modes.push_back(make_tuple(tempWidth, tempHeight, tempRefreshRateMultiplier, tempNominalRefreshRate));
@@ -1258,10 +1593,10 @@ bool LoadEdidProfile(const wstring& profilePath, EdidProfileData& profile) {
 					profile.hdr10PlusSupported = (value == L"true");
 				}
 				else if (currentElement == L"MaxLuminance") {
-					profile.maxLuminance = stod(value);
+					profile.maxLuminance = ParseDoubleSafe(value, profile.maxLuminance, L"EDID profile MaxLuminance");
 				}
 				else if (currentElement == L"MinLuminance") {
-					profile.minLuminance = stod(value);
+					profile.minLuminance = ParseDoubleSafe(value, profile.minLuminance, L"EDID profile MinLuminance");
 				}
 			}
 			// Parse color profile
@@ -1270,43 +1605,43 @@ bool LoadEdidProfile(const wstring& profilePath, EdidProfileData& profile) {
 					profile.primaryColorSpace = value;
 				}
 				else if (currentElement == L"Gamma") {
-					profile.gamma = stod(value);
+					profile.gamma = ParseDoubleSafe(value, profile.gamma, L"EDID profile Gamma");
 				}
 				else if (currentElement == L"RedX") {
-					profile.redX = stod(value);
+					profile.redX = ParseDoubleSafe(value, profile.redX, L"EDID profile RedX");
 				}
 				else if (currentElement == L"RedY") {
-					profile.redY = stod(value);
+					profile.redY = ParseDoubleSafe(value, profile.redY, L"EDID profile RedY");
 				}
 				else if (currentElement == L"GreenX") {
-					profile.greenX = stod(value);
+					profile.greenX = ParseDoubleSafe(value, profile.greenX, L"EDID profile GreenX");
 				}
 				else if (currentElement == L"GreenY") {
-					profile.greenY = stod(value);
+					profile.greenY = ParseDoubleSafe(value, profile.greenY, L"EDID profile GreenY");
 				}
 				else if (currentElement == L"BlueX") {
-					profile.blueX = stod(value);
+					profile.blueX = ParseDoubleSafe(value, profile.blueX, L"EDID profile BlueX");
 				}
 				else if (currentElement == L"BlueY") {
-					profile.blueY = stod(value);
+					profile.blueY = ParseDoubleSafe(value, profile.blueY, L"EDID profile BlueY");
 				}
 				else if (currentElement == L"WhiteX") {
-					profile.whiteX = stod(value);
+					profile.whiteX = ParseDoubleSafe(value, profile.whiteX, L"EDID profile WhiteX");
 				}
 				else if (currentElement == L"WhiteY") {
-					profile.whiteY = stod(value);
+					profile.whiteY = ParseDoubleSafe(value, profile.whiteY, L"EDID profile WhiteY");
 				}
 			}
 			// Parse preferred mode
 			else if (currentSection == L"PreferredMode") {
 				if (currentElement == L"Width") {
-					profile.preferredWidth = stoi(value);
+					profile.preferredWidth = ParseIntSafe(value, profile.preferredWidth, L"EDID profile PreferredMode Width");
 				}
 				else if (currentElement == L"Height") {
-					profile.preferredHeight = stoi(value);
+					profile.preferredHeight = ParseIntSafe(value, profile.preferredHeight, L"EDID profile PreferredMode Height");
 				}
 				else if (currentElement == L"RefreshRate") {
-					profile.preferredRefresh = stod(value);
+					profile.preferredRefresh = ParseDoubleSafe(value, profile.preferredRefresh, L"EDID profile PreferredMode RefreshRate");
 				}
 			}
 			break;
@@ -1354,7 +1689,7 @@ bool ApplyEdidProfile(const EdidProfileData& profile) {
 			   << "  Generated EDID modes: " << edidModes.size() << "\n"
 			   << "  Final optimized modes: " << finalModes.size() << "\n"
 			   << "  Preferred mode: " << get<0>(preferredMode) << "x" << get<1>(preferredMode) 
-			   << "@" << get<3>(preferredMode) << "Hz\n"
+			   << "@" << (get<3>(preferredMode) ? static_cast<double>(get<2>(preferredMode)) / get<3>(preferredMode) : 0.0) << "Hz\n"
 			   << "  Source priority: " << WStringToString(sourcePriority);
 			vddlog("i", ss.str().c_str());
 		} else {
@@ -1362,18 +1697,33 @@ bool ApplyEdidProfile(const EdidProfileData& profile) {
 		}
 	}
 
-	// Apply HDR settings if configured
+	// Apply HDR settings if configured.
+	// overrideManualSettings is the only thing that decides this, and its documented meaning in
+	// vdd_settings.xml is "false = manual settings take priority". Four tests used to sit
+	// alongside it, all meant to read as "unless the user changed this":
+	//
+	//   maxDisplayMasteringLuminance == 1000.0   XML ships 1000.0  -> always true, so a
+	//   minDisplayMasteringLuminance == 0.05     XML ships 0.05    -> configured values were
+	//   primaryColorSpace == L"sRGB"             XML ships sRGB      overwritten by the EDID
+	//                                                                on every load.
+	//   redX == 0.708                            XML ships 0.640   -> false for the shipped
+	//                                                                file, so the guard already
+	//                                                                reduced to the flag. Not a
+	//                                                                live bug: only a user who
+	//                                                                typed exactly 0.708 could
+	//                                                                have made it true.
+	//
+	// Comparing a float to a "default" cannot distinguish a default from a value someone typed,
+	// so the flag is the only honest test. Three of the four were lying; the fourth was noise.
 	if (hdr10StaticMetadataEnabled && profile.hdr10Supported) {
-		if (overrideManualSettings || maxDisplayMasteringLuminance == 1000.0) { // Default value
+		if (overrideManualSettings) {
 			maxDisplayMasteringLuminance = profile.maxLuminance;
-		}
-		if (overrideManualSettings || minDisplayMasteringLuminance == 0.05) { // Default value
 			minDisplayMasteringLuminance = profile.minLuminance;
 		}
 	}
 
 	// Apply color primaries if configured
-	if (colorPrimariesEnabled && (overrideManualSettings || redX == 0.708)) { // Default Rec.2020 values
+	if (colorPrimariesEnabled && overrideManualSettings) {
 		redX = profile.redX;
 		redY = profile.redY;
 		greenX = profile.greenX;
@@ -1385,7 +1735,7 @@ bool ApplyEdidProfile(const EdidProfileData& profile) {
 	}
 
 	// Apply color space settings
-	if (colorSpaceEnabled && (overrideManualSettings || primaryColorSpace == L"sRGB")) { // Default value
+	if (colorSpaceEnabled && overrideManualSettings) {
 		primaryColorSpace = profile.primaryColorSpace;
 		gammaCorrection = profile.gamma;
 	}
@@ -1417,7 +1767,7 @@ bool ApplyEdidProfile(const EdidProfileData& profile) {
 			
 			// Store as template metadata - will be applied to monitors during HDR metadata events
 			// We use a special key (nullptr converted to uintptr_t) to indicate template metadata
-			g_HdrMetadataStore[reinterpret_cast<IDDCX_MONITOR>(0)] = hdrMetadata;
+			StoreHdrMetadata(MetadataTemplateKey(), hdrMetadata);
 		} else {
 			vddlog("w", "Generated HDR metadata is not valid, skipping storage");
 		}
@@ -1446,7 +1796,7 @@ bool ApplyEdidProfile(const EdidProfileData& profile) {
 			
 			// Store as template gamma ramp - will be applied to monitors during gamma ramp events
 			// We use a special key (nullptr converted to uintptr_t) to indicate template gamma ramp
-			g_GammaRampStore[reinterpret_cast<IDDCX_MONITOR>(0)] = gammaRamp;
+			StoreGammaRamp(MetadataTemplateKey(), gammaRamp);
 		} else {
 			vddlog("w", "Generated gamma ramp is not valid, skipping storage");
 		}
@@ -1465,9 +1815,22 @@ int gcd(int a, int b) {
 }
 
 void float_to_vsync(float refresh_rate, int& num, int& den) {
+	// round(NaN) then static_cast<int>(NaN) is undefined behaviour, and a rate large enough to
+	// overflow the multiplication used to feed whatever is on the stack. A zero numerator later
+	// divides by zero when the mode is turned into timings.
+	if (!(refresh_rate > 0.0f)) {
+		// Catches 0, negative values and NaN.
+		vddlog("e", "Invalid refresh rate, falling back to 60");
+		refresh_rate = 60.0f;
+	}
+	else if (refresh_rate > 1000.0f) {
+		vddlog("e", "Refresh rate above 1000 Hz, clamping to 1000");
+		refresh_rate = 1000.0f;
+	}
+
 	den = 10000;
 
-	num = static_cast<int>(round(refresh_rate * den));
+	num = static_cast<int>(round(static_cast<double>(refresh_rate) * den));
 
 	int divisor = gcd(num, den);
 	num /= divisor;
@@ -1475,10 +1838,103 @@ void float_to_vsync(float refresh_rate, int& num, int& den) {
 }
 
 void  SendToPipe(const std::string& logMessage) {
-	if (g_pipeHandle != INVALID_HANDLE_VALUE) {
-		DWORD bytesWritten;
-		DWORD logMessageSize = static_cast<DWORD>(logMessage.size());
-		WriteFile(g_pipeHandle, logMessage.c_str(), logMessageSize, &bytesWritten, NULL);
+	// Write through a duplicate of the handle rather than g_pipeHandle itself. The pipe server
+	// can call ClearPipeHandle() and CloseHandle() on any thread at any moment; holding
+	// g_PipeMutex across WriteFile would fix that race but would also serialise every log line
+	// behind a pipe write that blocks for as long as the client is not reading. DuplicateHandle
+	// keeps the underlying file object alive on its own, so the write is safe without the lock.
+	HANDLE pipe = INVALID_HANDLE_VALUE;
+	{
+		lock_guard<mutex> lock(g_PipeMutex);
+		if (g_pipeHandle == INVALID_HANDLE_VALUE) {
+			return;
+		}
+		if (!DuplicateHandle(GetCurrentProcess(), g_pipeHandle, GetCurrentProcess(), &pipe, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
+			pipe = INVALID_HANDLE_VALUE;
+		}
+	}
+
+	if (pipe == INVALID_HANDLE_VALUE) {
+		return;
+	}
+
+	DWORD bytesWritten;
+	DWORD logMessageSize = static_cast<DWORD>(logMessage.size());
+	WriteFile(pipe, logMessage.c_str(), logMessageSize, &bytesWritten, NULL);
+	CloseHandle(pipe);
+}
+
+// vddlog used to CreateDirectoryW + fopen_s(append) + fclose on every single line, so a boot
+// that logs a few hundred lines did a few hundred directory checks and file opens. The handle
+// is cached and keyed by path instead: the file name carries the date, so crossing midnight
+// changes the path and the cached handle is swapped out then. fflush after every write keeps
+// external tailers (Virtual Driver Control, the community scripts) seeing lines as they land,
+// which is what the per-line fclose used to guarantee.
+mutex g_LogFileMutex;
+FILE* g_LogFile = nullptr;
+wstring g_LogFilePath;
+bool g_LogsDirEnsured = false;
+
+void CloseLogFile() {
+	lock_guard<mutex> lock(g_LogFileMutex);
+	if (g_LogFile != nullptr) {
+		fclose(g_LogFile);
+		g_LogFile = nullptr;
+	}
+	g_LogFilePath.clear();
+}
+
+void WriteLogLine(const wstring& logPath, const string& line) {
+	lock_guard<mutex> lock(g_LogFileMutex);
+
+	if (g_LogFile == nullptr || g_LogFilePath != logPath) {
+		if (g_LogFile != nullptr) {
+			fclose(g_LogFile);
+			g_LogFile = nullptr;
+		}
+		g_LogFilePath.clear();
+
+		// Ensured per open attempt, not latched. The flag used to be set after the first try whatever
+		// the outcome, so if the Logs directory was deleted while the driver ran, the reopen at
+		// the next date boundary failed and logging stayed dead for the rest of the session --
+		// the per-line CreateDirectoryW this replaced used to self-heal.
+		{
+			const wstring logsDir = confpath + L"\\Logs";
+			if (!CreateDirectoryW(logsDir.c_str(), NULL) && GetLastError() != ERROR_ALREADY_EXISTS) {
+				vddlog("d", "Log directory could not be created; the open below will fail");
+			}
+		}
+		g_LogsDirEnsured = true;
+
+		// Opened through CreateFileW rather than fopen_s so the handle is shareable for
+		// deletion. MSVC's fopen uses _SH_DENYNO, which permits read/write but not delete:
+		// holding one of those for the whole session would make "delete the old log" fail
+		// with a sharing violation while the driver is running, which it did not before.
+		// FILE_APPEND_DATA keeps every writer at end-of-file without an explicit seek.
+		HANDLE hLog = CreateFileW(logPath.c_str(), FILE_APPEND_DATA,
+			FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+			nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+		if (hLog != INVALID_HANDLE_VALUE) {
+			const int fd = _open_osfhandle((intptr_t)hLog, _O_APPEND | _O_TEXT);
+			if (fd < 0) {
+				CloseHandle(hLog);
+			}
+			else {
+				g_LogFile = _fdopen(fd, "a");
+				if (g_LogFile == nullptr) {
+					_close(fd);
+				}
+				else {
+					g_LogFilePath = logPath;
+				}
+			}
+		}
+
+	}
+
+	if (g_LogFile != nullptr) {
+		fputs(line.c_str(), g_LogFile);
+		fflush(g_LogFile);
 	}
 }
 
@@ -1491,66 +1947,56 @@ void vddlog(const char* type, const char* message) {
 		return;
 	}
 
-	FILE* logFile;
 	wstring logsDir = confpath + L"\\Logs";
 
 	auto now = chrono::system_clock::now();
 	auto in_time_t = chrono::system_clock::to_time_t(now);
 	tm tm_buf;
 	localtime_s(&tm_buf, &in_time_t);
-	wchar_t date_str[11]; 
+	wchar_t date_str[11];
 	wcsftime(date_str, sizeof(date_str) / sizeof(wchar_t), L"%Y-%m-%d", &tm_buf);
 
 	wstring logPath = logsDir + L"\\log_" + date_str + L".txt";
 
-	if (!CreateDirectoryW(logsDir.c_str(), NULL) && GetLastError() != ERROR_ALREADY_EXISTS) {
-		// Best effort only.
+	stringstream ss;
+	ss << put_time(&tm_buf, "%Y-%m-%d %X");
+
+	const char logTypeCode = (type != nullptr) ? type[0] : '\0';
+	string logType;
+	switch (logTypeCode) {
+	case 'e':
+		logType = "ERROR";
+		break;
+	case 'i':
+		logType = "INFO";
+		break;
+	case 'p':
+		logType = "PIPE";
+		break;
+	case 'd':
+		logType = "DEBUG";
+		break;
+	case 'w':
+		logType = "WARNING";
+		break;
+	case 't':
+		logType = "TESTING";
+		break;
+	case 'c':
+		logType = "COMPANION";
+		break;
+	default:
+		logType = "UNKNOWN";
+		break;
 	}
 
-	string narrow_logPath = WStringToString(logPath);
-	const char* mode = "a";
-	errno_t err = fopen_s(&logFile, narrow_logPath.c_str(), mode);
-	if (err == 0 && logFile != nullptr) {
-		stringstream ss;
-		ss << put_time(&tm_buf, "%Y-%m-%d %X");
+	const string logMessage = ss.str() + " [" + logType + "] " + message + "\n";
 
-		const char logTypeCode = (type != nullptr) ? type[0] : '\0';
-		string logType;
-		switch (logTypeCode) {
-		case 'e':
-			logType = "ERROR";
-			break; 
-		case 'i':
-			logType = "INFO";
-			break;
-		case 'p':
-			logType = "PIPE";
-			break;
-		case 'd':
-			logType = "DEBUG";
-			break;
-		case 'w':
-			logType = "WARNING";
-			break;
-		case 't':
-			logType = "TESTING";
-			break;
-		case 'c':
-			logType = "COMPANION";
-			break;
-		default:
-			logType = "UNKNOWN";
-			break;
-		}
+	WriteLogLine(logPath, logMessage);
 
-		fprintf(logFile, "[%s] [%s] %s\n", ss.str().c_str(), logType.c_str(), message);
-
-		fclose(logFile);
-
-		if (sendLogsThroughPipe && g_pipeHandle != INVALID_HANDLE_VALUE) {
-			string logMessage = ss.str() + " [" + logType + "] " + message + "\n";
-			SendToPipe(logMessage);
-		}
+	// No unlocked peek at g_pipeHandle here: SendToPipe() takes the pipe lock and checks it.
+	if (sendLogsThroughPipe) {
+		SendToPipe(logMessage);
 	}
 }
 
@@ -1708,6 +2154,11 @@ bool UpdateXmlToggleSetting(bool toggle, const wchar_t* variable) {
 		case XmlNodeType_EndElement:
 			pReader->GetLocalName(&pwszLocalName, nullptr);
 			pWriter->WriteEndElement();
+			// An empty target element never produces a Text node, so the flag set below would
+			// survive past it and the *next* element's text in the document would be replaced
+			// by this toggle. vdd_settings.xml is user-editable, so <logging/> is one edit away;
+			// clearing here too is what keeps the rewrite confined to the element asked for.
+			variableElementFound = false;
 			break;
 
 		case XmlNodeType_Text:
@@ -1724,6 +2175,25 @@ bool UpdateXmlToggleSetting(bool toggle, const wchar_t* variable) {
 		case XmlNodeType_Whitespace:
 			pReader->GetValue(&pwszValue, nullptr);
 			pWriter->WriteWhitespace(pwszValue);
+			break;
+
+		case XmlNodeType_Attribute:
+		{
+			// These three rewriters switched only on Element/EndElement/Text/Whitespace/
+			// Comment, so any attribute in vdd_settings.xml was dropped from the rewritten
+			// file the first time a runtime toggle ran. The file is user-editable, so that
+			// was silent data loss on someone else's settings. xmllite's IXmlWriter exposes
+			// WriteAttributeString as prefix/localName/namespace/value, four arguments.
+			const wchar_t* attrLocalName = nullptr;
+			pReader->GetLocalName(&attrLocalName, nullptr);
+			pReader->GetValue(&pwszValue, nullptr);
+			pWriter->WriteAttributeString(nullptr, attrLocalName, nullptr, pwszValue);
+		}
+			break;
+
+		case XmlNodeType_CDATA:
+			pReader->GetValue(&pwszValue, nullptr);
+			pWriter->WriteCData(pwszValue);
 			break;
 
 		case XmlNodeType_Comment:
@@ -1759,6 +2229,8 @@ bool UpdateXmlToggleSetting(bool toggle, const wchar_t* variable) {
 	if (!MoveFileExW(tempFileName.c_str(), settingsname.c_str(), MOVEFILE_REPLACE_EXISTING)) {
 		return false;
 	}
+	// The file just changed on disk, so the parsed copy the getters read from is stale.
+	InvalidateSettingsCache();
 	return true;
 }
 
@@ -1824,6 +2296,10 @@ bool UpdateXmlGpuSetting(const wchar_t* gpuName) {
 		case XmlNodeType_EndElement:
 			pReader->GetLocalName(&pwszLocalName, nullptr);
 			pWriter->WriteEndElement();
+			// Same trap as the toggle rewriter: an empty gpu/friendlyname element produces no
+			// Text node, so the flag would survive it and this writer would overwrite the next
+			// element's text in the file. Clear it on the way out as well.
+			gpuElementFound = false;
 			break;
 
 		case XmlNodeType_Text:
@@ -1840,6 +2316,25 @@ bool UpdateXmlGpuSetting(const wchar_t* gpuName) {
 		case XmlNodeType_Whitespace:
 			pReader->GetValue(&pwszValue, nullptr);
 			pWriter->WriteWhitespace(pwszValue);
+			break;
+
+		case XmlNodeType_Attribute:
+		{
+			// These three rewriters switched only on Element/EndElement/Text/Whitespace/
+			// Comment, so any attribute in vdd_settings.xml was dropped from the rewritten
+			// file the first time a runtime toggle ran. The file is user-editable, so that
+			// was silent data loss on someone else's settings. xmllite's IXmlWriter exposes
+			// WriteAttributeString as prefix/localName/namespace/value, four arguments.
+			const wchar_t* attrLocalName = nullptr;
+			pReader->GetLocalName(&attrLocalName, nullptr);
+			pReader->GetValue(&pwszValue, nullptr);
+			pWriter->WriteAttributeString(nullptr, attrLocalName, nullptr, pwszValue);
+		}
+			break;
+
+		case XmlNodeType_CDATA:
+			pReader->GetValue(&pwszValue, nullptr);
+			pWriter->WriteCData(pwszValue);
 			break;
 
 		case XmlNodeType_Comment:
@@ -1868,6 +2363,8 @@ bool UpdateXmlGpuSetting(const wchar_t* gpuName) {
 	if (!MoveFileExW(tempFileName.c_str(), settingsname.c_str(), MOVEFILE_REPLACE_EXISTING)) {
 		return false;
 	}
+	// The file just changed on disk, so the parsed copy the getters read from is stale.
+	InvalidateSettingsCache();
 	return true;
 }
 
@@ -1932,6 +2429,10 @@ bool UpdateXmlDisplayCountSetting(int displayCount) {
 		case XmlNodeType_EndElement:
 			pReader->GetLocalName(&pwszLocalName, nullptr);
 			pWriter->WriteEndElement();
+			// Same trap as the toggle rewriter: an empty monitors/count element produces no
+			// Text node, so the flag would survive it and this writer would overwrite the next
+			// element's text in the file. Clear it on the way out as well.
+			displayCountElementFound = false;
 			break;
 
 		case XmlNodeType_Text:
@@ -1948,6 +2449,25 @@ bool UpdateXmlDisplayCountSetting(int displayCount) {
 		case XmlNodeType_Whitespace:
 			pReader->GetValue(&pwszValue, nullptr);
 			pWriter->WriteWhitespace(pwszValue);
+			break;
+
+		case XmlNodeType_Attribute:
+		{
+			// These three rewriters switched only on Element/EndElement/Text/Whitespace/
+			// Comment, so any attribute in vdd_settings.xml was dropped from the rewritten
+			// file the first time a runtime toggle ran. The file is user-editable, so that
+			// was silent data loss on someone else's settings. xmllite's IXmlWriter exposes
+			// WriteAttributeString as prefix/localName/namespace/value, four arguments.
+			const wchar_t* attrLocalName = nullptr;
+			pReader->GetLocalName(&attrLocalName, nullptr);
+			pReader->GetValue(&pwszValue, nullptr);
+			pWriter->WriteAttributeString(nullptr, attrLocalName, nullptr, pwszValue);
+		}
+			break;
+
+		case XmlNodeType_CDATA:
+			pReader->GetValue(&pwszValue, nullptr);
+			pWriter->WriteCData(pwszValue);
 			break;
 
 		case XmlNodeType_Comment:
@@ -1977,6 +2497,8 @@ bool UpdateXmlDisplayCountSetting(int displayCount) {
 	if (!MoveFileExW(tempFileName.c_str(), settingsname.c_str(), MOVEFILE_REPLACE_EXISTING)) {
 		return false;
 	}
+	// The file just changed on disk, so the parsed copy the getters read from is stale.
+	InvalidateSettingsCache();
 	return true;
 }
 
@@ -2050,21 +2572,66 @@ void logAvailableGPUs() {
 
 
 
-void ReloadDriver(HANDLE hPipe) {
-	auto* pContext = WdfObjectGet_IndirectDeviceContextWrapper(hPipe);
-	if (pContext && pContext->pContext) {
-		pContext->pContext->InitAdapter();
-		vddlog("i", "Adapter reinitialized");
-	}
+// This used to take the named-pipe handle and hand it to WdfObjectGet_IndirectDeviceContextWrapper,
+// which expects a WDF object. It never was one, so the lookup yielded nothing and every caller
+// silently did nothing -- fifteen commands that log "Enabled" and then apply nothing.
+//
+// It is not wired to InitAdapter either, and should not be: InitAdapter calls IddCxAdapterInitAsync,
+// which is a one-shot per adapter. Calling it again from here would leave the live adapter in
+// place and bring up a second one, duplicating the monitors FinishInit creates.
+//
+// So this states what actually happened. The setting has been written to vdd_settings.xml; the
+// driver picks it up the next time it starts, which is what the callers' "Restarting Driver"
+// messages describe.
+void ReloadDriver() {
+	vddlog("i", "Setting written to vdd_settings.xml. It takes effect when the driver next starts.");
 }
 
 
 void HandleClient(HANDLE hPipe) {
-	g_pipeHandle = hPipe;
+	SetPipeHandle(hPipe);
 	vddlog("p", "Client Handling Enabled");
-	wchar_t buffer[128];
-	DWORD bytesRead;
-	BOOL result = ReadFile(hPipe, buffer, sizeof(buffer) - sizeof(wchar_t), &bytesRead, NULL);
+	// Zero-initialised: the command dispatch below does wcsncmp against literals up to 15 wchar
+	// long, and the buffer is only NUL-terminated at bytesRead/2. With the rest of the array
+	// left as stack garbage the analysis was right to call those reads of invalid data, and
+	// wcsncmp would have been reading uninitialised memory rather than stopping early.
+	wchar_t buffer[128] = {};
+	DWORD bytesRead = 0;
+
+	// A client that connects and then says nothing used to park this thread in ReadFile
+	// forever, because NULL OVERLAPPED makes it un-interruptible. The command read is now
+	// bounded; after PIPE_READ_POLL_MS with nothing, the client is treated as idle and
+	// dropped, so the server loop always gets back to its g_Running check.
+	BOOL result = FALSE;
+	OVERLAPPED ovRead = {};
+	ovRead.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+
+	if (ovRead.hEvent == nullptr) {
+		vddlog("e", "Pipe client handler could not create its read event; dropping the connection");
+		DisconnectNamedPipe(hPipe);
+		CloseHandle(ClearPipeHandle());
+		return;
+	}
+
+	result = ReadFile(hPipe, buffer, sizeof(buffer) - sizeof(wchar_t), &bytesRead, &ovRead) ? TRUE : FALSE;
+	if (!result && GetLastError() == ERROR_IO_PENDING) {
+		const DWORD waitResult = WaitForSingleObject(ovRead.hEvent, PIPE_READ_POLL_MS);
+		if (waitResult == WAIT_OBJECT_0) {
+			result = GetOverlappedResult(hPipe, &ovRead, &bytesRead, FALSE) ? TRUE : FALSE;
+		}
+		else {
+			vddlog("p", "Client sent no command within the poll window; dropping the connection");
+			// Wait for the cancellation to finish before letting the OVERLAPPED and its event
+			// go out of scope. CancelIoEx only requests it: the kernel still holds a pointer to
+			// this stack structure until the operation completes, and StopNamedPipeServer's
+			// DisconnectNamedPipe is exactly what completes a pending read.
+			CancelIoEx(hPipe, &ovRead);
+			DWORD cancelledBytes = 0;
+			GetOverlappedResult(hPipe, &ovRead, &cancelledBytes, TRUE);
+		}
+	}
+	CloseHandle(ovRead.hEvent);
+
 	if (result && bytesRead != 0) {
 		buffer[bytesRead / sizeof(wchar_t)] = L'\0';
 		wstring bufferwstr(buffer);
@@ -2074,7 +2641,7 @@ void HandleClient(HANDLE hPipe) {
 		vddlog("p", bufferstr.c_str());
 		if (wcsncmp(buffer, L"RELOAD_DRIVER", 13) == 0) {
 			vddlog("c", "Reloading the driver");
-			ReloadDriver(hPipe);
+			ReloadDriver();
 			
 		}
 		else if (wcsncmp(buffer, L"LOG_DEBUG", 9) == 0) {
@@ -2109,12 +2676,12 @@ void HandleClient(HANDLE hPipe) {
 			if (wcsncmp(param, L"true", 4) == 0) {
 				UpdateXmlToggleSetting(true, L"HDRPlus");
 				vddlog("c", "HDR+ Enabled"); 
-				ReloadDriver(hPipe);
+				ReloadDriver();
 			} 
 			else if (wcsncmp(param, L"false", 5) == 0) {
 				UpdateXmlToggleSetting(false, L"HDRPlus");
 				vddlog("c", "HDR+ Disabled");
-				ReloadDriver(hPipe);
+				ReloadDriver();
 			}
 		}
 		else if (wcsncmp(buffer, L"SDR10", 5) == 0) {
@@ -2122,12 +2689,12 @@ void HandleClient(HANDLE hPipe) {
 			if (wcsncmp(param, L"true", 4) == 0) {
 				UpdateXmlToggleSetting(true, L"SDR10bit");
 				vddlog("c", "SDR 10 Bit Enabled");
-				ReloadDriver(hPipe);
+				ReloadDriver();
 			}
 			else if (wcsncmp(param, L"false", 5) == 0) {
 				UpdateXmlToggleSetting(false, L"SDR10bit");
 				vddlog("c", "SDR 10 Bit Disabled");
-				ReloadDriver(hPipe);
+				ReloadDriver();
 			}
 		}
 		else if (wcsncmp(buffer, L"CUSTOMEDID", 10) == 0) {
@@ -2135,12 +2702,12 @@ void HandleClient(HANDLE hPipe) {
 			if (wcsncmp(param, L"true", 4) == 0) {
 				UpdateXmlToggleSetting(true, L"CustomEdid");
 				vddlog("c", "Custom Edid Enabled");
-				ReloadDriver(hPipe);
+				ReloadDriver();
 			}
 			else if (wcsncmp(param, L"false", 5) == 0) {
 				UpdateXmlToggleSetting(false, L"CustomEdid");
 				vddlog("c", "Custom Edid Disabled");
-				ReloadDriver(hPipe);
+				ReloadDriver();
 			}
 		}
 		else if (wcsncmp(buffer, L"PREVENTSPOOF", 12) == 0) {
@@ -2148,12 +2715,12 @@ void HandleClient(HANDLE hPipe) {
 			if (wcsncmp(param, L"true", 4) == 0) {
 				UpdateXmlToggleSetting(true, L"PreventSpoof");
 				vddlog("c", "Prevent Spoof Enabled");
-				ReloadDriver(hPipe);
+				ReloadDriver();
 			}
 			else if (wcsncmp(param, L"false", 5) == 0) {
 				UpdateXmlToggleSetting(false, L"PreventSpoof");
 				vddlog("c", "Prevent Spoof Disabled");
-				ReloadDriver(hPipe);
+				ReloadDriver();
 			}
 		}
 		else if (wcsncmp(buffer, L"CEAOVERRIDE", 11) == 0) {
@@ -2161,12 +2728,12 @@ void HandleClient(HANDLE hPipe) {
 			if (wcsncmp(param, L"true", 4) == 0) {
 				UpdateXmlToggleSetting(true, L"EdidCeaOverride");
 				vddlog("c", "Cea override Enabled");
-				ReloadDriver(hPipe);
+				ReloadDriver();
 			}
 			else if (wcsncmp(param, L"false", 5) == 0) {
 				UpdateXmlToggleSetting(false, L"EdidCeaOverride");
 				vddlog("c", "Cea override Disabled");
-				ReloadDriver(hPipe);
+				ReloadDriver();
 			}
 		}
 		else if (wcsncmp(buffer, L"HARDWARECURSOR", 14) == 0) {
@@ -2174,12 +2741,12 @@ void HandleClient(HANDLE hPipe) {
 			if (wcsncmp(param, L"true", 4) == 0) {
 				UpdateXmlToggleSetting(true, L"HardwareCursor");
 				vddlog("c", "Hardware Cursor Enabled");
-				ReloadDriver(hPipe);
+				ReloadDriver();
 			}
 			else if (wcsncmp(param, L"false", 5) == 0) {
 				UpdateXmlToggleSetting(false, L"HardwareCursor");
 				vddlog("c", "Hardware Cursor Disabled");
-				ReloadDriver(hPipe);
+				ReloadDriver();
 			}
 		}
 		else if (wcsncmp(buffer, L"D3DDEVICEGPU", 12) == 0) {
@@ -2203,38 +2770,65 @@ void HandleClient(HANDLE hPipe) {
 			vddlog("c", "Logged all GPUs");
 		}  
 		else if (wcsncmp(buffer, L"SETGPU", 6) == 0) {
-			std::wstring gpuName = buffer + 7;
-			gpuName = gpuName.substr(1, gpuName.size() - 2); 
-
-			int size_needed = WideCharToMultiByte(CP_UTF8, 0, gpuName.c_str(), static_cast<int>(gpuName.length()), nullptr, 0, nullptr, nullptr);
-			std::string gpuNameNarrow(size_needed, 0);
-			WideCharToMultiByte(CP_UTF8, 0, gpuName.c_str(), static_cast<int>(gpuName.length()), &gpuNameNarrow[0], size_needed, nullptr, nullptr);
-
-			vddlog("c", ("Setting GPU to: " + gpuNameNarrow).c_str());
-			if (UpdateXmlGpuSetting(gpuName.c_str())) {
-				vddlog("c", "Gpu Changed, Restarting Driver");
+			// The value arrives quoted. Reading buffer+7 blindly walked past the NUL when the
+			// message was just "SETGPU", and substr(1, size()-2) threw std::out_of_range on this
+			// pipe thread whenever fewer than two characters followed the command.
+			std::wstring gpuName;
+			size_t cmdLen = wcslen(buffer);
+			if (cmdLen >= 9 && buffer[6] == L'"' && buffer[cmdLen - 1] == L'"') {
+				gpuName.assign(buffer + 7, cmdLen - 8);
 			}
 			else {
-				vddlog("e", "Failed to update GPU setting in XML. Restarting anyway");
+				vddlog("e", "SETGPU expects a quoted name, for example: SETGPU \"NVIDIA GeForce\"");
 			}
-			ReloadDriver(hPipe);
+
+			if (!gpuName.empty()) {
+				int size_needed = WideCharToMultiByte(CP_UTF8, 0, gpuName.c_str(), static_cast<int>(gpuName.length()), nullptr, 0, nullptr, nullptr);
+				std::string gpuNameNarrow(size_needed, 0);
+				WideCharToMultiByte(CP_UTF8, 0, gpuName.c_str(), static_cast<int>(gpuName.length()), &gpuNameNarrow[0], size_needed, nullptr, nullptr);
+
+				vddlog("c", ("Setting GPU to: " + gpuNameNarrow).c_str());
+				if (UpdateXmlGpuSetting(gpuName.c_str())) {
+					vddlog("c", "Gpu Changed, Restarting Driver");
+				}
+				else {
+					vddlog("e", "Failed to update GPU setting in XML. Restarting anyway");
+				}
+				ReloadDriver();
+			}
 		}
 		else if (wcsncmp(buffer, L"SETDISPLAYCOUNT", 15) == 0) {
 			vddlog("i", "Setting Display Count");
 
-			int newDisplayCount = 1;
-			swscanf_s(buffer + 15, L"%d", &newDisplayCount);
+			// The value used to go straight into the XML. numVirtualDisplays is a UINT that
+			// becomes AdapterCaps.MaxMonitorsSupported and a CreateMonitor() loop, so 0 meant
+			// no monitor at all and a negative number meant about four billion. Bound it
+			// here, where there is still a log line left to explain the refusal.
+			int requestedCount = 0;
+			const int fieldsRead = swscanf_s(buffer + 15, L"%d", &requestedCount);
 
-			std::wstring displayLog = L"Setting display count  to " + std::to_wstring(newDisplayCount);
-			vddlog("c", WStringToString(displayLog).c_str());
-
-			if (UpdateXmlDisplayCountSetting(newDisplayCount)){
-				vddlog("c", "Display Count Changed, Restarting Driver");
+			if (fieldsRead != 1) {
+				vddlog("e", "SETDISPLAYCOUNT needs a number, for example: SETDISPLAYCOUNT 2");
+			}
+			else if (requestedCount < static_cast<int>(MIN_VIRTUAL_DISPLAYS) ||
+				requestedCount > static_cast<int>(MAX_VIRTUAL_DISPLAYS)) {
+				stringstream ss;
+				ss << "SETDISPLAYCOUNT of " << requestedCount << " is outside the supported range of "
+					<< MIN_VIRTUAL_DISPLAYS << " to " << MAX_VIRTUAL_DISPLAYS << "; nothing was changed";
+				vddlog("e", ss.str().c_str());
 			}
 			else {
-				vddlog("e", "Failed to update display count setting in XML. Restarting anyway");
+				std::wstring displayLog = L"Setting display count to " + std::to_wstring(requestedCount);
+				vddlog("c", WStringToString(displayLog).c_str());
+
+				if (UpdateXmlDisplayCountSetting(requestedCount)) {
+					vddlog("c", "Display Count Changed, Restarting Driver");
+				}
+				else {
+					vddlog("e", "Failed to update display count setting in XML. Restarting anyway");
+				}
+				ReloadDriver();
 			}
-			ReloadDriver(hPipe);
 		}
 		else if (wcsncmp(buffer, L"GETSETTINGS", 11) == 0) {
 			//query and return settings
@@ -2257,16 +2851,23 @@ void HandleClient(HANDLE hPipe) {
 		else {
 			vddlog("e", "Unknown command");
 
-			size_t size_needed;
-			wcstombs_s(&size_needed, nullptr, 0, buffer, 0);
-			std::string narrowString(size_needed, 0);
-			wcstombs_s(nullptr, &narrowString[0], size_needed, buffer, size_needed);
-			vddlog("e", narrowString.c_str());
+			// buffer is whatever the pipe client sent, so it can hold an invalid multibyte
+			// sequence or a lone surrogate. wcstombs_s fails on that, zeroes size_needed, and
+			// the old code carried on into &narrowString[0] on an empty string with a zero
+			// destination size, having checked neither return value -- which is what the _s
+			// family exists to prevent. WStringToString is what the rest of this file uses for
+			// this conversion, and it handles the empty case.
+			vddlog("e", WStringToString(std::wstring(buffer)).c_str());
 		}
 	}
 	DisconnectNamedPipe(hPipe);
-	CloseHandle(hPipe);
-	g_pipeHandle = INVALID_HANDLE_VALUE; // This value determines whether or not all data gets sent back through the pipe or just the handling pipe data
+	// Withdraw the published handle before closing it, so vddlog() from any other thread stops
+	// seeing it the instant the client goes away. SendToPipe() writes through its own duplicate,
+	// so a log already in flight finishes against a live file object instead of a closed handle.
+	HANDLE previousPipe = ClearPipeHandle();
+	if (previousPipe != INVALID_HANDLE_VALUE) {
+		CloseHandle(previousPipe);
+	}
 }
 
 
@@ -2276,8 +2877,32 @@ DWORD WINAPI NamedPipeServer(LPVOID lpParam) {
 	SECURITY_ATTRIBUTES sa;
 	sa.nLength = sizeof(SECURITY_ATTRIBUTES);
 	sa.bInheritHandle = FALSE;
-	const wchar_t* sddl = L"D:(A;;GA;;;WD)";
-	vddlog("d", "Starting pipe with parameters: D:(A;;GA;;;WD)");
+
+	// Write is keyed to Administrators and SYSTEM; Everyone keeps read only.
+	//
+	// This is one duplex pipe serving two directions: SendToPipe() streams logs to the
+	// client, and the dispatcher reads commands from it. The SDDL below becomes the DACL
+	// on the pipe, and a DACL is checked against the dwDesiredAccess of the CLIENT's
+	// CreateFile -- once that handle exists, ReadFile and WriteFile only honour what the
+	// handle was granted, so refusing the write at open time is what actually gates the
+	// command channel. The server handle is untouched by this: its access comes from
+	// PIPE_ACCESS_DUPLEX in dwOpenMode, not from this descriptor, so log streaming keeps
+	// working. An unprivileged client can therefore still open the pipe to read logs,
+	// while opening it for write fails with ERROR_ACCESS_DENIED and not one command byte
+	// reaches the dispatcher.
+	//
+	// Everyone also no longer gets GENERIC_ALL, which is what FILE_CREATE_PIPE_INSTANCE
+	// (0x0008), DELETE, WRITE_DAC and WRITE_OWNER ride on: with those, any unprivileged
+	// session could spawn extra instances of this named pipe -- the classic named-pipe
+	// squatting route to impersonation -- or rewrite the DACL and then claim full access.
+	//
+	// Every helper in this repo requires an Administrator session and the driver rewrites
+	// vdd_settings.xml as SYSTEM, so requiring elevation to mutate is the intent rather
+	// than a regression. If Virtual Driver Control turns out to connect without
+	// elevation and its controls go dead, the symptom is CreateFile failing on the
+	// client, and the fix is to put the W back on this one ACE. Nothing else depends on it.
+	const wchar_t* sddl = L"D:(A;;GR;;;WD)(A;;GA;;;BA)(A;;GA;;;SY)";
+	vddlog("d", ("Starting pipe with parameters: " + WStringToString(std::wstring(sddl))).c_str());
 	if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
 		sddl, SDDL_REVISION_1, &sa.lpSecurityDescriptor, NULL)) {
 		DWORD ErrorCode = GetLastError();
@@ -2286,10 +2911,19 @@ DWORD WINAPI NamedPipeServer(LPVOID lpParam) {
 		return 1;
 	}
 	HANDLE hPipe;
+	DWORD bytesConnected = 0;
 	while (g_Running) {
+		// FILE_FLAG_OVERLAPPED is required, not optional. I/O mode is a per-handle property fixed
+		// when the handle is created, so without this flag the server handle is synchronous and
+		// handing it an OVERLAPPED structure is not a supported combination: either it is
+		// rejected outright, and the server loop spins forever closing and recreating the pipe
+		// without ever accepting a connection, or the OVERLAPPED is ignored and the call blocks
+		// uninterruptibly, which is the defect this path exists to remove. Declaring the server
+		// side overlapped makes both the bounded connect and the bounded command read well
+		// defined whatever the client chooses.
 		hPipe = CreateNamedPipeW(
 			PIPE_NAME,
-			PIPE_ACCESS_DUPLEX,
+			PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
 			PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
 			PIPE_UNLIMITED_INSTANCES,
 			512, 512,
@@ -2304,7 +2938,41 @@ DWORD WINAPI NamedPipeServer(LPVOID lpParam) {
 			return 1;
 		}
 
-		BOOL connected = ConnectNamedPipe(hPipe, NULL) ? TRUE : (GetLastError() == ERROR_PIPE_CONNECTED);
+		// ConnectNamedPipe blocks until a client shows up. It used to pass NULL for OVERLAPPED,
+		// which made it un-interruptible: g_Running is only tested between connections, so a
+		// stop request could not be noticed until somebody connected. StopNamedPipeServer()
+		// then sat in WaitForSingleObject(INFINITE) on this thread. Overlapped plus a bounded
+		// wait means the loop re-checks g_Running at most PIPE_CONNECT_POLL_MS late.
+		OVERLAPPED ovConnect = {};
+		ovConnect.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+
+		if (ovConnect.hEvent == nullptr) {
+			vddlog("e", "Pipe server could not create its connect event; giving up");
+			CloseHandle(hPipe);
+			LocalFree(sa.lpSecurityDescriptor);
+			return 1;
+		}
+
+		BOOL connected = ConnectNamedPipe(hPipe, &ovConnect) ? TRUE : (GetLastError() == ERROR_PIPE_CONNECTED);
+		if (!connected && GetLastError() == ERROR_IO_PENDING) {
+			const DWORD waitResult = WaitForSingleObject(ovConnect.hEvent, PIPE_CONNECT_POLL_MS);
+			if (waitResult == WAIT_OBJECT_0 && GetOverlappedResult(hPipe, &ovConnect, &bytesConnected, FALSE)) {
+				connected = TRUE;
+			}
+			else if (waitResult == WAIT_TIMEOUT) {
+				vddlog("p", "No client connected within the poll window; re-checking the run flag");
+			}
+			// Wait for the cancellation to finish before letting the OVERLAPPED and its event
+			// go out of scope. CancelIoEx only requests it: the kernel still holds a pointer to
+			// this stack structure until the operation completes. Without this wait the next
+			// loop iteration could CreateNamedPipeW over the same handle while the cancelled
+			// connect is still unwinding.
+			CancelIoEx(hPipe, &ovConnect);
+			DWORD cancelledBytes = 0;
+			GetOverlappedResult(hPipe, &ovConnect, &cancelledBytes, TRUE);
+		}
+		CloseHandle(ovConnect.hEvent);
+
 		if (connected) {
 			vddlog("p", "Client Connected");
 			HandleClient(hPipe);
@@ -2319,7 +2987,15 @@ DWORD WINAPI NamedPipeServer(LPVOID lpParam) {
 
 void StartNamedPipeServer() {
 	vddlog("p", "Starting Pipe");
-	hPipeThread = CreateThread(NULL, 0, NamedPipeServer, NULL, 0, NULL);
+	// Re-arm the run flag and publish the thread handle under g_Mutex. StopNamedPipeServer()
+	// clears g_Running, so without this a stop/start pair would hand the new thread a flag
+	// that is already false and it would exit at the top of the loop. hPipeThread is also read
+	// by StopNamedPipeServer() on another thread.
+	{
+		lock_guard<mutex> lock(g_Mutex);
+		g_Running = true;
+		hPipeThread = CreateThread(NULL, 0, NamedPipeServer, NULL, 0, NULL);
+	}
 	if (hPipeThread == NULL) {
 		DWORD ErrorCode = GetLastError();
 		string errorMessage = to_string(ErrorCode);
@@ -2336,7 +3012,15 @@ void StopNamedPipeServer() {
 		lock_guard<mutex> lock(g_Mutex);
 		g_Running = false;
 	}
-	if (hPipeThread) {
+	// hPipeThread is written by StartNamedPipeServer() and read here, so take it under the same
+	// lock rather than trusting a plain global across two threads.
+	HANDLE thread = NULL;
+	{
+		lock_guard<mutex> lock(g_Mutex);
+		thread = hPipeThread;
+		hPipeThread = NULL;
+	}
+	if (thread) {
 		HANDLE hPipe = CreateFileW(
 			PIPE_NAME,
 			GENERIC_READ | GENERIC_WRITE,
@@ -2351,10 +3035,17 @@ void StopNamedPipeServer() {
 			CloseHandle(hPipe);
 		}
 
-		WaitForSingleObject(hPipeThread, INFINITE);
-		CloseHandle(hPipeThread);
-		hPipeThread = NULL;
-		vddlog("p", "Stopped Pipe");
+		// Bounded rather than INFINITE. The server thread polls its run flag every
+		// PIPE_CONNECT_POLL_MS, so it cannot legitimately need longer than that plus the
+		// in-flight read; waiting forever only turned a slow shutdown into a hung one.
+		const DWORD waitResult = WaitForSingleObject(thread, PIPE_SHUTDOWN_WAIT_MS);
+		if (waitResult == WAIT_TIMEOUT) {
+			vddlog("w", "Pipe server thread did not stop within the shutdown window; leaving it to finish");
+		}
+		else {
+			vddlog("p", "Stopped Pipe");
+		}
+		CloseHandle(thread);
 	}
 }
 
@@ -2372,7 +3063,16 @@ bool initpath() {
 		return false;
 	}
 
-	lResult = RegQueryValueExW(hKey, L"VDDPATH", NULL, NULL, (LPBYTE)szPath, &dwBufferSize);
+	// Ask for the value type and insist it is a string. GetStringSetting already documents this
+	// hazard and defends against it; with lpdwType NULL a REG_BINARY or REG_DWORD VDDPATH leaves
+	// szPath without a terminator, and the std::wstring built from it below scans the stack
+	// until it finds one -- confpath would then carry that scan into every path the driver
+	// builds for the rest of the session.
+	DWORD dwType = 0;
+	lResult = RegQueryValueExW(hKey, L"VDDPATH", NULL, &dwType, (LPBYTE)szPath, &dwBufferSize);
+	if (lResult == ERROR_SUCCESS && dwType != REG_SZ) {
+		lResult = ERROR_INVALID_DATA;
+	}
 	if (lResult != ERROR_SUCCESS) {
 		ostringstream oss;
 		oss << "Failed to open registry key for path. Error code: " << lResult;
@@ -2399,6 +3099,8 @@ EvtDriverUnload(
 	UNREFERENCED_PARAMETER(Driver);
 	StopNamedPipeServer();
 	vddlog("i", "Driver Unloaded");
+	// After this point nothing calls vddlog again, so the cached log handle can go.
+	CloseLogFile();
 }
 
 _Use_decl_annotations_
@@ -2423,7 +3125,7 @@ extern "C" NTSTATUS DriverEntry(
 	customEdid = EnabledQuery(L"CustomEdidEnabled");
 	preventManufacturerSpoof = EnabledQuery(L"PreventMonitorSpoof");
 	edidCeaOverride = EnabledQuery(L"EdidCeaOverride");
-	sendLogsThroughPipe = EnabledQuery(L"SendLogsThroughPipe");
+	sendLogsThroughPipe = EnabledOr(L"SendLogsThroughPipe", true);
 
 
 	//colour
@@ -2433,11 +3135,26 @@ extern "C" NTSTATUS DriverEntry(
 	SDRCOLOUR = SDR10 ? IDDCX_BITS_PER_COMPONENT_10 : IDDCX_BITS_PER_COMPONENT_8;
 	ColourFormat = GetStringSetting(L"ColourFormat");
 
+	// GetIntegerSetting answers -1 when the key is in neither the registry nor the settings
+	// XML, and DriverEntry reads them before loadSettings() decides which source exists.
+	// -1 is never a harmless sentinel in this file, so every positive integer read goes
+	// through this: it falls back to the compiled default and says so, because an absent key
+	// and a key someone typed as 0 should not look the same in the log.
+	auto positiveOr = [](int value, int fallback, const wchar_t* what) {
+		if (value <= 0) {
+			stringstream ss;
+			ss << WStringToString(what) << " is " << value << ", using the built-in default of " << fallback;
+			vddlog("w", ss.str().c_str());
+			return fallback;
+		}
+		return value;
+	};
+
 	//Cursor
-	hardwareCursor = EnabledQuery(L"HardwareCursorEnabled");
-	alphaCursorSupport = EnabledQuery(L"AlphaCursorSupport");
-	CursorMaxX = GetIntegerSetting(L"CursorMaxX");
-	CursorMaxY = GetIntegerSetting(L"CursorMaxY");
+	hardwareCursor = EnabledOr(L"HardwareCursorEnabled", true);
+	alphaCursorSupport = EnabledOr(L"AlphaCursorSupport", true);
+	CursorMaxX = positiveOr(GetIntegerSetting(L"CursorMaxX"), 128, L"CursorMaxX");
+	CursorMaxY = positiveOr(GetIntegerSetting(L"CursorMaxY"), 128, L"CursorMaxY");
 
 	int xorCursorSupportLevelInt = GetIntegerSetting(L"XorCursorSupportLevel");
 	std::string xorCursorSupportLevelName;
@@ -2455,7 +3172,7 @@ extern "C" NTSTATUS DriverEntry(
 	autoConfigureFromEdid = EnabledQuery(L"AutoConfigureFromEdid");
 	edidProfilePath = GetStringSetting(L"EdidProfilePath");
 	overrideManualSettings = EnabledQuery(L"OverrideManualSettings");
-	fallbackOnError = EnabledQuery(L"FallbackOnError");
+	fallbackOnError = EnabledOr(L"FallbackOnError", true);
 
 	// === LOAD HDR ADVANCED SETTINGS ===
 	hdr10StaticMetadataEnabled = EnabledQuery(L"Hdr10StaticMetadataEnabled");
@@ -2482,35 +3199,61 @@ extern "C" NTSTATUS DriverEntry(
 	// === LOAD AUTO RESOLUTIONS SETTINGS ===
 	autoResolutionsEnabled = EnabledQuery(L"AutoResolutionsEnabled");
 	sourcePriority = GetStringSetting(L"SourcePriority");
-	minRefreshRate = GetIntegerSetting(L"MinRefreshRate");
-	maxRefreshRate = GetIntegerSetting(L"MaxRefreshRate");
+	minRefreshRate = positiveOr(GetIntegerSetting(L"MinRefreshRate"), 24, L"min_refresh_rate");
+	maxRefreshRate = positiveOr(GetIntegerSetting(L"MaxRefreshRate"), 240, L"max_refresh_rate");
 	excludeFractionalRates = EnabledQuery(L"ExcludeFractionalRates");
-	minResolutionWidth = GetIntegerSetting(L"MinResolutionWidth");
-	minResolutionHeight = GetIntegerSetting(L"MinResolutionHeight");
-	maxResolutionWidth = GetIntegerSetting(L"MaxResolutionWidth");
-	maxResolutionHeight = GetIntegerSetting(L"MaxResolutionHeight");
+	minResolutionWidth = positiveOr(GetIntegerSetting(L"MinResolutionWidth"), 640, L"min_resolution_width");
+	minResolutionHeight = positiveOr(GetIntegerSetting(L"MinResolutionHeight"), 480, L"min_resolution_height");
+	maxResolutionWidth = positiveOr(GetIntegerSetting(L"MaxResolutionWidth"), 10240, L"max_resolution_width");
+	maxResolutionHeight = positiveOr(GetIntegerSetting(L"MaxResolutionHeight"), 4320, L"max_resolution_height");
 	useEdidPreferred = EnabledQuery(L"UseEdidPreferred");
-	fallbackWidth = GetIntegerSetting(L"FallbackWidth");
-	fallbackHeight = GetIntegerSetting(L"FallbackHeight");
-	fallbackRefresh = GetIntegerSetting(L"FallbackRefresh");
+	fallbackWidth = positiveOr(GetIntegerSetting(L"FallbackWidth"), 1920, L"fallback_width");
+	fallbackHeight = positiveOr(GetIntegerSetting(L"FallbackHeight"), 1080, L"fallback_height");
+	fallbackRefresh = positiveOr(GetIntegerSetting(L"FallbackRefresh"), 60, L"fallback_refresh");
 
 	// === LOAD COLOR ADVANCED SETTINGS ===
 	autoSelectFromColorSpace = EnabledQuery(L"AutoSelectFromColorSpace");
 	forceBitDepth = GetStringSetting(L"ForceBitDepth");
-	fp16SurfaceSupport = EnabledQuery(L"Fp16SurfaceSupport");
-	wideColorGamut = EnabledQuery(L"WideColorGamut");
-	hdrToneMapping = EnabledQuery(L"HdrToneMapping");
-	sdrWhiteLevel = GetDoubleSetting(L"SdrWhiteLevel");
+	// GetStringSetting answers L"" for a key that is in neither source, and L"" is not "auto",
+	// so the block below took the forced branch, matched no depth, and logged an error on every
+	// boot of the configuration that has no settings file -- while applying nothing.
+	if (forceBitDepth.empty()) {
+		forceBitDepth = L"8";
+	}
 
-	// === LOAD MONITOR EMULATION SETTINGS ===
-	monitorEmulationEnabled = EnabledQuery(L"MonitorEmulationEnabled");
-	emulatePhysicalDimensions = EnabledQuery(L"EmulatePhysicalDimensions");
-	physicalWidthMm = GetIntegerSetting(L"PhysicalWidthMm");
-	physicalHeightMm = GetIntegerSetting(L"PhysicalHeightMm");
-	manufacturerEmulationEnabled = EnabledQuery(L"ManufacturerEmulationEnabled");
-	manufacturerName = GetStringSetting(L"ManufacturerName");
-	modelName = GetStringSetting(L"ModelName");
-	serialNumber = GetStringSetting(L"SerialNumber");
+	// Both of these used to be parsed here and then thrown away: SelectBitDepthFromColorSpace() was
+// defined but had no caller at all, so raising force_bit_depth in vdd_settings.xml changed
+// nothing even though README.md tells users to do exactly that. The call is the "auto" branch
+// below. SDRCOLOUR and HDRCOLOUR are IDDCX_BITS_PER_COMPONENT bit flags that the mode paths OR
+// together, so a forced depth has to land on both of them to actually be advertised. "auto"
+// leaves the HDRPlus/SDR10 logic alone and is what a user switches to for 10- or 12-bit output.
+	if (forceBitDepth != L"auto") {
+		IDDCX_BITS_PER_COMPONENT forced = IDDCX_BITS_PER_COMPONENT_NONE;
+		if (forceBitDepth == L"8") {
+			forced = IDDCX_BITS_PER_COMPONENT_8;
+		}
+		else if (forceBitDepth == L"10") {
+			forced = IDDCX_BITS_PER_COMPONENT_10;
+		}
+		else if (forceBitDepth == L"12") {
+			forced = IDDCX_BITS_PER_COMPONENT_12;
+		}
+
+		if (forced != IDDCX_BITS_PER_COMPONENT_NONE) {
+			SDRCOLOUR = forced;
+			HDRCOLOUR = forced;
+			vddlog("i", ("Forced bit depth: " + WStringToString(forceBitDepth)).c_str());
+		}
+		else {
+			vddlog("e", ("force_bit_depth must be 8, 10, 12 or auto; got: " + WStringToString(forceBitDepth)).c_str());
+		}
+	}
+	else if (autoSelectFromColorSpace) {
+		IDDCX_BITS_PER_COMPONENT picked = SelectBitDepthFromColorSpace(primaryColorSpace);
+		SDRCOLOUR = picked;
+		HDRCOLOUR = picked;
+		vddlog("i", ("Bit depth picked from colour space " + WStringToString(primaryColorSpace)).c_str());
+	}
 
 	xorCursorSupportLevelName = XorCursorSupportLevelToString(XorCursorSupportLevel);
 
@@ -2597,10 +3340,20 @@ void loadSettings() {
 					return;
 				}
 				if (currentElement == L"count") {
-					monitorcount = stoi(wstring(pwszValue, cwchValue));
-					if (monitorcount == 0) {
+					monitorcount = ParseIntSafe(wstring(pwszValue, cwchValue), 1, L"monitor count");
+					// The guard used to be "== 0" only. numVirtualDisplays is a UINT and goes
+					// straight into AdapterCaps.MaxMonitorsSupported and then into
+					// for (i = 0; i < numVirtualDisplays; i++) CreateMonitor(i), so a negative
+					// count became roughly four billion and the loop asked for four billion
+					// monitors. SETDISPLAYCOUNT wrote any integer the client sent, so this was
+					// reachable from the pipe.
+					if (monitorcount < MIN_VIRTUAL_DISPLAYS || monitorcount > MAX_VIRTUAL_DISPLAYS) {
+						stringstream ss;
+						ss << "monitors/count of " << monitorcount << " is outside the supported range of "
+						   << MIN_VIRTUAL_DISPLAYS << " to " << MAX_VIRTUAL_DISPLAYS
+						   << "; loading a single monitor";
+						vddlog("w", ss.str().c_str());
 						monitorcount = 1;
-						vddlog("i", "Loading singular monitor (Monitor Count is not valid)");
 					}
 				}
 				else if (currentElement == L"friendlyname") {
@@ -2617,7 +3370,14 @@ void loadSettings() {
 					if (height.empty()) {
 						height = L"600";
 					}
-					resolutions.insert(make_tuple(stoi(width), stoi(height)));
+					int parsedWidth = ParseIntSafe(width, 0, L"resolution width");
+					int parsedHeight = ParseIntSafe(height, 0, L"resolution height");
+					if (parsedWidth > 0 && parsedHeight > 0) {
+						resolutions.insert(make_tuple(parsedWidth, parsedHeight));
+					}
+					else {
+						vddlog("e", "Skipping resolution with invalid width or height");
+					}
 				}
 				else if (currentElement == L"refresh_rate") {
 					refreshRate = wstring(pwszValue, cwchValue);
@@ -2625,15 +3385,28 @@ void loadSettings() {
 						refreshRate = L"30";
 					}
 					int vsync_num, vsync_den;
-					float_to_vsync(stof(refreshRate), vsync_num, vsync_den);
+					float_to_vsync(ParseFloatSafe(refreshRate, 30.0f, L"resolution refresh_rate"), vsync_num, vsync_den);
 
-					res.push_back(make_tuple(stoi(width), stoi(height), vsync_num, vsync_den));
-					stringstream ss;
-					ss << "Added: " << stoi(width) << "x" << stoi(height) << " @ " << vsync_num << "/" << vsync_den << "Hz";
-					vddlog("d", ss.str().c_str());
+					int parsedWidth = ParseIntSafe(width, 0, L"resolution width");
+					int parsedHeight = ParseIntSafe(height, 0, L"resolution height");
+					if (parsedWidth > 0 && parsedHeight > 0) {
+						res.push_back(make_tuple(parsedWidth, parsedHeight, vsync_num, vsync_den));
+						stringstream ss;
+						ss << "Added: " << parsedWidth << "x" << parsedHeight << " @ " << vsync_num << "/" << vsync_den << "Hz";
+						vddlog("d", ss.str().c_str());
+					}
+					else {
+						vddlog("e", "Skipping mode with invalid width or height");
+					}
 				}
 				else if (currentElement == L"g_refresh_rate") {
-					globalRefreshRates.push_back(stoi(wstring(pwszValue, cwchValue)));
+					int globalRate = ParseIntSafe(wstring(pwszValue, cwchValue), 0, L"global refresh rate");
+					if (globalRate > 0) {
+						globalRefreshRates.push_back(globalRate);
+					}
+					else {
+						vddlog("e", "Skipping invalid global refresh rate");
+					}
 				}
 				break;
 			}
@@ -2713,19 +3486,73 @@ void loadSettings() {
 	ifstream ifs(optionsname);
 	if (ifs.is_open()) {
     string line;
-    if (getline(ifs, line) && !line.empty()) {
-        numVirtualDisplays = stoi(line);
-        vector<tuple<int, int, int, int>> res; 
 
-        while (getline(ifs, line)) {
-            vector<string> strvec = split(line, ',');
-            if (strvec.size() == 3 && strvec[0].substr(0, 1) != "#") {
-                int vsync_num, vsync_den;
-                float_to_vsync(stof(strvec[2]), vsync_num, vsync_den); 
-                res.push_back({ stoi(strvec[0]), stoi(strvec[1]), vsync_num, vsync_den });
+    // The count is the first line that carries one, not literally the first line: '#' lines are
+    // skipped exactly as they are on a mode line, so the file can carry a header explaining what
+    // the count is, and without the skip the shipped file (a header of comment lines, then the
+	// count) would announce "opens with a comment" on every load and silently ignore anyone who
+	// edited the count.
+    // would announce "opens with a comment" on every load and silently ignore anyone who edited
+    // the count. The fallback is 1 on both paths -- numVirtualDisplays is zero-initialised, so
+    // leaving it alone would hand the adapter zero monitors, which is not the one the caller is
+    // about to get either way.
+    //
+    // Known trap, unchanged by this: a file with no count line at all whose first non-comment
+    // line is a mode. "640, 480, 60" is read as the count, ParseIntSafe takes it as trailing
+    // garbage, haveDisplayCount is still set, so the mode is lost with only a misattributed
+    // "Trailing garbage in option.txt display count" to explain it.
+    numVirtualDisplays = 1;
+    bool haveDisplayCount = false;
+    while (getline(ifs, line)) {
+        const string count = TrimAsciiSpace(line);
+        if (count.empty() || count[0] == '#') {
+            continue;
+        }
+        numVirtualDisplays = ParseIntSafe(count, 1, L"option.txt display count");
+        haveDisplayCount = true;
+        break;
+    }
+    if (!haveDisplayCount) {
+        vddlog("w", "option.txt has no display count before its mode lines, assuming 1 virtual display");
+    }
+
+    vector<tuple<int, int, int, int>> res; 
+
+    while (getline(ifs, line)) {
+        string trimmed = TrimAsciiSpace(line);
+        if (trimmed.empty() || trimmed[0] == '#') {
+            continue;
+        }
+        vector<string> strvec = split(trimmed, ',');
+        if (strvec.size() == 3) {
+            int vsync_num, vsync_den;
+            float_to_vsync(ParseFloatSafe(TrimAsciiSpace(strvec[2]), 60.0f, L"option.txt refresh rate"), vsync_num, vsync_den);
+            int modeWidth = ParseIntSafe(TrimAsciiSpace(strvec[0]), 0, L"option.txt width");
+            int modeHeight = ParseIntSafe(TrimAsciiSpace(strvec[1]), 0, L"option.txt height");
+            if (modeWidth > 0 && modeHeight > 0) {
+                // The same bounds the EDID profile filter applies. option.txt used to
+                // accept any positive size, so a hand-edited line produced a mode the
+                // rest of the driver considers out of range.
+                if (modeWidth < minResolutionWidth || modeWidth > maxResolutionWidth ||
+                    modeHeight < minResolutionHeight || modeHeight > maxResolutionHeight) {
+                    stringstream ss;
+                    ss << "option.txt mode " << modeWidth << "x" << modeHeight
+                       << " is outside the configured range, skipping";
+                    vddlog("w", ss.str().c_str());
+                    continue;
+                }
+                res.push_back({ modeWidth, modeHeight, vsync_num, vsync_den });
+            }
+            else {
+                vddlog("e", "Skipping malformed option.txt mode line");
             }
         }
+    }
 
+    if (res.empty()) {
+        vddlog("w", "option.txt yielded no usable modes. Enabling Fallback");
+    }
+    else {
         vddlog("i", "Using option.txt");
         monitorModes = res;
         RebuildKnownMonitorModesCache();
@@ -2736,11 +3563,9 @@ void loadSettings() {
             ss << "Resolution: " << width << "x" << height << " @ " << vsync_num << "/" << vsync_den << "Hz";
             vddlog("d", ss.str().c_str());
         }
-		return;
-    } else {
-        vddlog("w", "option.txt is empty or the first line is invalid. Enabling Fallback");
+        return;
     }
-}
+	}
 
 
 	numVirtualDisplays = 1;
@@ -2870,7 +3695,13 @@ NTSTATUS VirtualDisplayDriverDeviceAdd(WDFDRIVER Driver, PWDFDEVICE_INIT pDevice
 		IddConfig.EvtIddCxParseMonitorDescription2 = VirtualDisplayDriverEvtIddCxParseMonitorDescription2;
 		IddConfig.EvtIddCxMonitorQueryTargetModes2 = VirtualDisplayDriverEvtIddCxMonitorQueryTargetModes2;
 		IddConfig.EvtIddCxAdapterCommitModes2 = VirtualDisplayDriverEvtIddCxAdapterCommitModes2;
-		IddConfig.EvtIddCxMonitorSetGammaRamp = VirtualDisplayDriverEvtIddCxMonitorSetGammaRamp;
+		// EvtIddCxMonitorSetGammaRamp is deliberately NOT registered. Per IddCx.h, "if the
+		// driver implements this DDI then this implies the driver supports the gamma
+		// functionality", while InitAdapter() reports
+		// EndPointDiagnostics.GammaSupport = IDDCX_FEATURE_IMPLEMENTATION_NONE. Registering it
+		// while doing nothing contradicted that. VirtualDisplayDriverEvtIddCxMonitorSetGammaRamp
+		// is still here and still compiles: re-register it once the driver has a scan-out path
+		// that actually programs the ramp, and it is not dead code in the meantime.
 	}
 	else {
 		IddConfig.EvtIddCxParseMonitorDescription = VirtualDisplayDriverParseMonitorDescription;
@@ -3100,6 +3931,13 @@ SwapChainProcessor::SwapChainProcessor(IDDCX_SWAPCHAIN hSwapChain, shared_ptr<Di
 		logStream.str("");
 		logStream << "Failed to create terminate event. GetLastError: " << GetLastError();
 		vddlog("e", logStream.str().c_str());
+		// Do not start the thread. RunCore builds its wait list from m_hTerminateEvent, so
+		// without it the only remaining wake-up is the IddCx signalling a buffer event --
+		// which does not happen on a swap chain that is already unassigned. The destructor
+		// would then wait INFINITE on a thread it can never signal, hanging device teardown.
+		// It already tolerates a null m_hThread, so leaving it unset is the safe state.
+		vddlog("e", "Not starting the swap-chain processing thread without a terminate event.");
+		return;
 	}
 	else
 	{
@@ -3247,8 +4085,16 @@ void SwapChainProcessor::Run()
 	}
 	/*
 	AvRevertMmThreadCharacteristics(AvTaskHandle);
-	*/ //error handling when reversing multimedia thread characteristics 
-	if (AvRevertMmThreadCharacteristics(AvTaskHandle))
+	*/ //error handling when reversing multimedia thread characteristics
+	// Only revert when the handle is valid: AvSetMmThreadCharacteristicsW returns NULL on
+	// failure, and passing that to AvRevertMmThreadCharacteristics violates its contract.
+	if (!AvTaskHandle)
+	{
+		logStream.str("");
+		logStream << "Skipping revert: multimedia thread characteristics were never set.";
+		vddlog("d", logStream.str().c_str());
+	}
+	else if (AvRevertMmThreadCharacteristics(AvTaskHandle))
 	{
 		logStream.str(""); 
 		logStream << "Multimedia thread characteristics reverted successfully.";
@@ -3270,6 +4116,13 @@ void SwapChainProcessor::RunCore()
 	int retryCount = 0;
 	const int maxRetries = 5;
 
+	// Validate before dereferencing: this check used to sit below the As() call, so a null
+	// m_Device was already dereferenced by the time it ran.
+	if (!m_Device || !m_Device->Device) {
+		vddlog("e", "Direct3DDevice became invalid during SwapChain processing");
+		return;
+	}
+
 	// Get the DXGI device interface
 	ComPtr<IDXGIDevice> DxgiDevice;
 	HRESULT hr = m_Device->Device.As(&DxgiDevice);
@@ -3281,13 +4134,6 @@ void SwapChainProcessor::RunCore()
 	}
 	logStream << "DXGI device interface obtained successfully.";
 	//vddlog("d", logStream.str().c_str());
-
-
-	// Validate that our device is still valid before setting it
-	if (!m_Device || !m_Device->Device) {
-		vddlog("e", "Direct3DDevice became invalid during SwapChain processing");
-		return;
-	}
 
 	IDARG_IN_SWAPCHAINSETDEVICE SetDevice = {};
 	SetDevice.pDevice = DxgiDevice.Get();
@@ -3355,19 +4201,27 @@ void SwapChainProcessor::RunCore()
 
 			logStream << "Buffer acquisition pending. WaitResult: " << WaitResult;
 
-			if (WaitResult == WAIT_OBJECT_0)
+			// Decide by identity, not by index. waitHandles is built with the buffer
+			// event first and the terminate event second, so the terminate event sits
+			// at index waitHandleCount - 1. When the buffer event is absent from the list
+			// it is the only handle and lands at index 0 -- and the old order tested
+			// WAIT_OBJECT_0 for 'buffer available' first, so a signalled terminate event
+			// took the 'continue' and the thread re-entered ReleaseAndAcquireBuffer
+			// forever instead of exiting. The branch meant to catch this sat behind a
+			// WAIT_OBJECT_0 test the first branch had already consumed, and its comment
+			// documented the defect without fixing it.
+			const bool terminateSignaled =
+				(WaitResult == WAIT_OBJECT_0 + (waitHandleCount - 1)) &&
+				waitHandles[waitHandleCount - 1] == m_hTerminateEvent.Get();
+
+			if (terminateSignaled)
+			{
+				logStream << "Terminate event signaled. Exiting loop.";
+				break;
+			}
+			else if (WaitResult == WAIT_OBJECT_0)
 			{
 				continue;
-			}
-			else if (waitHandleCount > 1 && WaitResult == WAIT_OBJECT_0 + 1)
-			{
-				logStream << "Terminate event signaled. Exiting loop.";
-				break;
-			}
-			else if (waitHandleCount == 1 && waitHandles[0] == m_hTerminateEvent.Get() && WaitResult == WAIT_OBJECT_0)
-			{
-				logStream << "Terminate event signaled. Exiting loop.";
-				break;
 			}
 			else
 			{
@@ -3449,13 +4303,23 @@ const UINT64 MHZ = 1000000;
 const UINT64 KHZ = 1000;
 
 constexpr DISPLAYCONFIG_VIDEO_SIGNAL_INFO dispinfo(UINT32 h, UINT32 v, UINT32 rn, UINT32 rd) {
-	const UINT32 clock_rate = rn * (v + 4) * (v + 4) / rd + 1000;
+	// The 32-bit product here used to wrap before it reached the headline modes. option.txt
+	// shipped "7680, 4320, 500": 500 * 4324 * 4324 = 9,348,488,000 exceeds UINT32 and wrapped
+	// to 758,553,408, so an 8K mode was reported at a 758 MHz pixel clock. PixelRate is UINT32,
+	// so this computes wide and saturates, the same way Mode.pixelRate does.
+	// totalLines is UINT64 throughout: keeping "(v + 4)" in UINT32 inside the product trips
+	// C4754 under the Debug configurations, which analyse harder than Release.
+	const UINT64 totalLines = static_cast<UINT64>(v) + 4;
+	const UINT64 wideClock = static_cast<UINT64>(rn) * totalLines * totalLines / (rd ? rd : 1) + 1000;
+	const UINT64 wideVerticalTotal = totalLines * totalLines;
+	const UINT32 clock_rate = wideClock > UINT_MAX ? UINT_MAX : static_cast<UINT32>(wideClock);
+	const UINT32 verticalTotal = wideVerticalTotal > UINT_MAX ? UINT_MAX : static_cast<UINT32>(wideVerticalTotal);
 	return {
 	  clock_rate,                                      // pixel clock rate [Hz]
-	{ clock_rate, v + 4 },                         // fractional horizontal refresh rate [Hz]
-	{ clock_rate, (v + 4) * (v + 4) },          // fractional vertical refresh rate [Hz]
+	{ clock_rate, static_cast<UINT32>(totalLines) }, // fractional horizontal refresh rate [Hz]
+	{ clock_rate, verticalTotal },                  // fractional vertical refresh rate [Hz]
 	{ h, v },                                    // (horizontal, vertical) active pixel resolution
-	{ h + 4, v + 4 },                         // (horizontal, vertical) total pixel resolution
+	{ h + 4, static_cast<UINT32>(totalLines) }, // (horizontal, vertical) total pixel resolution
 	{ { 255, 0 }},                                   // video standard and vsync divider
 	DISPLAYCONFIG_SCANLINE_ORDERING_PROGRESSIVE
 	};
@@ -3532,6 +4396,15 @@ vector<BYTE> loadEdid(const string& filePath) {
 	streamsize size = file.tellg();
 	file.seekg(0, ios::beg);
 
+	// The EDID base block is 128 bytes. calculateChecksum() below unconditionally reads
+	// edid[0..126] and the caller writes edid[127], so a shorter file would read and
+	// write past the end of the heap buffer.
+	if (size < 128) {
+		vddlog("e", "Custom edid is shorter than the 128-byte base block, ignoring it");
+		vddlog("i", "Using hardcoded edid");
+		return hardcodedEdid;
+	}
+
 	vector<BYTE> buffer(size);
 	if (file.read((char*)buffer.data(), size)) {
 		//calculate checksum and compare it to 127 byte, if false then return hardcoded if true then return buffer to prevent loading borked edid.
@@ -3571,7 +4444,12 @@ int maincalc() {
 	BYTE checksum = calculateChecksum(edid);
 	edid[127] = checksum;
 	// Setting this variable is depricated, hardcoded edid is either returned or custom in loading edid function
-	IndirectDeviceContext::s_KnownMonitorEdid = edid;
+	// maincalc() runs both from D0Entry and from the pipe reload path, while CreateMonitor reads
+	// s_KnownMonitorEdid on another thread - publish the swap under the lock.
+	{
+		std::lock_guard<std::mutex> lock(IndirectDeviceContext::s_KnownMonitorEdidMutex);
+		IndirectDeviceContext::s_KnownMonitorEdid = edid;
+	}
 	return 0;
 }
 
@@ -3674,8 +4552,16 @@ IndirectDeviceContext::~IndirectDeviceContext()
 	{
 		std::lock_guard<std::mutex> lock(m_ProcessingThreadsMutex);
 		processingThreads.swap(m_ProcessingThreads);
+		for (auto& entry : m_CursorEvents)
+		{
+			if (entry.second)
+			{
+				CloseHandle(entry.second);
+			}
+		}
+		m_CursorEvents.clear();
 	}
-
+	ForgetAllMonitorMetadata();
 	logStream.str("");
 	logStream << "Released " << processingThreads.size() << " monitor processing thread(s).";
 	vddlog("d", logStream.str().c_str());
@@ -3804,19 +4690,26 @@ void IndirectDeviceContext::CreateMonitor(unsigned int index) {
 	MonitorInfo.MonitorDescription.Size = sizeof(MonitorInfo.MonitorDescription);
 	MonitorInfo.MonitorDescription.Type = IDDCX_MONITOR_DESCRIPTION_TYPE_EDID;
 	//MonitorInfo.MonitorDescription.DataSize = sizeof(s_KnownMonitorEdid);        can no longer use size of as converted to vector
-	if (s_KnownMonitorEdid.size() > UINT_MAX)
+	// s_KnownMonitorEdid is reassigned by maincalc() on another thread, so read it under the
+	// lock and work on a local copy: pData has to stay valid until IddCxMonitorCreate() runs.
+	std::vector<BYTE> edidCopy;
 	{
-		vddlog("e", "Edid size passes UINT_Max, escape to prevent loading borked display");
-	}
-	else
-	{
-		MonitorInfo.MonitorDescription.DataSize = static_cast<UINT>(s_KnownMonitorEdid.size());
+		std::lock_guard<std::mutex> lock(IndirectDeviceContext::s_KnownMonitorEdidMutex);
+		if (s_KnownMonitorEdid.size() > UINT_MAX)
+		{
+			vddlog("e", "Edid size passes UINT_Max, escape to prevent loading borked display");
+		}
+		else
+		{
+			MonitorInfo.MonitorDescription.DataSize = static_cast<UINT>(s_KnownMonitorEdid.size());
+			edidCopy = s_KnownMonitorEdid;
+		}
 	}
 	//MonitorInfo.MonitorDescription.pData = const_cast<BYTE*>(s_KnownMonitorEdid);
 	// Changed from using const_cast to data() to safely access the EDID data.
-	// This improves type safety and code readability, as it eliminates the need for casting 
+	// This improves type safety and code readability, as it eliminates the need for casting
 	// and ensures we are directly working with the underlying container of known monitor EDID data.
-	MonitorInfo.MonitorDescription.pData = IndirectDeviceContext::s_KnownMonitorEdid.data();
+	MonitorInfo.MonitorDescription.pData = edidCopy.empty() ? nullptr : edidCopy.data();
 
 
 
@@ -3832,7 +4725,13 @@ void IndirectDeviceContext::CreateMonitor(unsigned int index) {
 	// ==============================
 
 	// Create a container ID
-	CoCreateGuid(&MonitorInfo.MonitorContainerId);
+	HRESULT hrContainerId = CoCreateGuid(&MonitorInfo.MonitorContainerId);
+	if (FAILED(hrContainerId)) {
+		// MonitorInfo is zero-initialised, so MonitorContainerId would stay GUID_NULL and be
+		// handed to IddCxMonitorCreate as if it were valid. Bail out instead.
+		vddlog("e", "Failed to create container ID for monitor, skipping monitor creation");
+		return;
+	}
 	vddlog("d", "Created container ID");
 
 	IDARG_IN_MONITORCREATE MonitorCreate = {};
@@ -3875,8 +4774,9 @@ void IndirectDeviceContext::CreateMonitor(unsigned int index) {
 
 void IndirectDeviceContext::AssignSwapChain(IDDCX_MONITOR Monitor, IDDCX_SWAPCHAIN SwapChain, LUID RenderAdapter, HANDLE NewFrameEvent)
 {
-	// Only cleanup expired devices periodically, not on every assignment
-	static int assignmentCount = 0;
+	// AssignSwapChain can run on more than one thread, so the counter has to be atomic:
+	// "++static_int" is a read-modify-write that loses updates.
+	static std::atomic<int> assignmentCount{ 0 };
 	if (++assignmentCount % 10 == 0) {
 		CleanupExpiredDevices();
 	}
@@ -3943,10 +4843,27 @@ void IndirectDeviceContext::AssignSwapChain(IDDCX_MONITOR Monitor, IDDCX_SWAPCHA
 
 			if (FAILED(Status))
 			{
+				// Without this the hardware cursor silently stops working and nothing in the
+				// log says why.
+				vddlog("e", ("Failed to set up hardware cursor. NTSTATUS: " + to_string(static_cast<long>(Status))).c_str());
 				CloseHandle(mouseEvent); 
 				return;
 			}
 
+			// The driver owns this handle from here on. The OS reassigns the swap chain on
+			// every resolution and refresh-rate change, so this used to leak one handle each
+			// time: the name is a constant, so each CreateEventA returned a new handle to the
+			// same kernel object and nothing ever closed the previous one.
+			{
+				std::lock_guard<std::mutex> lock(m_ProcessingThreadsMutex);
+				auto previous = m_CursorEvents.find(Monitor);
+				if (previous != m_CursorEvents.end())
+				{
+					CloseHandle(previous->second);
+					m_CursorEvents.erase(previous);
+				}
+				m_CursorEvents[Monitor] = mouseEvent;
+			}
 			vddlog("d", "Hardware cursor setup completed successfully.");
 		}
 		else {
@@ -3980,6 +4897,16 @@ void IndirectDeviceContext::UnassignSwapChain(IDDCX_MONITOR Monitor)
 	{
 		vddlog("w", "UnassignSwapChain called for a monitor without an active processing thread.");
 	}
+	{
+		std::lock_guard<std::mutex> lock(m_ProcessingThreadsMutex);
+		auto it = m_CursorEvents.find(Monitor);
+		if (it != m_CursorEvents.end())
+		{
+			CloseHandle(it->second);
+			m_CursorEvents.erase(it);
+		}
+	}
+	ForgetMonitorMetadata(Monitor);
 }
 
 #pragma endregion
@@ -4039,35 +4966,52 @@ NTSTATUS VirtualDisplayDriverParseMonitorDescription(const IDARG_IN_PARSEMONITOR
 	vddlog("d", logStream.str().c_str());
 
 	RebuildKnownMonitorModesCache();
-	pOutArgs->MonitorModeBufferOutputCount = (UINT)monitorModes.size();
+
+	// This used to write monitorModes.size() into pInArgs->MonitorModeBufferInputCount --
+	// an input field, through a const pointer -- and then read that same field back to
+	// decide whether the buffer was big enough. It therefore always compared size() with
+	// itself, always took the copy branch, and wrote every mode into a buffer the IddCx
+	// sized for whatever it had actually supplied. On the size-query call, where the
+	// buffer is empty, that is a heap overflow.
+	//
+	// pOutArgs is the output: it carries the count the caller should allocate. The input
+	// count is left exactly as it arrived and is what bounds the copy.
+	const UINT available = pInArgs->MonitorModeBufferInputCount;
+	const UINT required = (UINT)monitorModes.size();
+	pOutArgs->MonitorModeBufferOutputCount = required;
 
 	logStream.str("");
-	logStream << "Number of monitor modes generated: " << monitorModes.size();
+	logStream << "Number of monitor modes generated: " << required;
 	vddlog("d", logStream.str().c_str());
 
-	if (pInArgs->MonitorModeBufferInputCount < monitorModes.size())
+	if (available < required)
 	{
 		logStream.str(""); 
-		logStream << "Buffer too small. Input count: " << pInArgs->MonitorModeBufferInputCount << ", Required: " << monitorModes.size();
+		logStream << "Buffer too small. Input count: " << available << ", Required: " << required;
 		vddlog("w", logStream.str().c_str());
 		// Return success if there was no buffer, since the caller was only asking for a count of modes
-		return (pInArgs->MonitorModeBufferInputCount > 0) ? STATUS_BUFFER_TOO_SMALL : STATUS_SUCCESS;
+		return (available > 0) ? STATUS_BUFFER_TOO_SMALL : STATUS_SUCCESS;
 	}
-	else
-	{
-		// Copy the known modes to the output buffer
-		for (DWORD ModeIndex = 0; ModeIndex < monitorModes.size(); ModeIndex++)
-		{
-			pInArgs->pMonitorModes[ModeIndex].Size = sizeof(IDDCX_MONITOR_MODE);
-			pInArgs->pMonitorModes[ModeIndex].Origin = IDDCX_MONITOR_MODE_ORIGIN_MONITORDESCRIPTOR;
-			pInArgs->pMonitorModes[ModeIndex].MonitorVideoSignalInfo = s_KnownMonitorModes2[ModeIndex];
-		}
 
-		// Set the preferred mode as represented in the EDID
-		pOutArgs->PreferredMonitorModeIdx = 0;
-		vddlog("d", "Monitor description parsed successfully.");
-		return STATUS_SUCCESS;
+	// Copy the known modes to the output buffer. Both sides of the copy are bounded
+	// independently: the destination by what the IddCx supplied, the source by how many
+	// entries RebuildKnownMonitorModesCache actually built. Bounding by `available` alone
+	// only protected the destination -- `available >= required` is all the guard above
+	// establishes, so a caller that passes a buffer larger than the count it was handed
+	// reads past the end of s_KnownMonitorModes2.
+	const vector<DISPLAYCONFIG_VIDEO_SIGNAL_INFO> knownModes = SnapshotKnownMonitorModes();
+	const UINT copies = min(available, (UINT)knownModes.size());
+	for (DWORD ModeIndex = 0; ModeIndex < copies; ModeIndex++)
+	{
+		pInArgs->pMonitorModes[ModeIndex].Size = sizeof(IDDCX_MONITOR_MODE);
+		pInArgs->pMonitorModes[ModeIndex].Origin = IDDCX_MONITOR_MODE_ORIGIN_MONITORDESCRIPTOR;
+		pInArgs->pMonitorModes[ModeIndex].MonitorVideoSignalInfo = knownModes[ModeIndex];
 	}
+
+	// Set the preferred mode as represented in the EDID
+	pOutArgs->PreferredMonitorModeIdx = 0;
+	vddlog("d", "Monitor description parsed successfully.");
+	return STATUS_SUCCESS;
 }
 
 _Use_decl_annotations_
@@ -4107,10 +5051,25 @@ void CreateTargetMode(DISPLAYCONFIG_VIDEO_SIGNAL_INFO& Mode, UINT Width, UINT He
 	Mode.AdditionalSignalInfo.videoStandard = 255;
 	Mode.vSyncFreq.Numerator = VSyncNum;
 	Mode.vSyncFreq.Denominator = VSyncDen;
-	Mode.hSyncFreq.Numerator = VSyncNum * Height;
+	// pixelRate and hSyncFreq.Numerator are UINT32, but the 32-bit product below wraps long
+	// before the headline modes: 8K@240 is 240 * 7680 * 4320 = 7,962,624,000, which exceeds
+	// UINT32_MAX. Wrapping silently reported 3,667,656,704 for 8K@240. Compute in 64 bits and
+	// saturate loudly rather than handing the compositor a nonsense rate.
+	UINT64 hSyncNumerator = static_cast<UINT64>(VSyncNum) * Height;
+	UINT64 pixelRate = static_cast<UINT64>(VSyncNum) * Width * Height / (VSyncDen ? VSyncDen : 1);
+
+	if (hSyncNumerator > UINT_MAX || pixelRate > UINT_MAX) {
+		logStream.str("");
+		logStream << "WARNING: timing for " << Width << "x" << Height << " @ " << VSyncNum << "/"
+			<< VSyncDen << " exceeds UINT32 (hSync " << hSyncNumerator << ", pixelRate "
+			<< pixelRate << "); saturating.";
+		vddlog("w", logStream.str().c_str());
+	}
+
+	Mode.hSyncFreq.Numerator = hSyncNumerator > UINT_MAX ? UINT_MAX : static_cast<UINT>(hSyncNumerator);
 	Mode.hSyncFreq.Denominator = VSyncDen;
 	Mode.scanLineOrdering = DISPLAYCONFIG_SCANLINE_ORDERING_PROGRESSIVE;
-	Mode.pixelRate = VSyncNum * Width * Height / VSyncDen;
+	Mode.pixelRate = pixelRate > UINT_MAX ? UINT_MAX : static_cast<UINT>(pixelRate);
 
 	logStream.str("");
 	logStream << "Target mode configured with:"
@@ -4182,13 +5141,20 @@ NTSTATUS VirtualDisplayDriverMonitorQueryModes(IDDCX_MONITOR MonitorObject, cons
 	// monitor's descriptor and instead are based on the static processing capability of the device. The OS will
 	// report the available set of modes for a given output as the intersection of monitor modes with target modes.
 
+	// One vddlog per mode inside the loop meant ~199 calls per IddCx query callback,
+	// because option.txt ships 199 modes. Accumulate into the stream and emit once,
+	// the way QueryModes2 already does. str() copies without clearing, so reset it
+	// stream first -- the line above this comment already wrote the mode count into it.
+	logStream.str("");
 	for (int i = 0; i < monitorModes.size(); i++) {
 		CreateTargetMode(TargetModes[i], std::get<0>(monitorModes[i]), std::get<1>(monitorModes[i]), std::get<2>(monitorModes[i]), std::get<3>(monitorModes[i]));
 
-		logStream.str("");
 		logStream << "Created target mode " << i << ": Width = " << std::get<0>(monitorModes[i])
 			<< ", Height = " << std::get<1>(monitorModes[i])
-			<< ", VSync = " << std::get<2>(monitorModes[i]);
+			<< ", VSync = " << std::get<2>(monitorModes[i]) << "\n";
+	}
+
+	if (!monitorModes.empty()) {
 		vddlog("d", logStream.str().c_str());
 	}
 
@@ -4310,23 +5276,20 @@ NTSTATUS VirtualDisplayDriverEvtIddCxMonitorSetDefaultHdrMetadata(
 
 	// Priority 1: Use EDID-derived metadata if available
 	if (edidIntegrationEnabled && autoConfigureFromEdid) {
+		VddHdrMetadata cached;
 		// First check for monitor-specific metadata
-		auto storeIt = g_HdrMetadataStore.find(MonitorObject);
-		if (storeIt != g_HdrMetadataStore.end() && storeIt->second.isValid) {
-			metadata = storeIt->second;
+		if (TryGetHdrMetadata(MonitorObject, cached) && cached.isValid) {
+			metadata = cached;
 			hasValidMetadata = true;
 			vddlog("i", "Using monitor-specific EDID-derived HDR metadata");
 		}
 		// If no monitor-specific metadata, check for template metadata from EDID profile
-		else {
-			auto templateIt = g_HdrMetadataStore.find(reinterpret_cast<IDDCX_MONITOR>(0));
-			if (templateIt != g_HdrMetadataStore.end() && templateIt->second.isValid) {
-				metadata = templateIt->second;
-				hasValidMetadata = true;
-				// Store it for this specific monitor for future use
-				g_HdrMetadataStore[MonitorObject] = metadata;
-				vddlog("i", "Using template EDID-derived HDR metadata and storing for monitor");
-			}
+		else if (TryGetHdrMetadata(MetadataTemplateKey(), cached) && cached.isValid) {
+			metadata = cached;
+			hasValidMetadata = true;
+			// Store it for this specific monitor for future use
+			StoreHdrMetadata(MonitorObject, metadata);
+			vddlog("i", "Using template EDID-derived HDR metadata and storing for monitor");
 		}
 	}
 
@@ -4345,9 +5308,9 @@ NTSTATUS VirtualDisplayDriverEvtIddCxMonitorSetDefaultHdrMetadata(
 		return STATUS_SUCCESS;
 	}
 
-	// Log the HDR metadata values being applied
+	// Log the HDR metadata values that were computed
 	logStream.str("");
-	logStream << "=== APPLYING SMPTE ST.2086 HDR METADATA ===\n"
+	logStream << "=== COMPUTED SMPTE ST.2086 HDR METADATA (saved for this monitor) ===\n"
 			  << "Red Primary: (" << metadata.display_primaries_x[0] << ", " << metadata.display_primaries_y[0] << ")\n"
 			  << "Green Primary: (" << metadata.display_primaries_x[1] << ", " << metadata.display_primaries_y[1] << ")\n" 
 			  << "Blue Primary: (" << metadata.display_primaries_x[2] << ", " << metadata.display_primaries_y[2] << ")\n"
@@ -4358,20 +5321,31 @@ NTSTATUS VirtualDisplayDriverEvtIddCxMonitorSetDefaultHdrMetadata(
 			  << "Max Frame Average Light Level: " << metadata.max_frame_avg_light_level << " nits";
 	vddlog("i", logStream.str().c_str());
 
-	// Store the metadata for this monitor
-	g_HdrMetadataStore[MonitorObject] = metadata;
+	// Save the computed metadata. That is the whole contract of this callback, and the comment
+	// that used to sit here was wrong in a way that mattered: it said the driver "never calls
+	// IddCxMonitorSetHdrMetadata". There is no such function. The IddCx monitor surface is
+	// Arrival/Create/Departure/GetSrmListVersion/QueryHardwareCursor{,2,3}/SetSrmList/
+	// SetupHardwareCursor/UpdateModes{,2}, and nothing else.
+	//
+	// IddCx.h is explicit about the direction of the data: EVT_IDD_CX_MONITOR_SET_DEFAULT_HDR_METADATA
+	// is "called by the OS to provide the default HDR10 meta data that should be sent to monitor",
+	// and IDARG_IN_MONITOR_SET_DEFAULT_HDR_METADATA::pHdr10 is "meta data a driver is to save and
+	// use if requested later". It comes back in IDDCX_METADATA2::Hdr10FrameMetaData from
+	// IddCxSwapChainReleaseAndAcquireBuffer2, where IDDCX_HDR10_FRAME_METADATA_TYPE_DEFAULT means
+	// "the data last sent to the driver in a call to EVT_IDD_CX_MONITOR_SET_DEFAULT_HDR_METADATA".
+	// Saving it here is the implementation, not a stub.
+	//
+	// The one place it could still be consumed is the swap-chain loop, which calls
+	// IddCxSwapChainReleaseAndAcquireBuffer2 at RunCore and reads only Buffer.MetaData.pSurface.
+	// There is nothing to do with the metadata there: an indirect display driver renders into a
+	// swap chain and never scans out over a cable, so it has no wire to put the metadata on. That
+	// becomes real work the moment a scan-out path exists.
+	StoreHdrMetadata(MonitorObject, metadata);
 
-	// Convert our metadata to the IddCx expected format
-	// Note: The actual HDR metadata structure would depend on the IddCx version
-	// For now, we log that the metadata has been processed and stored
-	
 	logStream.str("");
-	logStream << "HDR metadata successfully configured and stored for monitor " << MonitorObject;
+	logStream << "HDR metadata saved for monitor " << MonitorObject
+		<< "; it returns in IDDCX_METADATA2::Hdr10FrameMetaData when a frame asks for the default";
 	vddlog("i", logStream.str().c_str());
-
-	// In a full implementation, you would pass the metadata to the IddCx framework here
-	// The exact API calls would depend on IddCx version and HDR implementation details
-	// For Phase 2, we focus on the metadata preparation and storage
 
 	return STATUS_SUCCESS;
 }
@@ -4404,6 +5378,7 @@ NTSTATUS VirtualDisplayDriverEvtIddCxParseMonitorDescription2(
 	vddlog("d", logStream.str().c_str());
 
 	RebuildKnownMonitorModesCache();
+	const vector<DISPLAYCONFIG_VIDEO_SIGNAL_INFO> knownModes = SnapshotKnownMonitorModes();
 	pOutArgs->MonitorModeBufferOutputCount = (UINT)monitorModes.size();
 
 	if (pInArgs->MonitorModeBufferInputCount < monitorModes.size())
@@ -4421,11 +5396,11 @@ NTSTATUS VirtualDisplayDriverEvtIddCxParseMonitorDescription2(
 		
 		logStream.str(""); // Clear the stream
 		logStream << "Writing monitor modes to output buffer:";
-		for (DWORD ModeIndex = 0; ModeIndex < monitorModes.size(); ModeIndex++)
+		for (DWORD ModeIndex = 0; ModeIndex < knownModes.size(); ModeIndex++)
 		{
 			pInArgs->pMonitorModes[ModeIndex].Size = sizeof(IDDCX_MONITOR_MODE2);
 			pInArgs->pMonitorModes[ModeIndex].Origin = IDDCX_MONITOR_MODE_ORIGIN_MONITORDESCRIPTOR;
-			pInArgs->pMonitorModes[ModeIndex].MonitorVideoSignalInfo = s_KnownMonitorModes2[ModeIndex];
+			pInArgs->pMonitorModes[ModeIndex].MonitorVideoSignalInfo = knownModes[ModeIndex];
 
 
 			if (ColourFormat == L"RGB") {
@@ -4562,23 +5537,20 @@ NTSTATUS VirtualDisplayDriverEvtIddCxMonitorSetGammaRamp(
 
 	// Priority 1: Use EDID-derived gamma settings if available
 	if (edidIntegrationEnabled && autoConfigureFromEdid) {
+		VddGammaRamp cached;
 		// First check for monitor-specific gamma ramp
-		auto storeIt = g_GammaRampStore.find(MonitorObject);
-		if (storeIt != g_GammaRampStore.end() && storeIt->second.isValid) {
-			gammaRamp = storeIt->second;
+		if (TryGetGammaRamp(MonitorObject, cached) && cached.isValid) {
+			gammaRamp = cached;
 			hasValidGammaRamp = true;
 			vddlog("i", "Using monitor-specific EDID-derived gamma ramp");
 		}
 		// If no monitor-specific gamma ramp, check for template from EDID profile
-		else {
-			auto templateIt = g_GammaRampStore.find(reinterpret_cast<IDDCX_MONITOR>(0));
-			if (templateIt != g_GammaRampStore.end() && templateIt->second.isValid) {
-				gammaRamp = templateIt->second;
-				hasValidGammaRamp = true;
-				// Store it for this specific monitor for future use
-				g_GammaRampStore[MonitorObject] = gammaRamp;
-				vddlog("i", "Using template EDID-derived gamma ramp and storing for monitor");
-			}
+		else if (TryGetGammaRamp(MetadataTemplateKey(), cached) && cached.isValid) {
+			gammaRamp = cached;
+			hasValidGammaRamp = true;
+			// Store it for this specific monitor for future use
+			StoreGammaRamp(MonitorObject, gammaRamp);
+			vddlog("i", "Using template EDID-derived gamma ramp and storing for monitor");
 		}
 	}
 
@@ -4595,9 +5567,9 @@ NTSTATUS VirtualDisplayDriverEvtIddCxMonitorSetGammaRamp(
 		return STATUS_SUCCESS;
 	}
 
-	// Log the gamma ramp values being applied
+	// Log the gamma ramp values that were computed
 	logStream.str("");
-	logStream << "=== APPLYING GAMMA RAMP AND COLOR SPACE TRANSFORM ===\n"
+	logStream << "=== COMPUTED GAMMA RAMP AND COLOR SPACE TRANSFORM (not applied) ===\n"
 			  << "Gamma Value: " << gammaRamp.gamma << "\n"
 			  << "Color Space: " << WStringToString(gammaRamp.colorSpace) << "\n"
 			  << "Use Matrix Transform: " << (gammaRamp.useMatrix ? "Yes" : "No");
@@ -4605,48 +5577,34 @@ NTSTATUS VirtualDisplayDriverEvtIddCxMonitorSetGammaRamp(
 
 	// Apply gamma ramp based on type
 	if (pInArgs->Type == IDDCX_GAMMARAMP_TYPE_3x4_COLORSPACE_TRANSFORM && gammaRamp.useMatrix) {
-		// Apply 3x4 color space transformation matrix
+		// Record the 3x4 color space transformation matrix
 		logStream.str("");
-		logStream << "Applying 3x4 Color Space Matrix:\n"
+		logStream << "3x4 Color Space Matrix:\n"
 				  << "  [" << gammaRamp.matrix.matrix[0][0] << ", " << gammaRamp.matrix.matrix[0][1] << ", " << gammaRamp.matrix.matrix[0][2] << ", " << gammaRamp.matrix.matrix[0][3] << "]\n"
 				  << "  [" << gammaRamp.matrix.matrix[1][0] << ", " << gammaRamp.matrix.matrix[1][1] << ", " << gammaRamp.matrix.matrix[1][2] << ", " << gammaRamp.matrix.matrix[1][3] << "]\n"
 				  << "  [" << gammaRamp.matrix.matrix[2][0] << ", " << gammaRamp.matrix.matrix[2][1] << ", " << gammaRamp.matrix.matrix[2][2] << ", " << gammaRamp.matrix.matrix[2][3] << "]";
 		vddlog("i", logStream.str().c_str());
-
-		// Store the matrix for this monitor
-		g_GammaRampStore[MonitorObject] = gammaRamp;
-
-		// In a full implementation, you would apply the matrix to the rendering pipeline here
-		// The exact API calls would depend on IddCx version and hardware capabilities
-		
-		logStream.str("");
-		logStream << "3x4 matrix transform applied successfully for monitor " << MonitorObject;
-		vddlog("i", logStream.str().c_str());
 	}
 	else if (pInArgs->Type == IDDCX_GAMMARAMP_TYPE_RGB256x3x16) {
-		// Apply traditional RGB gamma ramp
 		logStream.str("");
-		logStream << "Applying RGB 256x3x16 gamma ramp with gamma " << gammaRamp.gamma;
-		vddlog("i", logStream.str().c_str());
-
-		// In a full implementation, you would generate and apply RGB lookup tables here
-		// Based on the gamma value and color space
-		
-		logStream.str("");
-		logStream << "RGB gamma ramp applied successfully for monitor " << MonitorObject;
+		logStream << "RGB 256x3x16 gamma ramp, gamma " << gammaRamp.gamma;
 		vddlog("i", logStream.str().c_str());
 	}
 	else {
 		logStream.str("");
-		logStream << "Unsupported gamma ramp type: " << pInArgs->Type << ", using default gamma processing";
+		logStream << "Unsupported gamma ramp type: " << pInArgs->Type << ", nothing to record";
 		vddlog("w", logStream.str().c_str());
 	}
 
-	// Store the final gamma ramp for this monitor
-	g_GammaRampStore[MonitorObject] = gammaRamp;
+	// Cache the ramp for this monitor. Nothing downstream reads it: this driver has no
+	// scan-out pipeline to program, so no IddCx call is made and no LUT is generated. Both
+	// branches above used to log "applied successfully" after only writing here, which is what
+	// made a pure cache look like a working gamma implementation.
+	StoreGammaRamp(MonitorObject, gammaRamp);
 
 	logStream.str("");
-	logStream << "Gamma ramp configuration completed for monitor " << MonitorObject;
+	logStream << "Gamma ramp cached for monitor " << MonitorObject
+		<< "; not applied, no scan-out pipeline in this driver";
 	vddlog("i", logStream.str().c_str());
 
 	return STATUS_SUCCESS;
@@ -4694,14 +5652,28 @@ NTSTATUS ValidateEdidIntegration()
 		<< "\n  Profile Path: " << WStringToString(profilePath);
 	vddlog("d", logStream.str().c_str());
 
+	// Manual configuration is a supported mode, not a defect, so a disabled integration is
+	// reported and not counted. This check used to add an issue for it, which meant the shipped
+	// default always scored 2 issues, and validationPassed -- which was initialised to true and
+	// never reassigned -- still returned STATUS_SUCCESS and logged PASSED next to a
+	// "Configuration Valid: No" line.
 	if (!edidEnabled) {
 		vddlog("w", "EDID integration is disabled - manual configuration mode");
-		issues++;
 	}
-
-	if (profilePath.empty() || profilePath == L"EDID/monitor_profile.xml") {
-		vddlog("w", "EDID profile path not configured or using default path");
-		issues++;
+	else {
+		// The profile only has to be there when something is actually going to read it.
+		if (autoConfig) {
+			EdidProfileData probe;
+			if (!LoadEdidProfile(profilePath, probe)) {
+				vddlog("e", "AutoConfigureFromEdid is on but the EDID profile could not be loaded");
+				issues++;
+				validationPassed = false;
+			}
+		}
+		else if (profilePath.empty()) {
+			vddlog("w", "EDID integration is on but no profile path is set");
+			issues++;
+		}
 	}
 
 	// Validate HDR configuration
@@ -4724,12 +5696,17 @@ NTSTATUS ValidateEdidIntegration()
 		<< "\n  Source Priority: " << WStringToString(localSourcePriority);
 	vddlog("d", logStream.str().c_str());
 
-	// Update integration status
+	// Update integration status. configurationValid used to be (issues < 3), an arbitrary
+	// threshold that no check could ever cross, so it disagreed with the PASSED/FAILED line and
+	// with the NTSTATUS returned right below. All three now read the same verdict.
 	g_IntegrationStatus.edidParsingEnabled = edidEnabled;
 	g_IntegrationStatus.hdrMetadataValid = hdrEnabled;
 	g_IntegrationStatus.modeManagementActive = autoResEnabled;
-	g_IntegrationStatus.configurationValid = (issues < 3);
+	g_IntegrationStatus.configurationValid = validationPassed;
 	g_IntegrationStatus.warningCount = issues;
+	if (!validationPassed) {
+		g_IntegrationStatus.errorCount = issues;
+	}
 
 	logStream.str("");
 	logStream << "=== VALIDATION SUMMARY ==="
@@ -4749,32 +5726,32 @@ NTSTATUS PerformanceMonitor()
 
 	// Monitor mode generation performance
 	auto start = chrono::high_resolution_clock::now();
-	
-	// Test mode generation with current configuration
-	vector<tuple<DWORD, DWORD, DWORD, DWORD>> testModes;
-	// Use the global monitorModes for performance testing
-	for (const auto& mode : monitorModes) {
-		testModes.push_back(make_tuple(get<0>(mode), get<1>(mode), get<2>(mode), get<3>(mode)));
-	}
-	
+
+	// This never measured mode generation. It copied monitorModes into a local vector and timed
+	// the copy, then reported the copy duration as "Mode Generation Time" and raised a warning
+	// when it exceeded 10ms. Time the real cache rebuild instead.
+	RebuildKnownMonitorModesCache();
+
 	auto end = chrono::high_resolution_clock::now();
 	auto duration = chrono::duration_cast<chrono::microseconds>(end - start);
 
+	const size_t modeCount = monitorModes.size();
+
 	logStream.str("");
 	logStream << "Performance Metrics:"
-		<< "\n  Mode Generation Time: " << duration.count() << " microseconds"
-		<< "\n  Total Modes Generated: " << testModes.size()
-		<< "\n  Memory Usage: ~" << (testModes.size() * sizeof(tuple<DWORD, DWORD, DWORD, DWORD>)) << " bytes";
+		<< "\n  Known Mode Cache Rebuild Time: " << duration.count() << " microseconds"
+		<< "\n  Modes In Current Mode List: " << modeCount
+		<< "\n  Memory Usage: ~" << (modeCount * sizeof(tuple<DWORD, DWORD, DWORD, DWORD>)) << " bytes";
 	vddlog("i", logStream.str().c_str());
 
 	// Performance thresholds
 	if (duration.count() > 10000) { // 10ms threshold
-		vddlog("w", "Mode generation is slower than expected (>10ms)");
+		vddlog("w", "Known mode cache rebuild is slower than expected (>10ms)");
 		g_IntegrationStatus.warningCount++;
 	}
 
-	if (testModes.size() > 100) {
-		vddlog("w", "Large number of modes generated - consider filtering");
+	if (modeCount > 100) {
+		vddlog("w", "Large number of modes in the mode list - consider filtering");
 		g_IntegrationStatus.warningCount++;
 	}
 
@@ -4787,12 +5764,14 @@ NTSTATUS CreateFallbackConfiguration()
 	logStream << "=== CREATING FALLBACK CONFIGURATION ===";
 	vddlog("i", logStream.str().c_str());
 
-	// Create safe fallback modes if EDID parsing fails
+	// Create safe fallback modes if EDID parsing fails.
+	// The 4th field is vsyncDen and was 0 here, which is a division by zero for anything that
+	// consumes these tuples the way the rest of the driver consumes monitorModes.
 	vector<tuple<DWORD, DWORD, DWORD, DWORD>> fallbackModes = {
-		make_tuple(1920, 1080, 60, 0),   // Full HD 60Hz
-		make_tuple(1366, 768, 60, 0),    // Common laptop resolution
-		make_tuple(1280, 720, 60, 0),    // HD 60Hz
-		make_tuple(800, 600, 60, 0)      // Safe fallback
+		make_tuple(1920, 1080, 60, 1),   // Full HD 60Hz
+		make_tuple(1366, 768, 60, 1),    // Common laptop resolution
+		make_tuple(1280, 720, 60, 1),    // HD 60Hz
+		make_tuple(800, 600, 60, 1)      // Safe fallback
 	};
 
 	logStream.str("");
@@ -4825,7 +5804,13 @@ NTSTATUS CreateFallbackConfiguration()
 		<< "\n  Max Content Light: " << fallbackHdr.max_content_light_level << " nits";
 	vddlog("d", logStream.str().c_str());
 
-	vddlog("i", "Fallback configuration ready for emergency use");
+	// Reports what the fallback configuration would contain. It does not install anything: the
+	// modes below are local and the HDR metadata is never stored, so the closing line used to
+	// promise "Fallback configuration ready for emergency use" for a configuration that did not
+	// exist. Making it real would mean overwriting the mode list the user already configured,
+	// which is not something a diagnostic should do behind their back.
+	vddlog("i", "Fallback configuration would provide the modes and sRGB HDR metadata listed above;"
+		" nothing is installed by this diagnostic");
 	return STATUS_SUCCESS;
 }
 
@@ -4881,14 +5866,15 @@ NTSTATUS RunComprehensiveDiagnostics()
 	vddlog("d", logStream.str().c_str());
 
 	// Check global stores
-	size_t hdrStoreSize = g_HdrMetadataStore.size();
-	size_t gammaStoreSize = g_GammaRampStore.size();
+	size_t hdrStoreSize = 0;
+	size_t gammaStoreSize = 0;
+	GetMetadataCacheSizes(hdrStoreSize, gammaStoreSize);
 	
 	logStream.str("");
 	logStream << "Resource Usage:"
 		<< "\n  HDR Metadata Store: " << hdrStoreSize << " entries"
 		<< "\n  Gamma Ramp Store: " << gammaStoreSize << " entries"
-		<< "\n  Known Monitor Modes: " << s_KnownMonitorModes2.size() << " modes";
+		<< "\n  Known Monitor Modes: " << KnownMonitorModesCount() << " modes";
 	vddlog("d", logStream.str().c_str());
 
 	// Final diagnostic summary
@@ -4927,13 +5913,18 @@ NTSTATUS ValidateAndSanitizeConfiguration()
 		sanitizedSettings++;
 	}
 
-	// Validate resolution settings
+	// Validate resolution settings. This runs after loadSettings(), so on the option.txt path --
+	// the one with no XML behind it -- GetIntegerSetting answers -1 for all four and these
+	// locals would land on -1, which is then written back into the globals. Every fallback and
+	// every bound here has to match the positiveOr() calls in DriverEntry and the compiled
+	// the ceiling quietly goes back to a smaller number than the one the mode list was built
+	// against.
 	int minWidth = GetIntegerSetting(L"MinResolutionWidth");
 	int minHeight = GetIntegerSetting(L"MinResolutionHeight");
 	int maxWidth = GetIntegerSetting(L"MaxResolutionWidth");
 	int maxHeight = GetIntegerSetting(L"MaxResolutionHeight");
 
-	if (minWidth < 640 || minWidth > 7680) {
+	if (minWidth < 640 || minWidth > 10240) {
 		vddlog("w", "Invalid min width detected, setting to 640");
 		minWidth = 640;
 		sanitizedSettings++;
@@ -4946,8 +5937,8 @@ NTSTATUS ValidateAndSanitizeConfiguration()
 	}
 
 	if (maxWidth < minWidth || maxWidth > 15360) {
-		vddlog("w", "Invalid max width detected, setting to 7680");
-		maxWidth = 7680;
+		vddlog("w", "Invalid max width detected, setting to 10240");
+		maxWidth = 10240;
 		sanitizedSettings++;
 	}
 	
@@ -4973,7 +5964,20 @@ NTSTATUS ValidateAndSanitizeConfiguration()
 		sanitizedSettings++;
 	}
 
-	// Validate color primaries
+	// Validate gamma correction. Nothing read gamma_correction before this, and
+	// GetDoubleSetting answers 0.0 for a key that is absent, so deleting the element from the
+	// XML left ConvertManualToGammaRamp() building a ramp and a matrix out of gamma 0.
+	double localGamma = GetDoubleSetting(L"GammaCorrection");
+
+	if (localGamma < 1.0 || localGamma > 3.0) {
+		vddlog("w", "Invalid gamma correction detected, setting to 2.2");
+		localGamma = 2.2;
+		sanitizedSettings++;
+	}
+
+	// Validate color primaries. The bound is exclusive at 0 on purpose: GetDoubleSetting
+	// answers 0.0 for an absent key, and 0.0 is inside [0,1], so a deleted <red_x> used to
+	// pass this check unchanged and leave a primary sitting on the corner of the triangle.
 	double localRedX = GetDoubleSetting(L"RedX");
 	double localRedY = GetDoubleSetting(L"RedY");
 	double localGreenX = GetDoubleSetting(L"GreenX");
@@ -4981,19 +5985,54 @@ NTSTATUS ValidateAndSanitizeConfiguration()
 	double localBlueX = GetDoubleSetting(L"BlueX");
 	double localBlueY = GetDoubleSetting(L"BlueY");
 
-	if (localRedX < 0.0 || localRedX > 1.0 || localRedY < 0.0 || localRedY > 1.0) {
+	if (localRedX <= 0.0 || localRedX > 1.0 || localRedY <= 0.0 || localRedY > 1.0) {
 		vddlog("w", "Invalid red primary coordinates, using sRGB defaults");
+		localRedX = 0.708; localRedY = 0.292;
 		sanitizedSettings++;
 	}
-	
-	if (localGreenX < 0.0 || localGreenX > 1.0 || localGreenY < 0.0 || localGreenY > 1.0) {
+
+	if (localGreenX <= 0.0 || localGreenX > 1.0 || localGreenY <= 0.0 || localGreenY > 1.0) {
 		vddlog("w", "Invalid green primary coordinates, using sRGB defaults");
+		localGreenX = 0.170; localGreenY = 0.797;
 		sanitizedSettings++;
 	}
 	
-	if (localBlueX < 0.0 || localBlueX > 1.0 || localBlueY < 0.0 || localBlueY > 1.0) {
+	if (localBlueX <= 0.0 || localBlueX > 1.0 || localBlueY <= 0.0 || localBlueY > 1.0) {
 		vddlog("w", "Invalid blue primary coordinates, using sRGB defaults");
+		localBlueX = 0.131; localBlueY = 0.046;
 		sanitizedSettings++;
+	}
+
+	// The white point is a primary too, and it had no range check at all.
+	double localWhiteX = GetDoubleSetting(L"WhiteX");
+	double localWhiteY = GetDoubleSetting(L"WhiteY");
+
+	if (localWhiteX <= 0.0 || localWhiteX > 1.0 || localWhiteY <= 0.0 || localWhiteY > 1.0) {
+		vddlog("w", "Invalid white point coordinates, using D65 defaults");
+		localWhiteX = 0.3127; localWhiteY = 0.3290;
+		sanitizedSettings++;
+	}
+
+	// Write the sanitized values back. This used to clamp only these locals and log
+	// "setting to ...", so every global kept the out-of-range value the XML asked for and the
+	// clamp had no effect on the driver at all. The globals are the ones the mode, HDR and
+	// colour paths read, so the corrected values only mean something once they land here.
+	// The refresh/resolution globals are ints, so the doubles above are rounded after the
+	// range check rather than truncated.
+	if (sanitizedSettings > 0) {
+		minRefreshRate = static_cast<int>(minRefresh + 0.5);
+		maxRefreshRate = static_cast<int>(maxRefresh + 0.5);
+		minResolutionWidth = minWidth;
+		minResolutionHeight = minHeight;
+		maxResolutionWidth = maxWidth;
+		maxResolutionHeight = maxHeight;
+		maxDisplayMasteringLuminance = maxLuminance;
+		minDisplayMasteringLuminance = minLuminance;
+		redX = localRedX; redY = localRedY;
+		greenX = localGreenX; greenY = localGreenY;
+		blueX = localBlueX; blueY = localBlueY;
+		whiteX = localWhiteX; whiteY = localWhiteY;
+		gammaCorrection = localGamma;
 	}
 
 	logStream.str("");
@@ -5001,7 +6040,8 @@ NTSTATUS ValidateAndSanitizeConfiguration()
 		<< "\n  Settings sanitized: " << sanitizedSettings
 		<< "\n  Refresh rate range: " << minRefresh << "-" << maxRefresh << " Hz"
 		<< "\n  Resolution range: " << minWidth << "x" << minHeight << " to " << maxWidth << "x" << maxHeight
-		<< "\n  Luminance range: " << minLuminance << "-" << maxLuminance << " nits";
+		<< "\n  Luminance range: " << minLuminance << "-" << maxLuminance << " nits"
+		<< "\n  Gamma correction: " << localGamma;
 	vddlog("i", logStream.str().c_str());
 
 	return (sanitizedSettings < 5) ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
