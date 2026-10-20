@@ -506,7 +506,112 @@ string WStringToString(const wstring& wstr) { //basically just a function for co
 	return str;
 }
 
-bool EnabledQuery(const std::wstring& settingKey) {
+// === vdd_settings.xml, parsed once ===
+//
+// Each of the four getters below used to open vdd_settings.xml and walk the whole document
+// on its own, and DriverEntry calls them 52 times, so every boot did 52 full parses of the
+// same file. The parsed result is cached here instead. InvalidateSettingsCache() is called
+// by the runtime rewriters, which are the only things that change the file after boot.
+mutex g_SettingsCacheMutex;
+map<wstring, wstring> g_SettingsCache;
+bool g_SettingsCacheReady = false;
+
+void InvalidateSettingsCache() {
+	lock_guard<mutex> lock(g_SettingsCacheMutex);
+	g_SettingsCacheReady = false;
+	g_SettingsCache.clear();
+}
+
+static void RecordSettingLocked(const wstring& parent, const wstring& name, const wstring& text) {
+	if (!parent.empty()) {
+		const wstring qualified = parent + L"/" + name;
+		g_SettingsCache.emplace(qualified, text);
+	}
+	// First match wins, which is what the old per-getter loops did: they stopped at the first
+	// element whose name matched.
+	g_SettingsCache.emplace(name, text);
+}
+
+static void BuildSettingsCacheLocked() {
+	if (g_SettingsCacheReady) {
+		return;
+	}
+	// Not marked ready until the parse completes. Latching it up front meant a transient failure
+	// to open the file -- the driver starting before the install script finished copying it --
+	// froze an empty cache for the whole session, where the old per-getter code retried every
+	// call and picked the file up as soon as it appeared.
+	g_SettingsCache.clear();
+
+	const wstring settingsname = confpath + L"\\vdd_settings.xml";
+
+	CComPtr<IStream> pFileStream;
+	HRESULT hr = SHCreateStreamOnFileEx(settingsname.c_str(), STGM_READ, FILE_ATTRIBUTE_NORMAL, FALSE, nullptr, &pFileStream);
+	if (FAILED(hr)) {
+		vddlog("d", "Settings cache: failed to open vdd_settings.xml");
+		return;
+	}
+
+	CComPtr<IXmlReader> pReader;
+	hr = CreateXmlReader(__uuidof(IXmlReader), (void**)&pReader, nullptr);
+	if (FAILED(hr) || FAILED(pReader->SetInput(pFileStream))) {
+		vddlog("d", "Settings cache: failed to create or feed the XML reader");
+		return;
+	}
+
+	XmlNodeType nodeType;
+	const wchar_t* pwszLocalName = nullptr;
+	const wchar_t* pwszValue = nullptr;
+	vector<wstring> path;
+
+	while (S_OK == pReader->Read(&nodeType)) {
+		if (nodeType == XmlNodeType_Element) {
+			pReader->GetLocalName(&pwszLocalName, nullptr);
+			path.push_back(pwszLocalName ? wstring(pwszLocalName) : wstring());
+		}
+		else if (nodeType == XmlNodeType_EndElement) {
+			if (!path.empty()) {
+				path.pop_back();
+			}
+		}
+		else if (nodeType == XmlNodeType_Text && !path.empty()) {
+			pReader->GetValue(&pwszValue, nullptr);
+			if (pwszValue) {
+				const wstring parent = path.size() >= 2 ? path[path.size() - 2] : wstring();
+				RecordSettingLocked(parent, path.back(), wstring(pwszValue));
+			}
+		}
+	}
+
+	g_SettingsCacheReady = true;
+}
+
+// Looks a setting up in vdd_settings.xml.
+//
+// "parent/element" selects by immediate parent. That qualifier is what makes the five
+// settings that all resolve to the bare name "enabled" work: the file has five <enabled>
+// elements in five different sections, and EdidIntegrationEnabled, Hdr10StaticMetadataEnabled,
+// ColorPrimariesEnabled, ColorSpaceEnabled and AutoResolutionsEnabled were all reading the
+// first one, so turning on any of the other four silently turned on all of them. A bare name
+// keeps meaning "first match".
+bool ReadSettingFromXml(const std::wstring& xmlName, std::wstring& value) {
+	lock_guard<mutex> lock(g_SettingsCacheMutex);
+	BuildSettingsCacheLocked();
+	auto it = g_SettingsCache.find(xmlName);
+	if (it == g_SettingsCache.end()) {
+		return false;
+	}
+	value = it->second;
+	return true;
+}
+
+// Resolve a boolean setting. present reports whether the key exists in the registry or the XML
+// at all, which EnabledQuery cannot tell apart from "it exists and is false" -- it collapses
+// both to false. DriverEntry needs the distinction for the settings whose compiled default is
+// true: HardwareCursor ships as <HardwareCursor>true</HardwareCursor>, and answering false for
+// "no settings file" turned the hardware cursor off on exactly the configuration nobody had
+// configured.
+bool ResolveEnabledSetting(const std::wstring& settingKey, bool& present) {
+	present = false;
 	auto it = SettingsQueryMap.find(settingKey);
 	if (it == SettingsQueryMap.end()) {
 		vddlog("e", "requested data not found in xml, consider updating xml!");
@@ -516,89 +621,107 @@ bool EnabledQuery(const std::wstring& settingKey) {
 	std::wstring regName = it->second.first;
 	std::wstring xmlName = it->second.second;
 
-	std::wstring settingsname = confpath + L"\\vdd_settings.xml";
 	HKEY hKey;
 	DWORD dwValue;
 	DWORD dwBufferSize = sizeof(dwValue);
 	LONG lResult = RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\MikeTheTech\\VirtualDisplayDriver", 0, KEY_READ, &hKey);
 
 	if (lResult == ERROR_SUCCESS) {
+		// Resolve fully before closing, and close exactly once. The previous shape closed the
+		// key inside the "registry string" branch and then again on the way out, so a registry
+		// string that was neither true/1 nor false/0 double-closed the handle. (A DWORD that was
+		// neither 0 nor 1 was already safe: that branch closed before testing the value.) The
+		// value now resolves into resolvedFromRegistry/registryValue, the key closes once, and
+		// the function returns early only when the registry actually settled it.
+		bool resolvedFromRegistry = false;
+		bool registryValue = false;
+
 		lResult = RegQueryValueExW(hKey, regName.c_str(), NULL, NULL, (LPBYTE)&dwValue, &dwBufferSize);
 		if (lResult == ERROR_SUCCESS) {
-			RegCloseKey(hKey);
+			present = true;
 			if (dwValue == 1) {
+				resolvedFromRegistry = true; registryValue = true;
 				LogQueries("d", xmlName + L" - is enabled (value = 1).");
-				return true;
 			}
 			else if (dwValue == 0) {
-				goto check_xml;
+				resolvedFromRegistry = true; registryValue = false;
+				LogQueries("d", xmlName + L" - is disabled (value = 0).");
 			}
 		}
 		else {
 			LogQueries("d", xmlName + L" - Failed to retrieve value from registry. Attempting to read as string.");
+			// Uninitialised buffer, unchecked type, then a NUL scan over the raw array:
+			// a REG_BINARY filling the buffer, or a REG_SZ written without its terminator,
+			// leaves nothing to terminate the scan and it runs off the end of the array.
+			// Same guard as GetStringSetting and GetDoubleSetting -- check the type, and
+			// build the string from the length the registry reported instead of from the
+			// raw array.
 			wchar_t path[MAX_PATH];
+			DWORD dwStringType = 0;
 			dwBufferSize = sizeof(path);
-			lResult = RegQueryValueExW(hKey, regName.c_str(), NULL, NULL, (LPBYTE)path, &dwBufferSize);
-			if (lResult == ERROR_SUCCESS) {
-				std::wstring logValue(path);
-				RegCloseKey(hKey);
+			lResult = RegQueryValueExW(hKey, regName.c_str(), NULL, &dwStringType, (LPBYTE)path, &dwBufferSize);
+			if (lResult == ERROR_SUCCESS && dwBufferSize > 0 && dwBufferSize <= sizeof(path)
+				&& (dwStringType == REG_SZ || dwStringType == REG_EXPAND_SZ)) {
+				size_t chars = dwBufferSize / sizeof(wchar_t);
+				if (path[chars - 1] != L'\0') {
+					LogQueries("d", xmlName + L" - Registry string was not NUL terminated, truncating.");
+					chars -= 1;
+				}
+				std::wstring logValue(path, chars);
+				present = true;
 				if (logValue == L"true" || logValue == L"1") {
+					resolvedFromRegistry = true; registryValue = true;
 					LogQueries("d", xmlName + L" - is enabled (string value).");
-					return true;
 				}
 				else if (logValue == L"false" || logValue == L"0") {
-					goto check_xml;
+					resolvedFromRegistry = true; registryValue = false;
+					LogQueries("d", xmlName + L" - is disabled (string value).");
 				}
 			}
-			RegCloseKey(hKey);
-			LogQueries("d", xmlName + L" - Failed to retrieve string value from registry.");
+			else {
+				LogQueries("d", xmlName + L" - Failed to retrieve string value from registry.");
+			}
+		}
+		RegCloseKey(hKey);
+		if (resolvedFromRegistry) {
+			return registryValue;
 		}
 	}
 
-check_xml:
-	CComPtr<IStream> pFileStream;
-	HRESULT hr = SHCreateStreamOnFileEx(settingsname.c_str(), STGM_READ, FILE_ATTRIBUTE_NORMAL, FALSE, nullptr, &pFileStream);
-	if (FAILED(hr)) {
-		LogQueries("d", xmlName + L" - Failed to create file stream for XML settings.");
-		return false;
-	}
-
-	CComPtr<IXmlReader> pReader;
-	hr = CreateXmlReader(__uuidof(IXmlReader), (void**)&pReader, nullptr);
-	if (FAILED(hr)) {
-		LogQueries("d", xmlName + L" - Failed to create XML reader.");
-		return false;
-	}
-
-	hr = pReader->SetInput(pFileStream);
-	if (FAILED(hr)) {
-		LogQueries("d", xmlName + L" - Failed to set input for XML reader.");
-		return false;
-	}
-
-	XmlNodeType nodeType;
-	const wchar_t* pwszLocalName;
-	bool xmlLoggingValue = false;
-
-	while (S_OK == pReader->Read(&nodeType)) {
-		if (nodeType == XmlNodeType_Element) {
-			pReader->GetLocalName(&pwszLocalName, nullptr);
-			if (pwszLocalName && wcscmp(pwszLocalName, xmlName.c_str()) == 0) {
-				pReader->Read(&nodeType);
-				if (nodeType == XmlNodeType_Text) {
-					const wchar_t* pwszValue;
-					pReader->GetValue(&pwszValue, nullptr);
-					if (pwszValue) {
-						xmlLoggingValue = (wcscmp(pwszValue, L"true") == 0);
-					}
-					LogQueries("i", xmlName + (xmlLoggingValue ? L" is enabled." : L" is disabled."));
-					break;
-				}
-			}
+	{
+		std::wstring xmlValue;
+		if (!ReadSettingFromXml(xmlName, xmlValue)) {
+			LogQueries("d", xmlName + L" - not present in XML.");
+			return false;
 		}
-	}
+		present = true;
 
-	return xmlLoggingValue;
+		bool xmlLoggingValue = (xmlValue == L"true" || xmlValue == L"1");
+		LogQueries("i", xmlName + (xmlLoggingValue ? L" is enabled." : L" is disabled."));
+
+		return xmlLoggingValue;
+	}
+}
+
+// EnabledQuery's original contract, kept for every caller that does not care why the answer is
+// false: a key that is absent and a key that says false both answer false.
+bool EnabledQuery(const std::wstring& settingKey) {
+	bool present = false;
+	return ResolveEnabledSetting(settingKey, present);
+}
+
+// EnabledQuery's contract with the missing-key case routed to a caller-chosen default.
+bool EnabledOr(const std::wstring& settingKey, bool fallback) {
+	bool present = false;
+	bool value = ResolveEnabledSetting(settingKey, present);
+	if (!present) {
+		stringstream ss;
+		ss << WStringToString(settingKey) << " is not set in the registry or the settings XML, using the built-in default of "
+		   << (fallback ? "true" : "false");
+		vddlog("w", ss.str().c_str());
+		return fallback;
+	}
+	return value;
 }
 
 int GetIntegerSetting(const std::wstring& settingKey) {
@@ -611,7 +734,6 @@ int GetIntegerSetting(const std::wstring& settingKey) {
 	std::wstring regName = it->second.first;
 	std::wstring xmlName = it->second.second;
 
-	std::wstring settingsname = confpath + L"\\vdd_settings.xml";
 	HKEY hKey;
 	DWORD dwValue;
 	DWORD dwBufferSize = sizeof(dwValue);
@@ -626,13 +748,26 @@ int GetIntegerSetting(const std::wstring& settingKey) {
 		}
 		else {
 			LogQueries("d", xmlName + L" - Failed to retrieve integer value from registry. Attempting to read as string.");
+			// Uninitialised buffer, unchecked type, then a NUL scan over the raw array:
+			// a REG_BINARY filling the buffer, or a REG_SZ written without its terminator,
+			// leaves nothing to terminate the scan and it runs off the end of the array.
+			// Same guard as GetStringSetting and GetDoubleSetting -- check the type, and
+			// build the string from the length the registry reported instead of from the
+			// raw array.
 			wchar_t path[MAX_PATH];
+			DWORD dwStringType = 0;
 			dwBufferSize = sizeof(path);
-			lResult = RegQueryValueExW(hKey, regName.c_str(), NULL, NULL, (LPBYTE)path, &dwBufferSize);
+			lResult = RegQueryValueExW(hKey, regName.c_str(), NULL, &dwStringType, (LPBYTE)path, &dwBufferSize);
 			RegCloseKey(hKey);
-			if (lResult == ERROR_SUCCESS) {
+			if (lResult == ERROR_SUCCESS && dwBufferSize > 0 && dwBufferSize <= sizeof(path)
+				&& (dwStringType == REG_SZ || dwStringType == REG_EXPAND_SZ)) {
+				size_t chars = dwBufferSize / sizeof(wchar_t);
+				if (path[chars - 1] != L'\0') {
+					LogQueries("d", xmlName + L" - Registry string was not NUL terminated, truncating.");
+					chars -= 1;
+				}
 				try {
-					int logValue = std::stoi(path);
+					int logValue = std::stoi(std::wstring(path, chars).c_str());
 					LogQueries("d", xmlName + L" - Retrieved string value: " + std::to_wstring(logValue));
 					return logValue;
 				}
@@ -643,51 +778,19 @@ int GetIntegerSetting(const std::wstring& settingKey) {
 		}
 	}
 
-	CComPtr<IStream> pFileStream;
-	HRESULT hr = SHCreateStreamOnFileEx(settingsname.c_str(), STGM_READ, FILE_ATTRIBUTE_NORMAL, FALSE, nullptr, &pFileStream);
-	if (FAILED(hr)) {
-		LogQueries("d", xmlName + L" - Failed to create file stream for XML settings.");
+	std::wstring xmlValue;
+	if (!ReadSettingFromXml(xmlName, xmlValue)) {
+		LogQueries("d", xmlName + L" - not present in XML.");
 		return -1;
 	}
 
-	CComPtr<IXmlReader> pReader;
-	hr = CreateXmlReader(__uuidof(IXmlReader), (void**)&pReader, nullptr);
-	if (FAILED(hr)) {
-		LogQueries("d", xmlName + L" - Failed to create XML reader.");
-		return -1;
-	}
-
-	hr = pReader->SetInput(pFileStream);
-	if (FAILED(hr)) {
-		LogQueries("d", xmlName + L" - Failed to set input for XML reader.");
-		return -1;
-	}
-
-	XmlNodeType nodeType;
-	const wchar_t* pwszLocalName;
 	int xmlLoggingValue = -1;
-
-	while (S_OK == pReader->Read(&nodeType)) {
-		if (nodeType == XmlNodeType_Element) {
-			pReader->GetLocalName(&pwszLocalName, nullptr);
-			if (pwszLocalName && wcscmp(pwszLocalName, xmlName.c_str()) == 0) {
-				pReader->Read(&nodeType);
-				if (nodeType == XmlNodeType_Text) {
-					const wchar_t* pwszValue;
-					pReader->GetValue(&pwszValue, nullptr);
-					if (pwszValue) {
-						try {
-							xmlLoggingValue = std::stoi(pwszValue);
-							LogQueries("i", xmlName + L" - Retrieved from XML: " + std::to_wstring(xmlLoggingValue));
-						}
-						catch (const std::exception&) {
-							LogQueries("d", xmlName + L" - Failed to convert XML string value to integer.");
-						}
-					}
-					break;
-				}
-			}
-		}
+	try {
+		xmlLoggingValue = ParseIntSafe(xmlValue, -1, L"XML setting value");
+		LogQueries("i", xmlName + L" - Retrieved from XML: " + std::to_wstring(xmlLoggingValue));
+	}
+	catch (const std::exception&) {
+		LogQueries("d", xmlName + L" - Failed to convert XML string value to integer.");
 	}
 
 	return xmlLoggingValue;
@@ -703,68 +806,43 @@ std::wstring GetStringSetting(const std::wstring& settingKey) {
 	std::wstring regName = it->second.first;
 	std::wstring xmlName = it->second.second;
 
-	std::wstring settingsname = confpath + L"\\vdd_settings.xml";
 	HKEY hKey;
-	DWORD dwBufferSize = MAX_PATH;
+	DWORD dwBufferSize = MAX_PATH * sizeof(wchar_t);
 	wchar_t buffer[MAX_PATH];
 
+	DWORD dwType = 0;
 	LONG lResult = RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\MikeTheTech\\VirtualDisplayDriver", 0, KEY_READ, &hKey);
 	if (lResult == ERROR_SUCCESS) {
-		lResult = RegQueryValueExW(hKey, regName.c_str(), NULL, NULL, (LPBYTE)buffer, &dwBufferSize);
+		lResult = RegQueryValueExW(hKey, regName.c_str(), NULL, &dwType, (LPBYTE)buffer, &dwBufferSize);
 		RegCloseKey(hKey);
 
-		if (lResult == ERROR_SUCCESS) {
-			LogQueries("d", xmlName + L" - Retrieved string value from registry: " + buffer);
-			return std::wstring(buffer);  
+		// std::wstring(buffer) scans for a NUL that a malformed REG_SZ is not guaranteed to
+		// have, and REG_DWORD writes 4 raw bytes with no terminator at all. Build the string
+		// from the length the registry reported and force the terminator.
+		if (lResult == ERROR_SUCCESS && dwBufferSize > 0 && dwBufferSize <= MAX_PATH * sizeof(wchar_t)
+			&& (dwType == REG_SZ || dwType == REG_EXPAND_SZ)) {
+			size_t chars = dwBufferSize / sizeof(wchar_t);
+			if (buffer[chars - 1] != L'\0') {
+				LogQueries("d", xmlName + L" - Registry string was not NUL terminated, truncating.");
+				chars -= 1;
+			}
+			std::wstring value(buffer, chars);
+			LogQueries("d", xmlName + L" - Retrieved string value from registry: " + value);
+			return value;
 		}
 		else {
 			LogQueries("d", xmlName + L" - Failed to retrieve string value from registry. Attempting to read as XML.");
 		}
 	}
 
-	CComPtr<IStream> pFileStream;
-	HRESULT hr = SHCreateStreamOnFileEx(settingsname.c_str(), STGM_READ, FILE_ATTRIBUTE_NORMAL, FALSE, nullptr, &pFileStream);
-	if (FAILED(hr)) {
-		LogQueries("d", xmlName + L" - Failed to create file stream for XML settings.");
-		return L""; 
+	std::wstring xmlValue;
+	if (!ReadSettingFromXml(xmlName, xmlValue)) {
+		LogQueries("d", xmlName + L" - not present in XML.");
+		return L"";
 	}
 
-	CComPtr<IXmlReader> pReader;
-	hr = CreateXmlReader(__uuidof(IXmlReader), (void**)&pReader, nullptr);
-	if (FAILED(hr)) {
-		LogQueries("d", xmlName + L" - Failed to create XML reader.");
-		return L""; 
-	}
-
-	hr = pReader->SetInput(pFileStream);
-	if (FAILED(hr)) {
-		LogQueries("d", xmlName + L" - Failed to set input for XML reader.");
-		return L"";  
-	}
-
-	XmlNodeType nodeType;
-	const wchar_t* pwszLocalName;
-	std::wstring xmlLoggingValue = L"";  
-
-	while (S_OK == pReader->Read(&nodeType)) {
-		if (nodeType == XmlNodeType_Element) {
-			pReader->GetLocalName(&pwszLocalName, nullptr);
-			if (pwszLocalName && wcscmp(pwszLocalName, xmlName.c_str()) == 0) {
-				pReader->Read(&nodeType);
-				if (nodeType == XmlNodeType_Text) {
-					const wchar_t* pwszValue;
-					pReader->GetValue(&pwszValue, nullptr);
-					if (pwszValue) {
-						xmlLoggingValue = pwszValue;
-					}
-					LogQueries("i", xmlName + L" - Retrieved from XML: " + xmlLoggingValue);
-					break;
-				}
-			}
-		}
-	}
-
-	return xmlLoggingValue;  
+	LogQueries("i", xmlName + L" - Retrieved from XML: " + xmlValue);
+	return xmlValue;
 }
 
 double GetDoubleSetting(const std::wstring& settingKey) {
@@ -777,18 +855,41 @@ double GetDoubleSetting(const std::wstring& settingKey) {
 	std::wstring regName = it->second.first;
 	std::wstring xmlName = it->second.second;
 
-	std::wstring settingsname = confpath + L"\\vdd_settings.xml";
 	HKEY hKey;
-	DWORD dwBufferSize = MAX_PATH;
+	DWORD dwBufferSize = MAX_PATH * sizeof(wchar_t);
 	wchar_t buffer[MAX_PATH];
 
+	DWORD dwType = 0;
 	LONG lResult = RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\MikeTheTech\\VirtualDisplayDriver", 0, KEY_READ, &hKey);
 	if (lResult == ERROR_SUCCESS) {
-		lResult = RegQueryValueExW(hKey, regName.c_str(), NULL, NULL, (LPBYTE)buffer, &dwBufferSize);
+		lResult = RegQueryValueExW(hKey, regName.c_str(), NULL, &dwType, (LPBYTE)buffer, &dwBufferSize);
 		if (lResult == ERROR_SUCCESS) {
 			RegCloseKey(hKey);
 			try {
-				double regValue = std::stod(buffer);
+				double regValue = 0.0;
+				if (dwType == REG_DWORD) {
+					// REG_DWORD is 4 raw bytes with no NUL terminator. Passing that buffer
+					// straight to stod() read past the value into uninitialised stack memory.
+					if (dwBufferSize < sizeof(DWORD)) {
+						throw std::out_of_range("REG_DWORD too small");
+					}
+					DWORD dwordValue = 0;
+					memcpy(&dwordValue, buffer, sizeof(DWORD));
+					regValue = static_cast<double>(dwordValue);
+				}
+				else if (dwType == REG_SZ || dwType == REG_EXPAND_SZ) {
+					// Force the terminator: a malformed REG_SZ is not guaranteed to have one.
+					if (dwBufferSize >= sizeof(wchar_t)) {
+						buffer[dwBufferSize / sizeof(wchar_t) - 1] = L'\0';
+						regValue = std::stod(buffer);
+					}
+					else {
+						throw std::out_of_range("REG_SZ too small");
+					}
+				}
+				else {
+					throw std::out_of_range("unsupported registry value type");
+				}
 				LogQueries("d", xmlName + L" - Retrieved from registry: " + std::to_wstring(regValue));
 				return regValue;
 			}
@@ -801,51 +902,19 @@ double GetDoubleSetting(const std::wstring& settingKey) {
 		}
 	}
 
-	CComPtr<IStream> pFileStream;
-	HRESULT hr = SHCreateStreamOnFileEx(settingsname.c_str(), STGM_READ, FILE_ATTRIBUTE_NORMAL, FALSE, nullptr, &pFileStream);
-	if (FAILED(hr)) {
-		LogQueries("d", xmlName + L" - Failed to create file stream for XML settings.");
+	std::wstring xmlValue;
+	if (!ReadSettingFromXml(xmlName, xmlValue)) {
+		LogQueries("d", xmlName + L" - not present in XML.");
 		return 0.0;
 	}
 
-	CComPtr<IXmlReader> pReader;
-	hr = CreateXmlReader(__uuidof(IXmlReader), (void**)&pReader, nullptr);
-	if (FAILED(hr)) {
-		LogQueries("d", xmlName + L" - Failed to create XML reader.");
-		return 0.0;
-	}
-
-	hr = pReader->SetInput(pFileStream);
-	if (FAILED(hr)) {
-		LogQueries("d", xmlName + L" - Failed to set input for XML reader.");
-		return 0.0;
-	}
-
-	XmlNodeType nodeType;
-	const wchar_t* pwszLocalName;
 	double xmlLoggingValue = 0.0;
-
-	while (S_OK == pReader->Read(&nodeType)) {
-		if (nodeType == XmlNodeType_Element) {
-			pReader->GetLocalName(&pwszLocalName, nullptr);
-			if (pwszLocalName && wcscmp(pwszLocalName, xmlName.c_str()) == 0) {
-				pReader->Read(&nodeType);
-				if (nodeType == XmlNodeType_Text) {
-					const wchar_t* pwszValue;
-					pReader->GetValue(&pwszValue, nullptr);
-					if (pwszValue) {
-						try {
-							xmlLoggingValue = std::stod(pwszValue);
-							LogQueries("i", xmlName + L" - Retrieved from XML: " + std::to_wstring(xmlLoggingValue));
-						}
-						catch (const std::exception&) {
-							LogQueries("d", xmlName + L" - Failed to convert XML value to double.");
-						}
-					}
-					break;
-				}
-			}
-		}
+	try {
+		xmlLoggingValue = std::stod(xmlValue);
+		LogQueries("i", xmlName + L" - Retrieved from XML: " + std::to_wstring(xmlLoggingValue));
+	}
+	catch (const std::exception&) {
+		LogQueries("d", xmlName + L" - Failed to convert XML value to double.");
 	}
 
 	return xmlLoggingValue;
