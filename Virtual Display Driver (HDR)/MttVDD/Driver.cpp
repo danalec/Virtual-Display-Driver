@@ -323,13 +323,20 @@ int maxContentLightLevel = 1000;
 int maxFrameAvgLightLevel = 400;
 
 bool colorPrimariesEnabled = false;
-double redX = 0.708, redY = 0.292;
-double greenX = 0.170, greenY = 0.797;
-double blueX = 0.131, blueY = 0.046;
+// Rec.709 / sRGB, matching vdd_settings.xml's <color_primaries>, which annotates exactly these
+// numbers "sRGB color space (safe defaults)". These used to be BT.2020 (0.708/0.292,
+// 0.170/0.797, 0.131/0.046), so the no-settings-file path answered a different colour gamut
+// than the shipped one -- the same class as the gammaCorrection, forceBitDepth, hardwareCursor
+// and maxResolutionWidth drifts, and the only one of the five still standing.
+double redX = 0.640, redY = 0.330;
+double greenX = 0.300, greenY = 0.600;
+double blueX = 0.150, blueY = 0.060;
 double whiteX = 0.3127, whiteY = 0.3290;
 
 bool colorSpaceEnabled = false;
-double gammaCorrection = 2.4;
+// 2.2, not 2.4: this is the value vdd_settings.xml ships, and the XML always wins at
+// runtime, so a default of 2.4 only ever showed up when the XML was missing.
+double gammaCorrection = 2.2;
 wstring primaryColorSpace = L"sRGB";
 bool enableMatrixTransform = false;
 
@@ -341,7 +348,9 @@ int maxRefreshRate = 240;
 bool excludeFractionalRates = false;
 int minResolutionWidth = 640;
 int minResolutionHeight = 480;
-int maxResolutionWidth = 7680;
+// 10240, not 7680: option.txt ships 10240x4320 and 8640 modes, and the bound is the ceiling
+// for every reported mode. A ceiling the shipped mode list violates is not a ceiling.
+int maxResolutionWidth = 10240;
 int maxResolutionHeight = 4320;
 bool useEdidPreferred = false;
 int fallbackWidth = 1920;
@@ -349,22 +358,19 @@ int fallbackHeight = 1080;
 int fallbackRefresh = 60;
 
 // === COLOR ADVANCED SETTINGS ===
+// fp16_surface_support, wide_color_gamut, hdr_tone_mapping and sdr_white_level used to be
+// parsed here and then never read, so a value in vdd_settings.xml silently did nothing.
+// They are gone from the parser, the alias map and the XML; see the "REMOVED SECTIONS"
+// note at the end of vdd_settings.xml. The monitor_emulation block (enabled,
+// emulate_physical_dimensions, physical_width_mm, physical_height_mm,
+// manufacturer_emulation/enabled, manufacturer_name, model_name, serial_number) went the
+// same way: the driver reports hardcoded endpoint diagnostics instead.
 bool autoSelectFromColorSpace = false;
-wstring forceBitDepth = L"auto";
-bool fp16SurfaceSupport = true;
-bool wideColorGamut = false;
-bool hdrToneMapping = false;
-double sdrWhiteLevel = 80.0;
-
-// === MONITOR EMULATION SETTINGS ===
-bool monitorEmulationEnabled = false;
-bool emulatePhysicalDimensions = false;
-int physicalWidthMm = 510;
-int physicalHeightMm = 287;
-bool manufacturerEmulationEnabled = false;
-wstring manufacturerName = L"Generic";
-wstring modelName = L"Virtual Display";
-wstring serialNumber = L"VDD001";
+// "8", not "auto": vdd_settings.xml ships 8 and README.md documents 8-bit as the shipped
+// default, so the path with no settings file has to behave like the shipped configuration.
+// DriverEntry reads this over unconditionally and used to leave an empty string behind on
+// path, which then failed the "must be 8, 10, 12 or auto" check and logged an error every boot.
+wstring forceBitDepth = L"8";
 
 std::map<std::wstring, std::pair<std::wstring, std::wstring>> SettingsQueryMap = {
 	{L"LoggingEnabled", {L"LOGS", L"logging"}},
@@ -390,7 +396,7 @@ std::map<std::wstring, std::pair<std::wstring, std::wstring>> SettingsQueryMap =
 	//Colour End
 	
 	//EDID Integration Begin
-	{L"EdidIntegrationEnabled", {L"EDIDINTEGRATION", L"enabled"}},
+	{L"EdidIntegrationEnabled", {L"EDIDINTEGRATION", L"edid_integration/enabled"}},
 	{L"AutoConfigureFromEdid", {L"AUTOCONFIGFROMEDID", L"auto_configure_from_edid"}},
 	{L"EdidProfilePath", {L"EDIDPROFILEPATH", L"edid_profile_path"}},
 	{L"OverrideManualSettings", {L"OVERRIDEMANUALSETTINGS", L"override_manual_settings"}},
@@ -398,12 +404,12 @@ std::map<std::wstring, std::pair<std::wstring, std::wstring>> SettingsQueryMap =
 	//EDID Integration End
 	
 	//HDR Advanced Begin
-	{L"Hdr10StaticMetadataEnabled", {L"HDR10STATICMETADATA", L"enabled"}},
+	{L"Hdr10StaticMetadataEnabled", {L"HDR10STATICMETADATA", L"hdr10_static_metadata/enabled"}},
 	{L"MaxDisplayMasteringLuminance", {L"MAXLUMINANCE", L"max_display_mastering_luminance"}},
 	{L"MinDisplayMasteringLuminance", {L"MINLUMINANCE", L"min_display_mastering_luminance"}},
 	{L"MaxContentLightLevel", {L"MAXCONTENTLIGHT", L"max_content_light_level"}},
 	{L"MaxFrameAvgLightLevel", {L"MAXFRAMEAVGLIGHT", L"max_frame_avg_light_level"}},
-	{L"ColorPrimariesEnabled", {L"COLORPRIMARIES", L"enabled"}},
+	{L"ColorPrimariesEnabled", {L"COLORPRIMARIES", L"color_primaries/enabled"}},
 	{L"RedX", {L"REDX", L"red_x"}},
 	{L"RedY", {L"REDY", L"red_y"}},
 	{L"GreenX", {L"GREENX", L"green_x"}},
@@ -412,14 +418,14 @@ std::map<std::wstring, std::pair<std::wstring, std::wstring>> SettingsQueryMap =
 	{L"BlueY", {L"BLUEY", L"blue_y"}},
 	{L"WhiteX", {L"WHITEX", L"white_x"}},
 	{L"WhiteY", {L"WHITEY", L"white_y"}},
-	{L"ColorSpaceEnabled", {L"COLORSPACE", L"enabled"}},
+	{L"ColorSpaceEnabled", {L"COLORSPACE", L"color_space/enabled"}},
 	{L"GammaCorrection", {L"GAMMA", L"gamma_correction"}},
 	{L"PrimaryColorSpace", {L"PRIMARYCOLORSPACE", L"primary_color_space"}},
 	{L"EnableMatrixTransform", {L"MATRIXTRANSFORM", L"enable_matrix_transform"}},
 	//HDR Advanced End
 	
 	//Auto Resolutions Begin
-	{L"AutoResolutionsEnabled", {L"AUTORESOLUTIONS", L"enabled"}},
+	{L"AutoResolutionsEnabled", {L"AUTORESOLUTIONS", L"auto_resolutions/enabled"}},
 	{L"SourcePriority", {L"SOURCEPRIORITY", L"source_priority"}},
 	{L"MinRefreshRate", {L"MINREFRESHRATE", L"min_refresh_rate"}},
 	{L"MaxRefreshRate", {L"MAXREFRESHRATE", L"max_refresh_rate"}},
@@ -437,22 +443,9 @@ std::map<std::wstring, std::pair<std::wstring, std::wstring>> SettingsQueryMap =
 	//Color Advanced Begin
 	{L"AutoSelectFromColorSpace", {L"AUTOSELECTCOLOR", L"auto_select_from_color_space"}},
 	{L"ForceBitDepth", {L"FORCEBITDEPTH", L"force_bit_depth"}},
-	{L"Fp16SurfaceSupport", {L"FP16SUPPORT", L"fp16_surface_support"}},
-	{L"WideColorGamut", {L"WIDECOLORGAMUT", L"wide_color_gamut"}},
-	{L"HdrToneMapping", {L"HDRTONEMAPPING", L"hdr_tone_mapping"}},
-	{L"SdrWhiteLevel", {L"SDRWHITELEVEL", L"sdr_white_level"}},
 	//Color Advanced End
-	
-	//Monitor Emulation Begin
-	{L"MonitorEmulationEnabled", {L"MONITOREMULATION", L"enabled"}},
-	{L"EmulatePhysicalDimensions", {L"EMULATEPHYSICAL", L"emulate_physical_dimensions"}},
-	{L"PhysicalWidthMm", {L"PHYSICALWIDTH", L"physical_width_mm"}},
-	{L"PhysicalHeightMm", {L"PHYSICALHEIGHT", L"physical_height_mm"}},
-	{L"ManufacturerEmulationEnabled", {L"MANUFACTUREREMULATION", L"enabled"}},
-	{L"ManufacturerName", {L"MANUFACTURERNAME", L"manufacturer_name"}},
-	{L"ModelName", {L"MODELNAME", L"model_name"}},
-	{L"SerialNumber", {L"SERIALNUMBER", L"serial_number"}},
-	//Monitor Emulation End
+	//Monitor Emulation has no entries: all eight of its settings were removed from the
+	//parser because nothing ever read them.
 };
 
 const char* XorCursorSupportLevelToString(IDDCX_XOR_CURSOR_SUPPORT level) {
@@ -2664,7 +2657,7 @@ extern "C" NTSTATUS DriverEntry(
 	customEdid = EnabledQuery(L"CustomEdidEnabled");
 	preventManufacturerSpoof = EnabledQuery(L"PreventMonitorSpoof");
 	edidCeaOverride = EnabledQuery(L"EdidCeaOverride");
-	sendLogsThroughPipe = EnabledQuery(L"SendLogsThroughPipe");
+	sendLogsThroughPipe = EnabledOr(L"SendLogsThroughPipe", true);
 
 
 	//colour
@@ -2674,11 +2667,26 @@ extern "C" NTSTATUS DriverEntry(
 	SDRCOLOUR = SDR10 ? IDDCX_BITS_PER_COMPONENT_10 : IDDCX_BITS_PER_COMPONENT_8;
 	ColourFormat = GetStringSetting(L"ColourFormat");
 
+	// GetIntegerSetting answers -1 when the key is in neither the registry nor the settings
+	// XML, and DriverEntry reads them before loadSettings() decides which source exists.
+	// -1 is never a harmless sentinel in this file, so every positive integer read goes
+	// through this: it falls back to the compiled default and says so, because an absent key
+	// and a key someone typed as 0 should not look the same in the log.
+	auto positiveOr = [](int value, int fallback, const wchar_t* what) {
+		if (value <= 0) {
+			stringstream ss;
+			ss << WStringToString(what) << " is " << value << ", using the built-in default of " << fallback;
+			vddlog("w", ss.str().c_str());
+			return fallback;
+		}
+		return value;
+	};
+
 	//Cursor
-	hardwareCursor = EnabledQuery(L"HardwareCursorEnabled");
-	alphaCursorSupport = EnabledQuery(L"AlphaCursorSupport");
-	CursorMaxX = GetIntegerSetting(L"CursorMaxX");
-	CursorMaxY = GetIntegerSetting(L"CursorMaxY");
+	hardwareCursor = EnabledOr(L"HardwareCursorEnabled", true);
+	alphaCursorSupport = EnabledOr(L"AlphaCursorSupport", true);
+	CursorMaxX = positiveOr(GetIntegerSetting(L"CursorMaxX"), 128, L"CursorMaxX");
+	CursorMaxY = positiveOr(GetIntegerSetting(L"CursorMaxY"), 128, L"CursorMaxY");
 
 	int xorCursorSupportLevelInt = GetIntegerSetting(L"XorCursorSupportLevel");
 	std::string xorCursorSupportLevelName;
@@ -2696,7 +2704,7 @@ extern "C" NTSTATUS DriverEntry(
 	autoConfigureFromEdid = EnabledQuery(L"AutoConfigureFromEdid");
 	edidProfilePath = GetStringSetting(L"EdidProfilePath");
 	overrideManualSettings = EnabledQuery(L"OverrideManualSettings");
-	fallbackOnError = EnabledQuery(L"FallbackOnError");
+	fallbackOnError = EnabledOr(L"FallbackOnError", true);
 
 	// === LOAD HDR ADVANCED SETTINGS ===
 	hdr10StaticMetadataEnabled = EnabledQuery(L"Hdr10StaticMetadataEnabled");
@@ -2723,35 +2731,61 @@ extern "C" NTSTATUS DriverEntry(
 	// === LOAD AUTO RESOLUTIONS SETTINGS ===
 	autoResolutionsEnabled = EnabledQuery(L"AutoResolutionsEnabled");
 	sourcePriority = GetStringSetting(L"SourcePriority");
-	minRefreshRate = GetIntegerSetting(L"MinRefreshRate");
-	maxRefreshRate = GetIntegerSetting(L"MaxRefreshRate");
+	minRefreshRate = positiveOr(GetIntegerSetting(L"MinRefreshRate"), 24, L"min_refresh_rate");
+	maxRefreshRate = positiveOr(GetIntegerSetting(L"MaxRefreshRate"), 240, L"max_refresh_rate");
 	excludeFractionalRates = EnabledQuery(L"ExcludeFractionalRates");
-	minResolutionWidth = GetIntegerSetting(L"MinResolutionWidth");
-	minResolutionHeight = GetIntegerSetting(L"MinResolutionHeight");
-	maxResolutionWidth = GetIntegerSetting(L"MaxResolutionWidth");
-	maxResolutionHeight = GetIntegerSetting(L"MaxResolutionHeight");
+	minResolutionWidth = positiveOr(GetIntegerSetting(L"MinResolutionWidth"), 640, L"min_resolution_width");
+	minResolutionHeight = positiveOr(GetIntegerSetting(L"MinResolutionHeight"), 480, L"min_resolution_height");
+	maxResolutionWidth = positiveOr(GetIntegerSetting(L"MaxResolutionWidth"), 10240, L"max_resolution_width");
+	maxResolutionHeight = positiveOr(GetIntegerSetting(L"MaxResolutionHeight"), 4320, L"max_resolution_height");
 	useEdidPreferred = EnabledQuery(L"UseEdidPreferred");
-	fallbackWidth = GetIntegerSetting(L"FallbackWidth");
-	fallbackHeight = GetIntegerSetting(L"FallbackHeight");
-	fallbackRefresh = GetIntegerSetting(L"FallbackRefresh");
+	fallbackWidth = positiveOr(GetIntegerSetting(L"FallbackWidth"), 1920, L"fallback_width");
+	fallbackHeight = positiveOr(GetIntegerSetting(L"FallbackHeight"), 1080, L"fallback_height");
+	fallbackRefresh = positiveOr(GetIntegerSetting(L"FallbackRefresh"), 60, L"fallback_refresh");
 
 	// === LOAD COLOR ADVANCED SETTINGS ===
 	autoSelectFromColorSpace = EnabledQuery(L"AutoSelectFromColorSpace");
 	forceBitDepth = GetStringSetting(L"ForceBitDepth");
-	fp16SurfaceSupport = EnabledQuery(L"Fp16SurfaceSupport");
-	wideColorGamut = EnabledQuery(L"WideColorGamut");
-	hdrToneMapping = EnabledQuery(L"HdrToneMapping");
-	sdrWhiteLevel = GetDoubleSetting(L"SdrWhiteLevel");
+	// GetStringSetting answers L"" for a key that is in neither source, and L"" is not "auto",
+	// so the block below took the forced branch, matched no depth, and logged an error on every
+	// boot of the configuration that has no settings file -- while applying nothing.
+	if (forceBitDepth.empty()) {
+		forceBitDepth = L"8";
+	}
 
-	// === LOAD MONITOR EMULATION SETTINGS ===
-	monitorEmulationEnabled = EnabledQuery(L"MonitorEmulationEnabled");
-	emulatePhysicalDimensions = EnabledQuery(L"EmulatePhysicalDimensions");
-	physicalWidthMm = GetIntegerSetting(L"PhysicalWidthMm");
-	physicalHeightMm = GetIntegerSetting(L"PhysicalHeightMm");
-	manufacturerEmulationEnabled = EnabledQuery(L"ManufacturerEmulationEnabled");
-	manufacturerName = GetStringSetting(L"ManufacturerName");
-	modelName = GetStringSetting(L"ModelName");
-	serialNumber = GetStringSetting(L"SerialNumber");
+	// Both of these used to be parsed here and then thrown away: SelectBitDepthFromColorSpace() was
+// defined but had no caller at all, so raising force_bit_depth in vdd_settings.xml changed
+// nothing even though README.md tells users to do exactly that. The call is the "auto" branch
+// below. SDRCOLOUR and HDRCOLOUR are IDDCX_BITS_PER_COMPONENT bit flags that the mode paths OR
+// together, so a forced depth has to land on both of them to actually be advertised. "auto"
+// leaves the HDRPlus/SDR10 logic alone and is what a user switches to for 10- or 12-bit output.
+	if (forceBitDepth != L"auto") {
+		IDDCX_BITS_PER_COMPONENT forced = IDDCX_BITS_PER_COMPONENT_NONE;
+		if (forceBitDepth == L"8") {
+			forced = IDDCX_BITS_PER_COMPONENT_8;
+		}
+		else if (forceBitDepth == L"10") {
+			forced = IDDCX_BITS_PER_COMPONENT_10;
+		}
+		else if (forceBitDepth == L"12") {
+			forced = IDDCX_BITS_PER_COMPONENT_12;
+		}
+
+		if (forced != IDDCX_BITS_PER_COMPONENT_NONE) {
+			SDRCOLOUR = forced;
+			HDRCOLOUR = forced;
+			vddlog("i", ("Forced bit depth: " + WStringToString(forceBitDepth)).c_str());
+		}
+		else {
+			vddlog("e", ("force_bit_depth must be 8, 10, 12 or auto; got: " + WStringToString(forceBitDepth)).c_str());
+		}
+	}
+	else if (autoSelectFromColorSpace) {
+		IDDCX_BITS_PER_COMPONENT picked = SelectBitDepthFromColorSpace(primaryColorSpace);
+		SDRCOLOUR = picked;
+		HDRCOLOUR = picked;
+		vddlog("i", ("Bit depth picked from colour space " + WStringToString(primaryColorSpace)).c_str());
+	}
 
 	xorCursorSupportLevelName = XorCursorSupportLevelToString(XorCursorSupportLevel);
 
