@@ -34,6 +34,7 @@ Environment:
 #include <cstdio>
 #include <sddl.h>
 #include <mutex>
+#include <atomic>
 #include <chrono>
 #include <iomanip>
 #include <cerrno>
@@ -110,13 +111,36 @@ UINT16 ClampToUINT16(int value) {
 	return static_cast<UINT16>(value);
 }
 
+// Whitespace around a number is not part of it. stoi and stod skip the leading
+// whitespace but stop at the first trailing character, so " 0.640 " reads back
+// as a partial number that the whole-value check then rejects -- and a value the
+// user merely spaced out falls back to the default without saying why. The
+// strict check stays on the content itself.
+inline bool IsNumberSpace(wchar_t c) { return c == L' ' || c == L'\t' || c == L'\r' || c == L'\n'; }
+inline bool IsNumberSpace(char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; }
+inline std::wstring TrimNumberText(const std::wstring& text) {
+	size_t first = 0;
+	size_t last = text.size();
+	while (first < last && IsNumberSpace(text[first])) { first++; }
+	while (last > first && IsNumberSpace(text[last - 1])) { last--; }
+	return text.substr(first, last - first);
+}
+inline std::string TrimNumberText(const std::string& text) {
+	size_t first = 0;
+	size_t last = text.size();
+	while (first < last && IsNumberSpace(text[first])) { first++; }
+	while (last > first && IsNumberSpace(text[last - 1])) { last--; }
+	return text.substr(first, last - first);
+}
+
 // vdd_settings.xml and monitor_profile.xml are wstring, option.txt is std::string.
 template <typename T>
 int ParseIntSafe(const T& text, int fallback, const wchar_t* what) {
 	try {
+		const T trimmed = TrimNumberText(text);
 		size_t consumed = 0;
-		int value = stoi(text, &consumed);
-		if (consumed != text.size()) {
+		int value = stoi(trimmed, &consumed);
+		if (consumed != trimmed.size()) {
 			stringstream ss;
 			ss << "Trailing garbage in " << WStringToString(what) << ", using fallback";
 			vddlog("e", ss.str().c_str());
@@ -135,9 +159,10 @@ int ParseIntSafe(const T& text, int fallback, const wchar_t* what) {
 template <typename T>
 float ParseFloatSafe(const T& text, float fallback, const wchar_t* what) {
 	try {
+		const T trimmed = TrimNumberText(text);
 		size_t consumed = 0;
-		float value = stof(text, &consumed);
-		if (consumed != text.size()) {
+		float value = stof(trimmed, &consumed);
+		if (consumed != trimmed.size()) {
 			stringstream ss;
 			ss << "Trailing garbage in " << WStringToString(what) << ", using fallback";
 			vddlog("e", ss.str().c_str());
@@ -160,9 +185,10 @@ float ParseFloatSafe(const T& text, float fallback, const wchar_t* what) {
 template <typename T>
 double ParseDoubleSafe(const T& text, double fallback, const wchar_t* what) {
 	try {
+		const T trimmed = TrimNumberText(text);
 		size_t consumed = 0;
-		double value = stod(text, &consumed);
-		if (consumed != text.size()) {
+		double value = stod(trimmed, &consumed);
+		if (consumed != trimmed.size()) {
 			stringstream ss;
 			ss << "Trailing garbage in " << WStringToString(what) << ", using fallback";
 			vddlog("e", ss.str().c_str());
@@ -662,8 +688,11 @@ bool ResolveEnabledSetting(const std::wstring& settingKey, bool& present) {
 			if (lResult == ERROR_SUCCESS && dwBufferSize > 0 && dwBufferSize <= sizeof(path)
 				&& (dwStringType == REG_SZ || dwStringType == REG_EXPAND_SZ)) {
 				size_t chars = dwBufferSize / sizeof(wchar_t);
-				if (chars > 0 && path[chars - 1] != L'\0') {
-					LogQueries("d", xmlName + L" - Registry string was not NUL terminated, truncating.");
+				// The terminator is counted in dwBufferSize, so it has to come off before
+				// the string is built. Keeping it puts a NUL inside the string, and the
+				// comparison below then never matches. A value written without a terminator
+				// keeps every character it has.
+				if (chars > 0 && path[chars - 1] == L'\0') {
 					chars -= 1;
 				}
 				std::wstring logValue(path, chars);
@@ -765,8 +794,10 @@ int GetIntegerSetting(const std::wstring& settingKey) {
 			if (lResult == ERROR_SUCCESS && dwBufferSize > 0 && dwBufferSize <= sizeof(path)
 				&& (dwStringType == REG_SZ || dwStringType == REG_EXPAND_SZ)) {
 				size_t chars = dwBufferSize / sizeof(wchar_t);
-				if (chars > 0 && path[chars - 1] != L'\0') {
-					LogQueries("d", xmlName + L" - Registry string was not NUL terminated, truncating.");
+				// The terminator is counted in dwBufferSize, so it has to come off before
+				// the string is built. Keeping it makes the value "480\0", and the
+				// whole-value check below then rejects a number that was perfectly fine.
+				if (chars > 0 && path[chars - 1] == L'\0') {
 					chars -= 1;
 				}
 				// stoi accepts a valid prefix and stops there: "80abc" and "80.5" both
@@ -829,8 +860,10 @@ std::wstring GetStringSetting(const std::wstring& settingKey) {
 		if (lResult == ERROR_SUCCESS && dwBufferSize > 0 && dwBufferSize <= MAX_PATH * sizeof(wchar_t)
 			&& (dwType == REG_SZ || dwType == REG_EXPAND_SZ)) {
 			size_t chars = dwBufferSize / sizeof(wchar_t);
-			if (buffer[chars - 1] != L'\0') {
-				LogQueries("d", xmlName + L" - Registry string was not NUL terminated, truncating.");
+			// The terminator is counted in dwBufferSize, so it has to come off before
+			// the string is built. Keeping it puts a NUL at the end of the value, and
+			// every comparison against it then fails.
+			if (chars > 0 && buffer[chars - 1] == L'\0') {
 				chars -= 1;
 			}
 			std::wstring value(buffer, chars);
@@ -885,14 +918,21 @@ double GetDoubleSetting(const std::wstring& settingKey) {
 					regValue = static_cast<double>(dwordValue);
 				}
 				else if (dwType == REG_SZ || dwType == REG_EXPAND_SZ) {
-					// Force the terminator: a malformed REG_SZ is not guaranteed to have one.
+					// Build the string from the length the registry reported: the
+					// terminator is counted in dwBufferSize, and a malformed REG_SZ
+					// is not guaranteed to have one. Forcing a NUL over the last
+					// character instead would eat that character when the value was
+					// written without a terminator.
 					if (dwBufferSize >= sizeof(wchar_t)) {
-						buffer[dwBufferSize / sizeof(wchar_t) - 1] = L'\0';
+						size_t chars = dwBufferSize / sizeof(wchar_t);
+						if (chars > 0 && buffer[chars - 1] == L'\0') {
+							chars -= 1;
+						}
 						// stod has the same prefix problem as stoi -- "2.2abc" comes
 						// back as 2.2 -- and this value ends up in the colour primaries,
 						// where a half-read number is a colour that is subtly wrong
 						// rather than one that is obviously wrong.
-						regValue = ParseDoubleSafe(std::wstring(buffer), 0.0, xmlName.c_str());
+						regValue = ParseDoubleSafe(std::wstring(buffer, chars), 0.0, xmlName.c_str());
 					}
 					else {
 						throw std::out_of_range("REG_SZ too small");
@@ -1574,6 +1614,22 @@ bool LoadEdidProfile(const wstring& profilePath, EdidProfileData& profile) {
 			// element of every section was read and the rest were skipped -- the
 			// profile yielded zero modes instead of 26, and no luminance, no
 			// chromaticity, no gamma and the default preferred mode.
+			//
+			// The reader does name the element that is closing, so the section can be
+			// closed here as well -- by name, so that the EndElement of a child
+			// element (</Width>, </Height>) does not end the section it is in.
+			// Leaving the section open made every element that came after
+			// </MonitorModes> count as part of MonitorModes, and a hand-edited
+			// profile with a stray element in it produced a mode built from
+			// whatever the last real mode left behind.
+			hr = pReader->GetLocalName(&pwszLocalName, &cwchLocalName);
+			if (SUCCEEDED(hr) && pwszLocalName != nullptr) {
+				const wstring closing = wstring(pwszLocalName, cwchLocalName);
+				if (closing == L"MonitorModes" || closing == L"HDRCapabilities" ||
+					closing == L"ColorProfile" || closing == L"PreferredMode") {
+					currentSection.clear();
+				}
+			}
 			currentElement.clear();
 			break;
 
@@ -1917,8 +1973,9 @@ void CloseLogFile() {
 }
 
 // Set inside WriteLogLine while g_LogFileMutex is held, read by vddlog() once that
-// lock has been released.
-static bool g_LogDirFailed = false;
+// lock has been released. Atomic because the two sides are not under the same
+// lock: a plain bool read and cleared from another thread is a data race.
+static std::atomic<bool> g_LogDirFailed(false);
 
 void WriteLogLine(const wstring& logPath, const string& line) {
 	lock_guard<mutex> lock(g_LogFileMutex);
@@ -2034,18 +2091,19 @@ void vddlog(const char* type, const char* message) {
 
 	WriteLogLine(logPath, logMessage);
 
-	// The log directory could not be created. WriteLogLine cannot report it: it holds
-	// g_LogFileMutex, and vddlog() from inside it re-enters the same non-recursive
-	// mutex and deadlocks. This is outside the lock, and it goes to the pipe only,
-	// because the file is exactly what could not be opened.
-	if (g_LogDirFailed) {
-		g_LogDirFailed = false;
-		SendToPipe("[d] The log directory could not be created; no log file was written\n");
-	}
-
 	// No unlocked peek at g_pipeHandle here: SendToPipe() takes the pipe lock and checks it.
 	if (sendLogsThroughPipe) {
 		SendToPipe(logMessage);
+	}
+
+	// The log directory could not be created. WriteLogLine cannot report it: it holds
+	// g_LogFileMutex, and vddlog() from inside it re-enters the same non-recursive
+	// mutex and deadlocks. This is outside the lock, and it goes to the pipe only,
+	// because the file is exactly what could not be opened. It comes after the
+	// line itself, so the stream reads in the order the events happened.
+	if (g_LogDirFailed) {
+		g_LogDirFailed = false;
+		SendToPipe("[d] The log directory could not be created; no log file was written\n");
 	}
 }
 
@@ -3133,7 +3191,11 @@ bool initpath() {
 		}
 		else {
 			size_t chars = dwBufferSize / sizeof(wchar_t);
-			if (chars > 0 && szPath[chars - 1] != L'\0') {
+			// RegQueryValueExW counts the terminator in dwBufferSize, so a well-formed
+			// REG_SZ arrives with a NUL as its last character. Keeping it puts a NUL
+			// inside the string, and every path built from it stops there: the log file
+			// path becomes the log directory, and no log file is ever opened.
+			if (chars > 0 && szPath[chars - 1] == L'\0') {
 				chars -= 1;
 			}
 			confpath = std::wstring(szPath, chars);
@@ -6048,6 +6110,12 @@ NTSTATUS ValidateAndSanitizeConfiguration()
 	// limits that are now in force.
 	{
 		const size_t before = monitorModes.size();
+		// Keep a copy of the list as it was. The limits can exclude every
+		// configured mode -- a range sitting between two resolutions does
+		// exactly that -- and an empty mode list is a driver failure:
+		// ValidateModeList refuses one on purpose, and every other producer
+		// of this list falls back when it comes out empty. This one did not.
+		const auto configuredModes = monitorModes;
 		monitorModes.erase(
 			std::remove_if(monitorModes.begin(), monitorModes.end(),
 				[&](const std::tuple<int, int, int, int>& mode) {
@@ -6056,7 +6124,14 @@ NTSTATUS ValidateAndSanitizeConfiguration()
 					return w < minWidth || w > maxWidth || h < minHeight || h > maxHeight;
 				}),
 			monitorModes.end());
-		if (monitorModes.size() != before) {
+		if (monitorModes.empty() && !configuredModes.empty()) {
+			monitorModes = configuredModes;
+			stringstream ss;
+			ss << "The resolution limits exclude every configured mode; keeping the "
+			   << configuredModes.size() << " modes the configuration asked for";
+			vddlog("w", ss.str().c_str());
+		}
+		else if (monitorModes.size() != before) {
 			stringstream ss;
 			ss << "The mode list was rebuilt against the corrected resolution limits: "
 			   << before << " -> " << monitorModes.size() << " modes";
