@@ -1,23 +1,27 @@
 <?xml version="1.0" encoding="UTF-8"?>
+<!--
+    Verified against the upstream repository on 2026-10-16.
+
+    This file used to advertise three builds: 25.7.22 as stable and 25.8.14 as alpha.
+    Neither tag exists upstream, and both download URLs return HTTP 404, so every visitor
+    was sent to a dead link.
+
+    What actually resolves:
+      - GET /releases lists only 24.10.16-beta and 24.10.27, both prereleases.
+      - 25.7.23 exists and is reachable by tag, with prerelease=false, but is not in that
+        listing. Its assets are VDD.Control.25.7.23.zip, VirtualDisplayDriver-x86.Driver.Only.zip,
+        VirtualDisplayDriver-ARM64.Driver.Only.zip and VirtualAudioDriver-x86.Driver.Only.zip.
+
+    So there is exactly one resolvable Virtual Driver Control build, and it is listed here
+    under <release>. Calling it stable is a judgement this file cannot make on the
+    maintainer's behalf: upstream marks no non-prerelease release. If a channel marker is
+    wanted back, restore <beta>/<alpha> and give each a build that exists.
+-->
 <versions>
     <release>
         <name>Virtual Driver Control</name>
-        <build>25.7.22</build>
-        <link>https://github.com/yourusername/yourrepo/releases/download/v25.7.22/VirtualDriverControl-25.7.22.zip</link>
-        <description>Stable release with signed drivers and core functionality</description>
-    </release>
-    
-    <beta>
-        <name>Virtual Driver Control</name>
         <build>25.7.23</build>
-        <link>https://github.com/VirtualDrivers/Virtual-Display-Driver/releases/tag/25.7.23</link>
-        <description>Installer-less portable app with Install/Uninstall support, RELOAD_DRIVER functionality, officially signed drivers, and alpha XML Editor feature. Fixed Win 10 installation and RESTART_DRIVER issues.</description>
-    </beta>
-    
-    <alpha>
-        <name>Virtual Driver Control</name>
-        <build>25.8.14</build>
-        <link>https://github.com/yourusername/yourrepo/releases/download/v25.7.24/VirtualDriverControl-25.7.24.zip</link>
-        <description>Development build with experimental features - for testing only</description>
-    </alpha>
+        <link>https://github.com/VirtualDrivers/Virtual-Display-Driver/releases/download/25.7.23/VDD.Control.25.7.23.zip</link>
+        <description>The only Virtual Driver Control build upstream currently resolves. Portable, no installer, supports Install/Uninstall and RELOAD_DRIVER over the driver pipe. Upstream marks no non-prerelease release, so treat "stable" here as "newest that exists", not as a maintainer designation.</description>
+    </release>
 </versions>

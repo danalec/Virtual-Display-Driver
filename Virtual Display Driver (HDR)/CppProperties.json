@@ -6,16 +6,99 @@
       ],
       "name": "x64-Debug",
       "includePath": [
-        "${env.INCLUDE}",
-        "${workspaceRoot}\\**"
+        "C:\\Program Files (x86)\\Windows Kits\\10\\Include\\${env.WindowsSdkVersion}\\um\\iddcx\\1.10",
+        "C:\\Program Files (x86)\\Windows Kits\\10\\Include\\wdf\\umdf\\2.25",
+        "${workspaceRoot}\\..\\Common\\Include",
+        "${workspaceRoot}\\**",
+        "${env.INCLUDE}"
       ],
       "defines": [
         "WIN32",
         "_DEBUG",
         "UNICODE",
-        "_UNICODE"
+        "_UNICODE",
+        "UMDF_DRIVER",
+        "_ATL_NO_WIN_SUPPORT",
+        "IDDCX_VERSION_MAJOR=1",
+        "IDDCX_VERSION_MINOR=10",
+        "IDDCX_MINIMUM_VERSION_REQUIRED=3"
       ],
       "intelliSenseMode": "windows-msvc-x64"
+    },
+    {
+      "inheritEnvironments": [
+        "msvc_x64"
+      ],
+      "name": "x64-Release",
+      "includePath": [
+        "C:\\Program Files (x86)\\Windows Kits\\10\\Include\\${env.WindowsSdkVersion}\\um\\iddcx\\1.10",
+        "C:\\Program Files (x86)\\Windows Kits\\10\\Include\\wdf\\umdf\\2.25",
+        "${workspaceRoot}\\..\\Common\\Include",
+        "${workspaceRoot}\\**",
+        "${env.INCLUDE}"
+      ],
+      "defines": [
+        "WIN32",
+        "NDEBUG",
+        "UNICODE",
+        "_UNICODE",
+        "UMDF_DRIVER",
+        "_ATL_NO_WIN_SUPPORT",
+        "IDDCX_VERSION_MAJOR=1",
+        "IDDCX_VERSION_MINOR=10",
+        "IDDCX_MINIMUM_VERSION_REQUIRED=3"
+      ],
+      "intelliSenseMode": "windows-msvc-x64"
+    },
+    {
+      "inheritEnvironments": [
+        "msvc_arm64"
+      ],
+      "name": "ARM64-Debug",
+      "includePath": [
+        "C:\\Program Files (x86)\\Windows Kits\\10\\Include\\${env.WindowsSdkVersion}\\um\\iddcx\\1.10",
+        "C:\\Program Files (x86)\\Windows Kits\\10\\Include\\wdf\\umdf\\2.25",
+        "${workspaceRoot}\\..\\Common\\Include",
+        "${workspaceRoot}\\**",
+        "${env.INCLUDE}"
+      ],
+      "defines": [
+        "WIN32",
+        "_DEBUG",
+        "UNICODE",
+        "_UNICODE",
+        "UMDF_DRIVER",
+        "_ATL_NO_WIN_SUPPORT",
+        "IDDCX_VERSION_MAJOR=1",
+        "IDDCX_VERSION_MINOR=10",
+        "IDDCX_MINIMUM_VERSION_REQUIRED=3"
+      ],
+      "intelliSenseMode": "windows-msvc-arm64"
+    },
+    {
+      "inheritEnvironments": [
+        "msvc_arm64"
+      ],
+      "name": "ARM64-Release",
+      "includePath": [
+        "C:\\Program Files (x86)\\Windows Kits\\10\\Include\\${env.WindowsSdkVersion}\\um\\iddcx\\1.10",
+        "C:\\Program Files (x86)\\Windows Kits\\10\\Include\\wdf\\umdf\\2.25",
+        "${workspaceRoot}\\..\\Common\\Include",
+        "${workspaceRoot}\\**",
+        "${env.INCLUDE}"
+      ],
+      "defines": [
+        "WIN32",
+        "NDEBUG",
+        "UNICODE",
+        "_UNICODE",
+        "UMDF_DRIVER",
+        "_ATL_NO_WIN_SUPPORT",
+        "IDDCX_VERSION_MAJOR=1",
+        "IDDCX_VERSION_MINOR=10",
+        "IDDCX_MINIMUM_VERSION_REQUIRED=3"
+      ],
+      "intelliSenseMode": "windows-msvc-arm64"
     }
   ]
 }
