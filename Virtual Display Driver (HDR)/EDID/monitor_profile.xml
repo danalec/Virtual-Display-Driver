@@ -192,7 +192,7 @@
     <MinLuminance>0.0034</MinLuminance>
   </HDRCapabilities>
   <ColorProfile>
-    <PrimaryColorSpace>Rec709</PrimaryColorSpace>
+    <PrimaryColorSpace>sRGB</PrimaryColorSpace>
     <Gamma>2.200</Gamma>
     <Chromaticity>
       <RedX>0.6250</RedX>

@@ -1197,11 +1197,17 @@ public:
         
         std::string colorspace_name;
         switch (color_profile.primary_colorspace) {
+            // These are the names the driver reads. Driver.cpp's ConvertGammaToMatrix
+            // compares the profile's PrimaryColorSpace against exactly these four
+            // strings, and the profile wrote "Rec709", "Rec2020" and "Adobe RGB",
+            // which match none of them: a profile for a Rec.2020 display was applied
+            // with the sRGB matrix. Rec.709 and sRGB share that matrix, so both are
+            // written as sRGB.
             case ColorProfile::sRGB: colorspace_name = "sRGB"; break;
-            case ColorProfile::Rec709: colorspace_name = "Rec709"; break;
-            case ColorProfile::Rec2020: colorspace_name = "Rec2020"; break;
+            case ColorProfile::Rec709: colorspace_name = "sRGB"; break;
+            case ColorProfile::Rec2020: colorspace_name = "Rec.2020"; break;
             case ColorProfile::DCI_P3: colorspace_name = "DCI-P3"; break;
-            case ColorProfile::Adobe_RGB: colorspace_name = "Adobe RGB"; break;
+            case ColorProfile::Adobe_RGB: colorspace_name = "Adobe_RGB"; break;
             default: colorspace_name = "Unknown"; break;
         }
         
