@@ -579,7 +579,7 @@ void ReportUnusedSettings(const vector<wstring>& leafPaths) {
 	}
 	// The names the separate mode-list pass in loadSettings() reads. That pass
 	// walks the whole file, so every one of its elements is read -- the file
-	// has four <g_refresh_rate> and three <width> and they are all used.
+	// has six <g_refresh_rate> and three <width> and they are all used.
 	set<wstring> passNames;
 	passNames.insert(L"count");
 	passNames.insert(L"friendlyname");
@@ -650,7 +650,7 @@ static void BuildSettingsCacheLocked() {
 	const wchar_t* pwszValue = nullptr;
 	vector<wstring> path;
 	// Every leaf the file has, in document order. The cache itself is a map, so
-	// the four <g_refresh_rate> elements and the three <resolution> blocks collapse
+	// the six <g_refresh_rate> elements and the three <resolution> blocks collapse
 	// into one entry each; the list keeps what the file says, which is what the
 	// unused-key report needs.
 	vector<wstring> leafPaths;
