@@ -65,4 +65,4 @@ $disp = Get-VddDisplay
 
 # Setting the rotation on the correct display.
 Set-DisplayRotation -DisplayId $disp.DisplayId -Rotation $degree
-	
+

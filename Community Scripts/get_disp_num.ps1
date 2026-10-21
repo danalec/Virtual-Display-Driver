@@ -36,7 +36,7 @@ param(
 )
 
 # One-liner to get the logicalname of the first VDD
-# You can alter the script -First 3, would make the third in the list, 
+# You can alter the script -First 3, would make the third in the list,
 # or -Last 2 would give second from last.
 
 $ErrorActionPreference = 'Stop';

@@ -4,7 +4,7 @@ param(
     # Latest stable version of NefCon installer
     [Parameter(Mandatory=$false)]
     [string]$NefConURL = "https://github.com/nefarius/nefcon/releases/download/v1.14.0/nefcon_v1.14.0.zip",
-    
+
     # Latest stable version of VDD driver only.
     # Left empty on purpose: which asset to install depends on this machine's
     # architecture, and the upstream release names its AMD64 asset "x86".

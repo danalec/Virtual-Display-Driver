@@ -238,9 +238,9 @@ try {
         return $device
     }
 
-    #---------------------------------------------------------------------- 
+    #----------------------------------------------------------------------
     # SECTION 5b: HELPER FUNCTION TO PICK THE DRIVER ASSET
-    #---------------------------------------------------------------------- 
+    #----------------------------------------------------------------------
     # SHA-256 of the driver archives, per release. silent-install.ps1 pins the
     # same two files for release 25.7.23.
     $knownDriverHashes = @{
@@ -289,11 +289,11 @@ try {
         Write-Log -Message "Action '$Action' requires the DevCon utility. Determining correct version..."
         $osInfo = Get-CimInstance -ClassName Win32_OperatingSystem
         $osBuild = [int]$osInfo.BuildNumber
-        
+
         $osMajorVersion = 'Server'
         if ($osInfo.Caption -match 'Windows 11') { $osMajorVersion = '11' }
         elseif ($osInfo.Caption -match 'Windows 10') { $osMajorVersion = '10' }
-        
+
         Write-Log -Message "Detected: Windows $osMajorVersion (Build $osBuild)"
         Write-Verbose "OS detection complete. Starting DevCon source matching."
 
@@ -304,7 +304,7 @@ try {
             "Windows 11 version 21H2" = 22000; "Windows Server 2022" = 20348; "Windows 10 version 2004" = 19041;
             "Windows 10 version 1903" = 18362; "Windows 10 version 1809" = 17763; "Windows Server 2019" = 17763
         }
-        
+
         $sourcesUrl = "https://raw.githubusercontent.com/Drawbackz/DevCon-Installer/refs/heads/master/devcon_sources.json"
         Write-Verbose "Fetching DevCon sources from $sourcesUrl"
         $devconSources = Invoke-RestMethod -Uri $sourcesUrl -ErrorAction Stop
@@ -319,7 +319,7 @@ try {
         } | Where-Object { $_.BuildNumber -gt 0 }
 
         $osFamilySources = $enrichedSources | Where-Object { $_.Name -like "*Windows $osMajorVersion*" -or ($osMajorVersion -eq 'Server' -and $_.Name -like "*Server*") }
-        
+
         # --- NEAREST-BUILD MATCHING LOGIC ---
         # 1. Try for a perfect match first.
         $bestMatch = $osFamilySources | Where-Object { $_.BuildNumber -eq $osBuild } | Select-Object -First 1
@@ -329,17 +329,17 @@ try {
             # 2. If no exact match, find the newest version that is still older than (or equal to) the current OS.
             #    This is the safest fallback, as it guarantees API compatibility.
             $bestOlderMatch = $osFamilySources | Where-Object { $_.BuildNumber -le $osBuild } | Sort-Object BuildNumber -Descending | Select-Object -First 1
-            
+
             # 3. If no older versions exist, find the oldest version that is newer than the current OS.
             #    This is a less-safe fallback but better than failing completely.
             $bestNewerMatch = $osFamilySources | Where-Object { $_.BuildNumber -gt $osBuild } | Sort-Object BuildNumber | Select-Object -First 1
-            
+
             if ($bestOlderMatch) { $bestMatch = $bestOlderMatch } elseif ($bestNewerMatch) { $bestMatch = $bestNewerMatch }
             Write-Verbose "Nearest older match: $($bestOlderMatch.Name) | Nearest newer match: $($bestNewerMatch.Name)"
         }
 
         if (-not $bestMatch) { throw "Could not find any compatible DevCon versions for your OS (Build $osBuild)." }
-        
+
         # Prefer a DevCon build matching the OS architecture and fall back to X64 rather than
         # failing: x64 runs through emulation on ARM64. This used to hardcode X64, so the ARM64
         # path downloaded an emulated installer even when the sources list carries a native one.
@@ -376,12 +376,12 @@ try {
             throw "Devcon.Installer.exe SHA-256 mismatch: expected $devconInstallerSha256, got $devconInstallerActual. Aborting before executing it."
         }
         Write-Verbose "DevCon Installer downloaded and SHA-256 verified."
-        
+
         # Use the hash to ensure the DevCon-Installer utility downloads the correct, secure version of DevCon.
         $devconArgs = "install -hash $devconHash -update -dir `"$tempDir`""
         Write-Verbose "Running DevCon Installer with arguments: $devconArgs"
         Start-Process -FilePath $devconInstallerPath -ArgumentList $devconArgs -Wait -NoNewWindow
-        
+
         $devconExe = Join-Path $tempDir "devcon.exe"
         if (-not (Test-Path $devconExe)) { throw "Failed to acquire devcon.exe." }
         Write-Verbose "devcon.exe acquired successfully at $devconExe"
@@ -576,7 +576,7 @@ try {
         if ($device) {
             $isEnabled = ($device.Status -in ('OK', 'Degraded', 'Started'))
             $statusText = if ($isEnabled) { "Enabled" } else { "Disabled" }
-            
+
             $statusResult.installed = $true
             $statusResult.status = $statusText.ToLower()
             $statusResult.details = @{

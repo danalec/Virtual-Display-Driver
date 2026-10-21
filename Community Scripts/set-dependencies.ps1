@@ -128,7 +128,7 @@ function Get-VddDisplay {
     # The endpoint name ("VirtualDisplayDriver Device") is kept as well, in case the
     # display stack reports the endpoint instead of the EDID.
     $pattern = 'VDD\s*by\s*MTT|Virtual\s*Display\s*Driver|VirtualDisplayDriver|MttVDD|IDD\s*Sample|IddSampleDriver'
-    
+
     # The monitor's own device id is the other half of the identity. The driver forces
     # its manufacturer and product codes on every EDID it reports -- modifyEdid() in
     # Driver.cpp writes 0x36 0x94 0x37 0x13 into bytes 8 to 11 -- and Windows renders
