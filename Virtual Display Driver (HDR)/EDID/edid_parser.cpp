@@ -481,16 +481,28 @@ private:
     void parse_cea_extension(const uint8_t* cea_block) {
         if (cea_block[0] != 0x02) return; // Not a CEA extension
         
-        // dtd_start is a byte read straight out of the EDID file, and a CEA extension block is
-        // only 128 bytes. Checking the lower bound alone is not enough: a value above 127 sends
-        // both loops below past the end of the block. The caller guarantees 128 bytes are
-        // present and not one byte more.
+        // Byte 2 is the offset of the first detailed timing descriptor. The data block
+        // collection runs from byte 4 to just before it. CTA-861 gives byte 2 two special
+        // values: 04 means the collection is empty (the descriptors start at 4), and 00
+        // means there are no descriptors at all and the collection takes up the whole
+        // rest of the block ahead of the checksum.
+        //
+        // dtd_start is a byte read straight out of the EDID file, and a CEA extension
+        // block is only 128 bytes. Checking the lower bound alone is not enough: a value
+        // above 127 sends both loops below past the end of the block. The caller
+        // guarantees 128 bytes are present and not one byte more.
         uint8_t dtd_start = cea_block[2];
-        if (dtd_start < 4 || dtd_start > 127) {
+        if (dtd_start > 127 || (dtd_start > 0 && dtd_start < 4)) {
             std::cout << "ERROR: DTD start offset " << (int)dtd_start
-                      << " is outside the 4..127 range of a CEA extension block" << std::endl;
+                      << " is outside the 0..127 range of a CEA extension block" << std::endl;
             return;
         }
+        
+        // The collection ends where the descriptors begin, or at the last byte before the
+        // checksum when there are none. The parser used to reject byte 2 = 00 outright,
+        // which threw away the whole collection and with it every mode the video data
+        // block advertises.
+        const uint8_t collection_end = (dtd_start == 0) ? 127 : dtd_start;
         // The data blocks start at offset 4 of the extension block. Byte 3 is
         // NOT the data block collection offset: in the three EDIDs in this
         // repository it holds 0xF0, 0xF1 and 0x40, and a collection that
@@ -499,17 +511,21 @@ private:
         const uint8_t data_block_start = 4;
         std::cout << "=== CEA Extension Block Debug ===" << std::endl;
         std::cout << "CEA revision: " << (int)cea_block[1] << std::endl;
-        std::cout << "DTD start offset: " << (int)dtd_start << std::endl;
+        if (dtd_start == 0) {
+            std::cout << "DTD start offset: 0 (the EDID states there are no detailed timing descriptors)" << std::endl;
+        } else {
+            std::cout << "DTD start offset: " << (int)dtd_start << std::endl;
+        }
 
         // Dump the entire data block collection for debugging
-        std::cout << "Data block collection bytes (" << (dtd_start - data_block_start) << " bytes): ";
-        for (uint8_t i = data_block_start; i < dtd_start; i++) {
+        std::cout << "Data block collection bytes (" << (collection_end - data_block_start) << " bytes): ";
+        for (uint8_t i = data_block_start; i < collection_end; i++) {
             std::cout << std::hex << std::setw(2) << std::setfill('0') << (int)cea_block[i] << " ";
         }
         std::cout << std::dec << std::endl;
 
         // Parse data block collection
-        for (uint8_t offset = data_block_start; offset < dtd_start; ) {
+        for (uint8_t offset = data_block_start; offset < collection_end; ) {
             uint8_t tag_length = cea_block[offset];
             uint8_t tag = (tag_length >> 5) & 0x07;
             uint8_t length = tag_length & 0x1F;
@@ -517,8 +533,8 @@ private:
             std::cout << "Data block at offset " << (int)offset << ": tag=" << (int)tag 
                       << ", length=" << (int)length << std::endl;
             
-            if (offset + 1 + length > dtd_start) {
-                std::cout << "ERROR: Data block extends beyond DTD start!" << std::endl;
+            if (offset + 1 + length > collection_end) {
+                std::cout << "ERROR: Data block extends beyond the data block collection!" << std::endl;
                 break;
             }
             
@@ -558,14 +574,18 @@ private:
         }
         
         // Parse DTDs in CEA extension
-        std::cout << "Parsing DTDs starting at offset " << (int)dtd_start << std::endl;
-        for (uint8_t offset = dtd_start; offset + 18 <= 128; offset += 18) {
-            if (cea_block[offset] == 0 && cea_block[offset + 1] == 0) {
-                std::cout << "  Empty DTD slot at offset " << (int)offset << std::endl;
-                continue;
+        if (dtd_start == 0) {
+            std::cout << "No detailed timing descriptors in this CEA extension block" << std::endl;
+        }
+        else {
+            for (uint8_t offset = dtd_start; offset + 18 <= 128; offset += 18) {
+                if (cea_block[offset] == 0 && cea_block[offset + 1] == 0) {
+                    std::cout << "  Empty DTD slot at offset " << (int)offset << std::endl;
+                    continue;
+                }
+                std::cout << "  Parsing DTD at offset " << (int)offset << std::endl;
+                parse_detailed_timing_descriptor(&cea_block[offset]);
             }
-            std::cout << "  Parsing DTD at offset " << (int)offset << std::endl;
-            parse_detailed_timing_descriptor(&cea_block[offset]);
         }
         
         std::cout << "=== End CEA Extension Debug ===" << std::endl << std::endl;
