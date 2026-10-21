@@ -5,7 +5,7 @@
      
      Every element below is read by the driver. 52 of them are reached through
      SettingsQueryMap in Driver.cpp; the monitors/count and gpu/friendlyname entries are
-     rewritten by the pipe commands, and the <global>/<monitors> mode lists are read by a
+     rewritten by the pipe commands, and the <global>/<resolutions> mode lists are read by a
      separate pass, so counting SettingsQueryMap entries does not count this file.
      Generated: August 16, 2025 based on driver code analysis
      =============================================================================== -->
@@ -151,7 +151,8 @@
     These keys were present in the original vdd_settings.xml and were still being parsed
     by the driver, but nothing ever read the values: editing them here changed no behaviour.
     They have now been removed from the parser, from the settings alias map and from this
-    file, so a typo in any of them is reported instead of silently ignored.
+    file, so a typo in any of them is reported instead of silently ignored: the
+    driver lists the settings this file has that it does not read.
 
     1. monitor_emulation (8 keys)
        - enabled, emulate_physical_dimensions, physical_width_mm, physical_height_mm

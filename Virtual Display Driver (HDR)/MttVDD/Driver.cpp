@@ -542,14 +542,81 @@ void InvalidateSettingsCache() {
 	g_SettingsCache.clear();
 }
 
-static void RecordSettingLocked(const wstring& parent, const wstring& name, const wstring& text) {
+static void RecordSettingLocked(const wstring& parent, const wstring& name, const wstring& text,
+	vector<wstring>& leafPaths) {
 	if (!parent.empty()) {
 		const wstring qualified = parent + L"/" + name;
 		g_SettingsCache.emplace(qualified, text);
+		leafPaths.push_back(qualified);
+	}
+	else {
+		leafPaths.push_back(name);
 	}
 	// First match wins, which is what the old per-getter loops did: they stopped at the first
 	// element whose name matched.
 	g_SettingsCache.emplace(name, text);
+}
+
+// Say which settings the file has that the driver does not read.
+//
+// A key that is not read is a key that does nothing: a setting the user
+// spelled wrong, or one of the keys that were removed from the parser. The
+// file says those are reported rather than silently ignored, and until now
+// nothing reported them -- the cache is only ever looked up by name, so a
+// misspelling was indistinguishable from a setting that was never there.
+//
+// The names the driver reads are the ones in the alias map, plus the ones the
+// separate mode-list pass and the pipe commands use. A bare name in the map
+// means the first element with that name, so only the first leaf carrying it
+// is read -- a second one is genuinely not read, and is reported.
+void ReportUnusedSettings(const vector<wstring>& leafPaths) {
+	// The names the alias map reads. A bare name in the map means the first
+	// element with that name -- that is what the cache keeps -- so only the
+	// first leaf carrying it is read. A qualified name means that element.
+	set<wstring> mapNames;
+	for (const auto& entry : SettingsQueryMap) {
+		mapNames.insert(entry.second.second);
+	}
+	// The names the separate mode-list pass in loadSettings() reads. That pass
+	// walks the whole file, so every one of its elements is read -- the file
+	// has four <g_refresh_rate> and three <width> and they are all used.
+	set<wstring> passNames;
+	passNames.insert(L"count");
+	passNames.insert(L"friendlyname");
+	passNames.insert(L"g_refresh_rate");
+	passNames.insert(L"width");
+	passNames.insert(L"height");
+	passNames.insert(L"refresh_rate");
+
+	set<wstring> firstBareSeen;
+	vector<wstring> unused;
+	for (const wstring& path : leafPaths) {
+		const size_t slash = path.find_last_of(L"/");
+		const wstring bare = slash == wstring::npos ? path : path.substr(slash + 1);
+		if (mapNames.count(path)) {
+			continue;
+		}
+		if (mapNames.count(bare) && firstBareSeen.insert(bare).second) {
+			continue;
+		}
+		if (passNames.count(bare)) {
+			continue;
+		}
+		unused.push_back(path);
+	}
+
+	if (unused.empty()) {
+		return;
+	}
+	stringstream ss;
+	ss << unused.size() << " setting(s) in vdd_settings.xml are not read by the driver and have no effect: ";
+	for (size_t i = 0; i < unused.size(); i++) {
+		if (i) {
+			ss << ", ";
+		}
+		ss << WStringToString(unused[i]);
+	}
+	vddlog("w", ss.str().c_str());
 }
 
 static void BuildSettingsCacheLocked() {
@@ -582,6 +649,11 @@ static void BuildSettingsCacheLocked() {
 	const wchar_t* pwszLocalName = nullptr;
 	const wchar_t* pwszValue = nullptr;
 	vector<wstring> path;
+	// Every leaf the file has, in document order. The cache itself is a map, so
+	// the four <g_refresh_rate> elements and the three <resolution> blocks collapse
+	// into one entry each; the list keeps what the file says, which is what the
+	// unused-key report needs.
+	vector<wstring> leafPaths;
 
 	while (S_OK == pReader->Read(&nodeType)) {
 		if (nodeType == XmlNodeType_Element) {
@@ -597,12 +669,13 @@ static void BuildSettingsCacheLocked() {
 			pReader->GetValue(&pwszValue, nullptr);
 			if (pwszValue) {
 				const wstring parent = path.size() >= 2 ? path[path.size() - 2] : wstring();
-				RecordSettingLocked(parent, path.back(), wstring(pwszValue));
+				RecordSettingLocked(parent, path.back(), wstring(pwszValue), leafPaths);
 			}
 		}
 	}
 
 	g_SettingsCacheReady = true;
+	ReportUnusedSettings(leafPaths);
 }
 
 // Looks a setting up in vdd_settings.xml.
