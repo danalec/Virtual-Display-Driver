@@ -2383,14 +2383,44 @@ bool UpdateXmlToggleSetting(bool toggle, const wchar_t* variable) {
 			pReader->GetLocalName(&pwszLocalName, nullptr);
 			pWriter->WriteStartElement(nullptr, pwszLocalName, nullptr);
 			depth++;
+			if (pwszLocalName != nullptr && wcscmp(pwszLocalName, variable) == 0) {
+				variableElementFound = true;
+				// The text of this element lives one level deeper than its parent's.
+				elementDepth = depth;
+			}
+			// A self-closing element never produces an EndElement event. MSXML Lite
+			// reports the element and then goes straight on to the next sibling, so the
+			// writer's element stack would be one level off from that point on, and
+			// everything after the empty element in the file would end up nested inside
+			// it: the rewritten file would not be the file the driver read. Measured on
+			// <a><b/><c>x</c></a> -- the events are ELEM b, ELEM c, TEXT x, END c, END a,
+			// with no END b. Close it here, and give it the value now, because it will
+			// not have a text node of its own either.
+			{
+				// IsEmptyElement takes no argument and returns the answer.
+				const BOOL isEmpty = pReader->IsEmptyElement();
+				if (isEmpty) {
+					if (variableElementFound && depth == elementDepth) {
+						pWriter->WriteString(toggle ? L"true" : L"false");
+						variableElementFound = false;
+					}
+					pWriter->WriteEndElement();
+					depth--;
+				}
+			}
 			break;
 
 		case XmlNodeType_EndElement:
 			pReader->GetLocalName(&pwszLocalName, nullptr);
-			// The matching element ended without a text of its own, so it was written as
-			// <logging/>: give it the value now, before the end tag. The old code cleared
-			// the flag on the way out and lost the toggle for an empty element entirely.
-			if (variableElementFound && depth == elementDepth) {
+			// The matching element ended without a text of its own: it was written as
+			// <logging></logging>. Give it the value now, before the end tag.
+			//
+			// The name is part of the test: MSXML Lite reports the end of a
+			// self-closing element late, and under its parent's name, so the end of
+			// an empty element would otherwise write the value a second time, into
+			// the parent. The end of the element we are after carries our name.
+			if (variableElementFound && depth == elementDepth &&
+				pwszLocalName != nullptr && wcscmp(pwszLocalName, variable) == 0) {
 				pWriter->WriteString(toggle ? L"true" : L"false");
 				variableElementFound = false;
 			}
@@ -2527,27 +2557,72 @@ bool UpdateXmlGpuSetting(const wchar_t* gpuName) {
 	const wchar_t* pwszLocalName;
 	const wchar_t* pwszValue;
 	bool gpuElementFound = false;
+	// The depth of the element that matched, and the depth the reader is at: the value
+	// replaced has to be that element's OWN text. The rewriter used to match the "gpu"
+	// section and write into the first text inside it, which is <friendlyname> only
+	// because that happens to be its first child. Put another child in front and the GPU
+	// name landed in that child instead, while the reader -- which takes the name from
+	// "friendlyname" -- never saw the change, so the selection silently did not move.
+	// Measured, with this function extracted and run against the shipped file. The target
+	// is the element the reader reads.
+	int elementDepth = 0;
+	int depth = 0;
 
 	while (S_OK == pReader->Read(&nodeType)) {
 		switch (nodeType) {
 		case XmlNodeType_Element:
 			pReader->GetLocalName(&pwszLocalName, nullptr);
 			pWriter->WriteStartElement(nullptr, pwszLocalName, nullptr);
+			depth++;
+			if (wcscmp(pwszLocalName, L"friendlyname") == 0) {
+				gpuElementFound = true;
+				// The text of this element lives one level deeper than its parent's.
+				elementDepth = depth;
+			}
+			// A self-closing element never produces an EndElement event. MSXML Lite
+			// reports the element and then goes straight on to the next sibling, so the
+			// writer's element stack would be one level off from that point on, and
+			// everything after the empty element in the file would end up nested inside
+			// it: the rewritten file would not be the file the driver read. Measured on
+			// <a><b/><c>x</c></a> -- the events are ELEM b, ELEM c, TEXT x, END c, END a,
+			// with no END b. Close it here, and give it the value now, because it will
+			// not have a text node of its own either.
+			{
+				// IsEmptyElement takes no argument and returns the answer.
+				const BOOL isEmpty = pReader->IsEmptyElement();
+				if (isEmpty) {
+					if (gpuElementFound && depth == elementDepth) {
+						pWriter->WriteString(gpuName);
+						gpuElementFound = false;
+					}
+					pWriter->WriteEndElement();
+					depth--;
+				}
+			}
 			break;
 
 		case XmlNodeType_EndElement:
 			pReader->GetLocalName(&pwszLocalName, nullptr);
+			// The element ended without a text of its own: it was written as
+			// <friendlyname></friendlyname>. Give it the value now, before the end tag.
+			//
+			// The name is part of the test: MSXML Lite reports the end of a
+			// self-closing element late, and under its parent's name, so the end of
+			// an empty element would otherwise write the value a second time, into
+			// the parent. The end of the element we are after carries our name.
+			if (gpuElementFound && depth == elementDepth &&
+				pwszLocalName != nullptr && wcscmp(pwszLocalName, L"friendlyname") == 0) {
+				pWriter->WriteString(gpuName);
+				gpuElementFound = false;
+			}
 			pWriter->WriteEndElement();
-			// Same trap as the toggle rewriter: an empty gpu/friendlyname element produces no
-			// Text node, so the flag would survive it and this writer would overwrite the next
-			// element's text in the file. Clear it on the way out as well.
-			gpuElementFound = false;
+			depth--;
 			break;
 
 		case XmlNodeType_Text:
 			pReader->GetValue(&pwszValue, nullptr);
-			if (gpuElementFound) {
-				pWriter->WriteString(gpuName); 
+			if (gpuElementFound && depth == elementDepth) {
+				pWriter->WriteString(gpuName);
 				gpuElementFound = false;
 			}
 			else {
@@ -2587,8 +2662,10 @@ bool UpdateXmlGpuSetting(const wchar_t* gpuName) {
 
 		if (nodeType == XmlNodeType_Element) {
 			pReader->GetLocalName(&pwszLocalName, nullptr);
-			if (wcscmp(pwszLocalName, L"gpu") == 0) {
+			if (wcscmp(pwszLocalName, L"friendlyname") == 0) {
 				gpuElementFound = true;
+				// The text of this element lives one level deeper than its parent's.
+				elementDepth = depth;
 			}
 		}
 	}
@@ -2660,28 +2737,69 @@ bool UpdateXmlDisplayCountSetting(int displayCount) {
 	const wchar_t* pwszLocalName;
 	const wchar_t* pwszValue;
 	bool displayCountElementFound = false;
+	// The depth of the element that matched, and the depth the reader is at: the value
+	// replaced has to be that element's OWN text. The target is already the element the
+	// reader reads -- "count" -- but the flag used to survive an empty one and land on
+	// the next element's text, and the empty case lost the write entirely.
+	int elementDepth = 0;
+	int depth = 0;
 
 	while (S_OK == pReader->Read(&nodeType)) {
 		switch (nodeType) {
 		case XmlNodeType_Element:
 			pReader->GetLocalName(&pwszLocalName, nullptr);
 			pWriter->WriteStartElement(nullptr, pwszLocalName, nullptr);
+			depth++;
+			if (wcscmp(pwszLocalName, L"count") == 0) {
+				displayCountElementFound = true;
+				// The text of this element lives one level deeper than its parent's.
+				elementDepth = depth;
+			}
+			// A self-closing element never produces an EndElement event. MSXML Lite
+			// reports the element and then goes straight on to the next sibling, so the
+			// writer's element stack would be one level off from that point on, and
+			// everything after the empty element in the file would end up nested inside
+			// it: the rewritten file would not be the file the driver read. Measured on
+			// <a><b/><c>x</c></a> -- the events are ELEM b, ELEM c, TEXT x, END c, END a,
+			// with no END b. Close it here, and give it the value now, because it will
+			// not have a text node of its own either.
+			{
+				// IsEmptyElement takes no argument and returns the answer.
+				const BOOL isEmpty = pReader->IsEmptyElement();
+				if (isEmpty) {
+					if (displayCountElementFound && depth == elementDepth) {
+						pWriter->WriteString(std::to_wstring(displayCount).c_str());
+						displayCountElementFound = false;
+					}
+					pWriter->WriteEndElement();
+					depth--;
+				}
+			}
 			break;
 
 		case XmlNodeType_EndElement:
 			pReader->GetLocalName(&pwszLocalName, nullptr);
+			// The element ended without a text of its own: it was written as
+			// <count></count>. Give it the value now, before the end tag.
+			//
+			// The name is part of the test: MSXML Lite reports the end of a
+			// self-closing element late, and under its parent's name, so the end of
+			// an empty element would otherwise write the value a second time, into
+			// the parent. The end of the element we are after carries our name.
+			if (displayCountElementFound && depth == elementDepth &&
+				pwszLocalName != nullptr && wcscmp(pwszLocalName, L"count") == 0) {
+				pWriter->WriteString(std::to_wstring(displayCount).c_str());
+				displayCountElementFound = false;
+			}
 			pWriter->WriteEndElement();
-			// Same trap as the toggle rewriter: an empty monitors/count element produces no
-			// Text node, so the flag would survive it and this writer would overwrite the next
-			// element's text in the file. Clear it on the way out as well.
-			displayCountElementFound = false;
+			depth--;
 			break;
 
 		case XmlNodeType_Text:
 			pReader->GetValue(&pwszValue, nullptr);
-			if (displayCountElementFound) {
+			if (displayCountElementFound && depth == elementDepth) {
 				pWriter->WriteString(std::to_wstring(displayCount).c_str());
-				displayCountElementFound = false; 
+				displayCountElementFound = false;
 			}
 			else {
 				pWriter->WriteString(pwszValue);
@@ -2721,7 +2839,9 @@ bool UpdateXmlDisplayCountSetting(int displayCount) {
 		if (nodeType == XmlNodeType_Element) {
 			pReader->GetLocalName(&pwszLocalName, nullptr);
 			if (wcscmp(pwszLocalName, L"count") == 0) {
-				displayCountElementFound = true; 
+				displayCountElementFound = true;
+				// The text of this element lives one level deeper than its parent's.
+				elementDepth = depth;
 			}
 		}
 	}
