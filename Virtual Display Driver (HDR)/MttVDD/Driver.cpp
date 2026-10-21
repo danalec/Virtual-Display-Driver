@@ -3989,10 +3989,8 @@ void loadSettings() {
     // The count is the first line that carries one, not literally the first line: '#' lines are
     // skipped exactly as they are on a mode line, so the file can carry a header explaining what
     // the count is, and without the skip the shipped file (a header of comment lines, then the
-	// count) would announce "opens with a comment" on every load and silently ignore anyone who
-	// edited the count.
-    // would announce "opens with a comment" on every load and silently ignore anyone who edited
-    // the count. The fallback is 1 on both paths -- numVirtualDisplays is zero-initialised, so
+    // count) would announce "opens with a comment" on every load and silently ignore anyone who
+    // edited the count. The fallback is 1 on both paths -- numVirtualDisplays is zero-initialised, so
     // leaving it alone would hand the adapter zero monitors, which is not the one the caller is
     // about to get either way.
     //
