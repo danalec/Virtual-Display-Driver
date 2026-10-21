@@ -3979,10 +3979,20 @@ void loadSettings() {
 					int parsedWidth = ParseIntSafe(width, 0, L"resolution width");
 					int parsedHeight = ParseIntSafe(height, 0, L"resolution height");
 					if (parsedWidth > 0 && parsedHeight > 0) {
-						// The same bounds the EDID profile filter applies. The
-						// resolution bounds were checked and the refresh rate was not, so
-						// min_refresh_rate and max_refresh_rate did nothing on this path.
-						if (parsedRate < static_cast<float>(minRefreshRate) || parsedRate > static_cast<float>(maxRefreshRate)) {
+						// The same bounds the EDID profile filter applies. The resolution
+						// bounds were not checked at all here, so min_resolution_width,
+						// min_resolution_height, max_resolution_width and max_resolution_height
+						// did nothing on the path that runs by default.
+						if (parsedWidth < minResolutionWidth || parsedWidth > maxResolutionWidth ||
+							parsedHeight < minResolutionHeight || parsedHeight > maxResolutionHeight) {
+							stringstream ss;
+							ss << "Resolution " << parsedWidth << "x" << parsedHeight
+							   << " is outside the configured resolution range of " << minResolutionWidth
+							   << "x" << minResolutionHeight << " to " << maxResolutionWidth
+							   << "x" << maxResolutionHeight << ", skipping";
+							vddlog("w", ss.str().c_str());
+						}
+						else if (parsedRate < static_cast<float>(minRefreshRate) || parsedRate > static_cast<float>(maxRefreshRate)) {
 							stringstream ss;
 							ss << "Resolution " << parsedWidth << "x" << parsedHeight << " @ " << parsedRate
 							   << "Hz is outside the configured refresh rate range of " << minRefreshRate
@@ -4044,6 +4054,20 @@ void loadSettings() {
 			for (const auto& resTuple : resolutions) {
 				int global_width = get<0>(resTuple);
 				int global_height = get<1>(resTuple);
+
+				// The resolution bounds, the same ones the EDID profile filter and the
+				// resolution above apply. The set of resolutions is filled in whatever
+				// the file says, and every one of them was combined with every rate.
+				if (global_width < minResolutionWidth || global_width > maxResolutionWidth ||
+					global_height < minResolutionHeight || global_height > maxResolutionHeight) {
+					stringstream ss;
+					ss << "Resolution " << global_width << "x" << global_height
+					   << " is outside the configured resolution range of " << minResolutionWidth
+					   << "x" << minResolutionHeight << " to " << maxResolutionWidth
+					   << "x" << maxResolutionHeight << ", skipping";
+					vddlog("w", ss.str().c_str());
+					continue;
+				}
 
 				int vsync_num, vsync_den;
 				float_to_vsync(static_cast<float>(globalRate), vsync_num, vsync_den);
