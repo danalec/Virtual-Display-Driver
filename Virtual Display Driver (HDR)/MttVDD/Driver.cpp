@@ -2924,14 +2924,27 @@ void logAvailableGPUs() {
 		return;
 	}
 	for (UINT i = 0;; i++) {
-		ComPtr<IDXGIAdapter> adapter;
-		if (!SUCCEEDED(factory->EnumAdapters(i, &adapter))) {
+		// EnumAdapters1 and GetDesc1, not the plain ones: the software flag is
+		// only on DXGI_ADAPTER_DESC1.
+		ComPtr<IDXGIAdapter1> adapter1;
+		if (!SUCCEEDED(factory->EnumAdapters1(i, &adapter1))) {
 			break;
 		}
-		DXGI_ADAPTER_DESC desc;
-		if (!SUCCEEDED(adapter->GetDesc(&desc))) {
+
+		DXGI_ADAPTER_DESC1 desc1;
+		if (!SUCCEEDED(adapter1->GetDesc1(&desc1))) {
 			continue;
 		}
+
+		// The software rasteriser is not an adapter the OS presents on, and a
+		// D3D11 device CAN be created on it. Listing it here meant the log named
+		// a GPU that is not one.
+		if ((desc1.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0) {
+			continue;
+		}
+
+		const DXGI_ADAPTER_DESC1 desc = desc1;
+		ComPtr<IDXGIAdapter> adapter = adapter1;
 		GPUInfo info{ desc.Description, adapter, desc };
 		gpus.push_back(info);
 	}
@@ -3022,7 +3035,7 @@ void HandleClient(HANDLE hPipe) {
 		WideCharToMultiByte(CP_UTF8, 0, bufferwstr.c_str(), -1, &bufferstr[0], bufferSize, nullptr, nullptr);
 		vddlog("p", bufferstr.c_str());
 		if (wcsncmp(buffer, L"RELOAD_DRIVER", 13) == 0) {
-			vddlog("c", "Reloading the driver");
+			vddlog("c", "The setting was written; the driver picks it up the next time it starts.");
 			ReloadDriver();
 			
 		}
@@ -3199,10 +3212,10 @@ void HandleClient(HANDLE hPipe) {
 				vddlog("c", WStringToString(displayLog).c_str());
 
 				if (UpdateXmlDisplayCountSetting(requestedCount)) {
-					vddlog("c", "Display Count Changed, Restarting Driver");
+					vddlog("c", "Display count changed in vdd_settings.xml; it takes effect when the driver next starts.");
 				}
 				else {
-					vddlog("e", "Failed to update display count setting in XML. Restarting anyway");
+					vddlog("e", "Failed to update the display count setting in the XML; the count is unchanged.");
 				}
 				ReloadDriver();
 			}
@@ -5520,6 +5533,12 @@ NTSTATUS VirtualDisplayDriverAdapterInitFinished(IDDCX_ADAPTER AdapterObject, co
 		stringstream ss;
 		ss << "Adapter initialization failed. Status: " << pInArgs->AdapterInitStatus;
 		vddlog("e", ss.str().c_str());
+		// The adapter will have no monitors at all: the driver told the OS it supports
+		// numVirtualDisplays of them and then created none. Say so, and say that the
+		// device has to be restarted -- the SDK's own prescription for a failed init
+		// is to report a device failure, and IddCxReportCriticalError terminates the
+		// driver process, which is the maintainer's call, not a log line's.
+		vddlog("e", "The adapter will report no monitors; the device has to be restarted for the driver to come up.");
 	}
 	vddlog("i", "Finished Setting up adapter.");
 	

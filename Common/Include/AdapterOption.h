@@ -2,7 +2,7 @@
 
 #include <wrl/client.h> 	// For ComPtr
 #include <IddCx.h>       	// For IDDCX_ADAPTER, IddCxAdapterSetRenderAdapter
-#include <dxgi.h>       	// For IDXGIAdapter, IDXGIFactory1
+#include <dxgi1_5.h>   	// For IDXGIAdapter, IDXGIAdapter1, IDXGIFactory1, DXGI_ADAPTER_DESC1
 #include <algorithm>    	// For sort
 #include <setupapi.h>
 #include <devguid.h>
@@ -13,6 +13,12 @@
 #include <string>
 #include <vector>
 #include <fstream>
+#include <sstream>
+
+// The driver's logger and name converter, defined in Driver.cpp. Declared here so
+// the header can report what it resolved and what it substituted for it.
+void vddlog(const char* type, const char* message);
+std::string WStringToString(const std::wstring& wstr);
 
 using namespace std;
 using namespace Microsoft::WRL;
@@ -28,7 +34,7 @@ static const DEVPROPKEY DEVPKEY_Device_Luid_Custom = {
 struct GPUInfo {
     wstring name;                // GPU name
     ComPtr<IDXGIAdapter> adapter;// COM pointer to the adapter
-    DXGI_ADAPTER_DESC desc;      // Adapter description
+    DXGI_ADAPTER_DESC1 desc;     // Adapter description (with the software flag)
 };
 
 // Sort function for GPUs by dedicated video memory
@@ -47,23 +53,47 @@ inline vector<GPUInfo> getAvailableGPUs() {
 
     // Enumerate all adapters (GPUs)
     for (UINT i = 0;; i++) {
-        ComPtr<IDXGIAdapter> adapter;
-        if (!SUCCEEDED(factory->EnumAdapters(i, &adapter))) {
+        // EnumAdapters1 and GetDesc1, not the plain ones: the software flag is
+        // only on DXGI_ADAPTER_DESC1.
+        ComPtr<IDXGIAdapter1> adapter1;
+        if (!SUCCEEDED(factory->EnumAdapters1(i, &adapter1))) {
             break;
         }
 
-        DXGI_ADAPTER_DESC desc;
+        DXGI_ADAPTER_DESC1 desc1;
 
-        if (!SUCCEEDED(adapter->GetDesc(&desc))) {
+        if (!SUCCEEDED(adapter1->GetDesc1(&desc1))) {
+            continue;
+        }
+
+        // The software rasteriser is not an adapter the OS presents on, and a
+        // D3D11 device CAN be created on it -- so it used to be enumerable,
+        // selectable by name, and the swap chain could end up on it. Measured on
+        // this machine: the list held "Microsoft Basic Render Driver" with
+        // DXGI_ADAPTER_FLAG_SOFTWARE set, and a device was created on it.
+        if ((desc1.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0) {
             continue;
         }
 
         // Add the adapter information to the list
+        const DXGI_ADAPTER_DESC1 desc = desc1;
+        ComPtr<IDXGIAdapter> adapter = adapter1;
         GPUInfo info{ desc.Description, adapter, desc };
         gpus.push_back(info);
     }
 
     return gpus;
+}
+
+// The name of the adapter with this LUID, or an empty string when there is none.
+inline wstring nameOfAdapter(LUID luid) {
+    for (const auto& gpu : getAvailableGPUs()) {
+        if (gpu.desc.AdapterLuid.LowPart == luid.LowPart &&
+            gpu.desc.AdapterLuid.HighPart == luid.HighPart) {
+            return gpu.name;
+        }
+    }
+    return L"";
 }
 
 // Resolve an adapter LUID from a PCI bus number by enumerating display devices (SetupAPI).
@@ -134,18 +164,34 @@ public:
     LUID adapterLuid{};      // Adapter's unique identifier (LUID)
     wstring target_name{};   // Target adapter name
 
-    // Select the best GPU based on dedicated video memory
+    // Select the best GPU based on dedicated video memory. The LUID is what
+    // identifies it: matching by name threw the ranking away, because two cards
+    // with the same name resolved to whichever one DXGI enumerated first.
+    bool selectBestAdapter() {
+        auto gpus = getAvailableGPUs();
+        if (gpus.empty()) {
+            return false; // Error check for headless / vm
+        }
+
+        // Sort GPUs by dedicated video memory in descending order
+        sort(gpus.begin(), gpus.end(), CompareGPUs);
+        const GPUInfo& bestGPU = gpus.front(); // Get the GPU with the most memory
+
+        adapterLuid = bestGPU.desc.AdapterLuid;
+        target_name = bestGPU.name;
+        hasTargetAdapter = true;
+        return true;
+    }
+
+    // The name of the best GPU, for the log line only.
     wstring selectBestGPU() {
         auto gpus = getAvailableGPUs();
         if (gpus.empty()) {
             return L""; // Error check for headless / vm
         }
 
-        // Sort GPUs by dedicated video memory in descending order
         sort(gpus.begin(), gpus.end(), CompareGPUs);
-        auto bestGPU = gpus.front(); // Get the GPU with the most memory
-
-        return bestGPU.name;
+        return gpus.front().name;
     }
 
     // Load friendlyname from a file OR select the best GPU 
@@ -158,6 +204,17 @@ public:
         else {
             string line;
             getline(ifs, line);
+            // A file saved with a UTF-8 BOM, or with a trailing space, carried a name
+            // that no adapter has: the configured adapter was discarded silently and a
+            // different one was used. Strip both before the name is compared.
+            if (line.size() >= 3 && (unsigned char)line[0] == 0xEF &&
+                (unsigned char)line[1] == 0xBB && (unsigned char)line[2] == 0xBF) {
+                line.erase(0, 3);
+            }
+            while (!line.empty() &&
+                (line.back() == ' ' || line.back() == '\t' || line.back() == '\r')) {
+                line.pop_back();
+            }
             // Decode, do not widen. assign(line.begin(), line.end()) copies one
             // byte per wchar_t, so a UTF-8 GPU name became a string of
             // individual code units that never matched the DXGI name, and
@@ -175,9 +232,14 @@ public:
 
         // Find and set the adapter based on the target name
         if (!findAndSetAdapter(target_name)) {
-            // If the adapter is not found, select the best GPU and retry
-            target_name = selectBestGPU();
-            findAndSetAdapter(target_name);
+            // The configured name matched no adapter, and the old code swapped in
+            // another one silently: the operator got a render adapter they had not
+            // chosen, with nothing in the log to say so.
+            stringstream ss;
+            ss << "The configured adapter \"" << WStringToString(target_name)
+               << "\" was not found; falling back to the best adapter by video memory.";
+            vddlog("w", ss.str().c_str());
+            selectBestAdapter();
         }
     }
 
@@ -185,9 +247,14 @@ public:
     void xmlprovide(const wstring& xtarg) {
         target_name = xtarg;
         if (!findAndSetAdapter(target_name)) {
-            // If the adapter is not found, select the best GPU and retry
-            target_name = selectBestGPU();
-            findAndSetAdapter(target_name);
+            // The configured name matched no adapter, and the old code swapped in
+            // another one silently: the operator got a render adapter they had not
+            // chosen, with nothing in the log to say so.
+            stringstream ss;
+            ss << "The configured adapter \"" << WStringToString(target_name)
+               << "\" was not found; falling back to the best adapter by video memory.";
+            vddlog("w", ss.str().c_str());
+            selectBestAdapter();
         }
     }
 
@@ -218,6 +285,17 @@ private:
                 if (auto luidOpt = ResolveAdapterLuidFromPciBus(static_cast<uint32_t>(busUl)); luidOpt.has_value()) {
                     adapterLuid = luidOpt.value();
                     hasTargetAdapter = true;
+                    // The bus wins, and the name was never checked against it, so
+                    // the log paired one adapter's name with another adapter's LUID.
+                    // Say what the bus actually resolved to.
+                    const wstring resolved = nameOfAdapter(adapterLuid);
+                    if (!resolved.empty() && _wcsicmp(resolved.c_str(), namePart.c_str()) != 0) {
+                        stringstream ss;
+                        ss << "The adapter on PCI bus " << busUl << " is \"" << WStringToString(resolved)
+                            << "\", which is not the configured \"" << WStringToString(namePart) << "\".";
+                        vddlog("w", ss.str().c_str());
+                        target_name = resolved;
+                    }
                     return true;
                 }
             }
