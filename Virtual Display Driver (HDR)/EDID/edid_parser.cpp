@@ -853,6 +853,47 @@ public:
             return false;
         }
 
+        // The same three rules the driver applies to a custom EDID, so that the
+        // tool and the driver agree on what an EDID is.
+        //
+        // The header magic: every EDID starts with 00 FF FF FF FF FF FF 00. A file
+        // without it is not an EDID, and the parser used to report one anyway -- a
+        // PNG with 120 bytes of rubbish produced a full monitor profile and exit
+        // code 0.
+        static const BYTE edid_header[8] = { 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00 };
+        if (file_size < 8 || memcmp(edid_data.data(), edid_header, 8) != 0) {
+            std::cerr << "Error: " << filename << " does not start with the EDID header" << std::endl;
+            return false;
+        }
+
+        // The extension count: byte 126 says how many 128-byte blocks follow the
+        // base block, so the file has to be exactly that many blocks. A file that
+        // declares more than it carries was silently parsed as a shorter EDID, and
+        // one that declares fewer had its extra block ignored while the tool still
+        // claimed to have read the extension.
+        const size_t declared = 128 * (static_cast<size_t>(edid_data[126]) + 1);
+        if (file_size != declared) {
+            std::cerr << "Error: " << filename << " is " << file_size
+                      << " bytes but declares " << static_cast<int>(edid_data[126])
+                      << " extension block(s), so it should be " << declared << " bytes" << std::endl;
+            return false;
+        }
+
+        // Every block carries its own checksum and the sum of a whole block has to
+        // be a multiple of 256. Only the base block was checked, so a file with a
+        // corrupt extension produced a full profile and exit code 0.
+        for (size_t block = 0; block < file_size; block += 128) {
+            unsigned int sum = 0;
+            for (size_t i = 0; i < 128; ++i) {
+                sum += edid_data[block + i];
+            }
+            if ((sum & 0xFF) != 0) {
+                std::cerr << "Error: the block at offset " << block << " of " << filename
+                          << " has a bad checksum" << std::endl;
+                return false;
+            }
+        }
+
         return true;
     }
     

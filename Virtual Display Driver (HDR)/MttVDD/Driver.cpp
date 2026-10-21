@@ -3984,6 +3984,13 @@ void loadSettings() {
 		RemoveDuplicateModes(res);
 		monitorModes = res;
 		RebuildKnownMonitorModesCache();
+		// The performance measurement belongs here: this is where the mode list exists.
+		// It used to run in the context constructor, before loadSettings() had built
+		// anything, so it always timed an empty list.
+		vddlog("d", "Running performance measurement");
+		if (!NT_SUCCESS(PerformanceMonitor())) {
+			vddlog("e", "Performance monitoring failed");
+		}
 		
 		// === APPLY EDID INTEGRATION ===
 		if (edidIntegrationEnabled && autoConfigureFromEdid) {
@@ -6371,6 +6378,10 @@ NTSTATUS ValidateEdidIntegration()
 		else if (profilePath.empty()) {
 			vddlog("w", "EDID integration is on but no profile path is set");
 			issues++;
+			// The issue was counted and then dropped: the summary printed "Total
+			// Issues Found: 1" next to "Configuration Valid: Yes" and
+			// "Integration Status: PASSED", and the function returned STATUS_SUCCESS.
+			validationPassed = false;
 		}
 	}
 
@@ -6541,15 +6552,14 @@ NTSTATUS RunComprehensiveDiagnostics()
 	}
 
 	// Test 2: Performance monitoring
+	//
+	// The measurement moved to maincalc(), which runs after loadSettings() has built
+	// the mode list. It used to run here, inside the context constructor, where the
+	// list was always empty: it timed nothing, and neither of its thresholds could
+	// ever fire.
 	logStream.str("");
-	logStream << "Running Test 2: Performance Monitoring";
+	logStream << "Running Test 2: Performance Monitoring (deferred to maincalc)";
 	vddlog("d", logStream.str().c_str());
-	
-	NTSTATUS perfStatus = PerformanceMonitor();
-	if (!NT_SUCCESS(perfStatus)) {
-		vddlog("e", "Performance monitoring failed");
-		g_IntegrationStatus.errorCount++;
-	}
 
 	// Test 3: Fallback configuration
 	logStream.str("");
@@ -6807,17 +6817,28 @@ NTSTATUS InitializePhase5Integration()
 	NTSTATUS configStatus = ValidateAndSanitizeConfiguration();
 	if (!NT_SUCCESS(configStatus)) {
 		vddlog("w", "Configuration validation completed with warnings");
-		g_IntegrationStatus.warningCount++;
 	}
 	
 	// Run comprehensive diagnostics
 	NTSTATUS diagStatus = RunComprehensiveDiagnostics();
+	
+	// The diagnostics reset their own counters, so a failure detected above was not in
+	// the summary this block prints: it printed "Total Warnings: 0" on a run that had
+	// just logged one. Book it after the reset.
+	if (!NT_SUCCESS(configStatus)) {
+		g_IntegrationStatus.warningCount++;
+	}
 	
 	if (NT_SUCCESS(diagStatus) && NT_SUCCESS(configStatus)) {
 		vddlog("i", "Phase 5 integration completed successfully");
 		g_IntegrationStatus.configurationValid = true;
 	} else {
 		vddlog("e", "Phase 5 integration completed with errors");
+		// The failure branch never cleared the validity flag, which the EDID validation
+		// had already set to true, so the block below printed "Configuration: VALID" on the
+		// same run that logged "completed with errors" and returned
+		// STATUS_UNSUCCESSFUL.
+		g_IntegrationStatus.configurationValid = false;
 		g_IntegrationStatus.lastError = L"Diagnostic failures detected";
 	}
 
