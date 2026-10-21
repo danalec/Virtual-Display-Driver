@@ -5699,7 +5699,8 @@ NTSTATUS VirtualDisplayDriverEvtIddCxParseMonitorDescription2(
 	{
 		logStream << "\n  Mode - Width: " << std::get<0>(mode)
 			<< ", Height: " << std::get<1>(mode)
-			<< ", RefreshRate: " << std::get<2>(mode);
+			<< ", RefreshRate: "
+			<< (std::get<3>(mode) ? static_cast<double>(std::get<2>(mode)) / std::get<3>(mode) : 0.0) << "Hz";
 	}
 	vddlog("d", logStream.str().c_str());
 
@@ -5792,7 +5793,8 @@ NTSTATUS VirtualDisplayDriverEvtIddCxMonitorQueryTargetModes2(
 		logStream << "\n  TargetModeIndex: " << i
 			<< "\n    Width: " << std::get<0>(monitorModes[i])
 			<< "\n    Height: " << std::get<1>(monitorModes[i])
-			<< "\n    RefreshRate: " << std::get<2>(monitorModes[i]);
+			<< "\n    RefreshRate: "
+			<< (std::get<3>(monitorModes[i]) ? static_cast<double>(std::get<2>(monitorModes[i])) / std::get<3>(monitorModes[i]) : 0.0) << "Hz";
 	}
 	vddlog("d", logStream.str().c_str());
 
