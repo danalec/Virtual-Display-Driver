@@ -132,8 +132,11 @@ namespace Microsoft
 
             WDFDEVICE m_WdfDevice;
             IDDCX_ADAPTER m_Adapter;
-            IDDCX_MONITOR m_Monitor;
-            IDDCX_MONITOR m_Monitor2;
+            // The monitors this context created, one per connector index. The driver used
+            // to keep only the last one in a single member, so the others were
+            // unaddressable and no departure could ever be reported for them. The second
+            // member was dead: it was never written and never read.
+            std::vector<IDDCX_MONITOR> m_Monitors;
             std::map<IDDCX_MONITOR, std::unique_ptr<SwapChainProcessor>> m_ProcessingThreads;
 
             // Guards m_ProcessingThreads, the map of swap-chain processors, one per monitor.

@@ -5185,9 +5185,7 @@ void IndirectDeviceContext::CleanupExpiredDevices()
 
 IndirectDeviceContext::IndirectDeviceContext(_In_ WDFDEVICE WdfDevice) :
 	m_WdfDevice(WdfDevice),
-	m_Adapter(nullptr),
-	m_Monitor(nullptr),
-	m_Monitor2(nullptr)
+	m_Adapter(nullptr)
 {
 	// Initialize Phase 5: Final Integration and Testing
 	NTSTATUS initStatus = InitializePhase5Integration();
@@ -5406,7 +5404,7 @@ void IndirectDeviceContext::CreateMonitor(unsigned int index) {
 	if (NT_SUCCESS(Status))
 	{
 		vddlog("d", "Monitor created successfully.");
-		m_Monitor = MonitorCreateOut.MonitorObject;
+		m_Monitors.push_back(MonitorCreateOut.MonitorObject);
 
 		// Associate the monitor with this device context
 		auto* pContext = WdfObjectGet_IndirectDeviceContextWrapper(MonitorCreateOut.MonitorObject);
@@ -5414,7 +5412,7 @@ void IndirectDeviceContext::CreateMonitor(unsigned int index) {
 
 		// Tell the OS that the monitor has been plugged in
 		IDARG_OUT_MONITORARRIVAL ArrivalOut;
-		Status = IddCxMonitorArrival(m_Monitor, &ArrivalOut);
+		Status = IddCxMonitorArrival(MonitorCreateOut.MonitorObject, &ArrivalOut);
 		if (NT_SUCCESS(Status))
 		{
 			vddlog("d", "Monitor arrival successfully reported.");
