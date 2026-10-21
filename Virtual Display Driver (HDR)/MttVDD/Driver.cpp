@@ -3620,6 +3620,22 @@ extern "C" NTSTATUS DriverEntry(
 	preventManufacturerSpoof = EnabledQuery(L"PreventMonitorSpoof");
 	edidCeaOverride = EnabledQuery(L"EdidCeaOverride");
 	sendLogsThroughPipe = EnabledOr(L"SendLogsThroughPipe", true);
+	
+	// The string settings have the same problem the integer ones below have:
+	// GetStringSetting answers an empty string for a key that is not in the file, and an
+	// empty profile path is not a path. The compiled default stands in for it, and the
+	// log says so, because an absent key and a key someone emptied should not look the
+	// same in the log.
+	auto stringOr = [](const std::wstring& value, const std::wstring& fallback, const wchar_t* what) {
+		if (value.empty()) {
+			stringstream ss;
+			ss << WStringToString(what) << " is not set, using the built-in default of "
+			   << WStringToString(fallback);
+			vddlog("w", ss.str().c_str());
+			return fallback;
+		}
+		return value;
+	};
 
 
 	//colour
@@ -3627,7 +3643,7 @@ extern "C" NTSTATUS DriverEntry(
 	SDR10 = EnabledQuery(L"SDR10Enabled");
 	HDRCOLOUR = HDRPlus ? IDDCX_BITS_PER_COMPONENT_12 : IDDCX_BITS_PER_COMPONENT_10;
 	SDRCOLOUR = SDR10 ? IDDCX_BITS_PER_COMPONENT_10 : IDDCX_BITS_PER_COMPONENT_8;
-	ColourFormat = GetStringSetting(L"ColourFormat");
+	ColourFormat = stringOr(GetStringSetting(L"ColourFormat"), L"RGB", L"ColourFormat");
 
 	// GetIntegerSetting answers -1 when the key is in neither the registry nor the settings
 	// XML, and DriverEntry reads them before loadSettings() decides which source exists.
@@ -3649,7 +3665,8 @@ extern "C" NTSTATUS DriverEntry(
 	// === LOAD NEW EDID INTEGRATION SETTINGS ===
 	edidIntegrationEnabled = EnabledQuery(L"EdidIntegrationEnabled");
 	autoConfigureFromEdid = EnabledQuery(L"AutoConfigureFromEdid");
-	edidProfilePath = GetStringSetting(L"EdidProfilePath");
+	edidProfilePath = stringOr(GetStringSetting(L"EdidProfilePath"),
+		L"EDID/monitor_profile.xml", L"EDID profile path");
 	overrideManualSettings = EnabledQuery(L"OverrideManualSettings");
 	fallbackOnError = EnabledOr(L"FallbackOnError", true);
 
@@ -3672,12 +3689,12 @@ extern "C" NTSTATUS DriverEntry(
 
 	colorSpaceEnabled = EnabledQuery(L"ColorSpaceEnabled");
 	gammaCorrection = GetDoubleSetting(L"GammaCorrection");
-	primaryColorSpace = GetStringSetting(L"PrimaryColorSpace");
+	primaryColorSpace = stringOr(GetStringSetting(L"PrimaryColorSpace"), L"sRGB", L"Primary color space");
 	enableMatrixTransform = EnabledQuery(L"EnableMatrixTransform");
 
 	// === LOAD AUTO RESOLUTIONS SETTINGS ===
 	autoResolutionsEnabled = EnabledQuery(L"AutoResolutionsEnabled");
-	sourcePriority = GetStringSetting(L"SourcePriority");
+	sourcePriority = stringOr(GetStringSetting(L"SourcePriority"), L"manual", L"Source priority");
 	minRefreshRate = positiveOr(GetIntegerSetting(L"MinRefreshRate"), 24, L"min_refresh_rate");
 	maxRefreshRate = positiveOr(GetIntegerSetting(L"MaxRefreshRate"), 240, L"max_refresh_rate");
 	excludeFractionalRates = EnabledQuery(L"ExcludeFractionalRates");
@@ -3692,7 +3709,7 @@ extern "C" NTSTATUS DriverEntry(
 
 	// === LOAD COLOR ADVANCED SETTINGS ===
 	autoSelectFromColorSpace = EnabledQuery(L"AutoSelectFromColorSpace");
-	forceBitDepth = GetStringSetting(L"ForceBitDepth");
+	forceBitDepth = stringOr(GetStringSetting(L"ForceBitDepth"), L"8", L"Force bit depth");
 	// GetStringSetting answers L"" for a key that is in neither source, and L"" is not "auto",
 	// so the block below took the forced branch, matched no depth, and logged an error on every
 	// boot of the configuration that has no settings file -- while applying nothing.
