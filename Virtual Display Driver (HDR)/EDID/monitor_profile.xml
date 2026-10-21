@@ -206,8 +206,8 @@
     </Chromaticity>
   </ColorProfile>
   <PreferredMode>
-    <Width>4096</Width>
+    <Width>3840</Width>
     <Height>2160</Height>
-    <RefreshRate>59.940</RefreshRate>
+    <RefreshRate>60.000</RefreshRate>
   </PreferredMode>
 </IddCxMonitorConfig>

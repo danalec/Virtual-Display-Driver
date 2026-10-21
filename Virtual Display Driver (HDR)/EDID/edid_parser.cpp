@@ -79,6 +79,11 @@ private:
     HDRMetadata hdr_metadata;
     ColorProfile color_profile;
     
+    // The display's preferred timing, taken from the first detailed timing descriptor of
+    // the base block. The profile used to pick the mode with the most pixels instead.
+    bool has_preferred_mode = false;
+    VideoMode preferred_mode{0, 0, 1000, 60};
+    
     // Helper functions
     uint16_t read_uint16_le(const uint8_t* data) {
         return data[0] | (data[1] << 8);
@@ -88,13 +93,15 @@ private:
         return (data[0] << 8) | data[1];
     }
     
-    // Calculate Z multiplier for fractional refresh rates
+    // The refresh rate is carried as (nominal Hz, per-mille correction) and the driver
+    // recomputes it as nominal * Z / 1000. This used to recognise only the NTSC factor
+    // 1000/1001 and forced Z to 1000 for everything else, so a timing whose real rate
+    // was 48.0769 Hz was reported as exactly 48 Hz and the difference was lost without
+    // a word. Z now carries the residual: the NTSC case still lands on 999 (59.94006 Hz
+    // -> 999) and every other rate keeps the fraction it actually has.
     int calculate_z_multiplier(double actual_refresh, int nominal_refresh) {
-        // For standard NTSC fractional rates (59.94, 29.97, 23.976)
-        if (std::abs(actual_refresh - nominal_refresh * 1000.0/1001.0) < 0.01) {
-            return 999; // 999/1000 = 0.999, which gives us the NTSC factor
-        }
-        return 1000; // For exact refresh rates
+        if (nominal_refresh <= 0) return 1000;
+        return static_cast<int>(actual_refresh * 1000.0 / nominal_refresh + 0.5);
     }
     
     void parse_base_edid() {
@@ -134,6 +141,21 @@ private:
             }
         }
         std::cout << std::endl;
+
+        // The display gamma is EDID byte 23, stored as (gamma * 100) - 100, so 120 means
+        // 2.2. 0xFF means the EDID does not define it here -- the gamma then comes from
+        // the extension block -- and the sRGB default stands in for it. The value used to
+        // be hardcoded at 2.2, so an EDID asking for a different gamma was ignored.
+        uint8_t gamma_byte = edid_data[23];
+        if (gamma_byte == 0xFF) {
+            std::cout << "Display gamma: not defined by this EDID (byte 23 = 0xFF), keeping "
+                      << color_profile.gamma << std::endl;
+        } else {
+            color_profile.gamma = (gamma_byte + 100) / 100.0;
+            std::cout << "Display gamma: " << color_profile.gamma
+                      << " (EDID byte 23 = 0x" << std::hex << (int)gamma_byte << std::dec
+                      << ")" << std::endl;
+        }
         
         // Parse display descriptors (might contain HDR info)
         std::cout << "Checking display descriptors for HDR hints..." << std::endl;
@@ -153,6 +175,8 @@ private:
                 parse_detailed_timing_descriptor(&edid_data[54 + i * 18]);
             }
         }
+        
+        capture_preferred_mode();
         
         // Parse chromaticity (bytes 25-34)
         parse_chromaticity();
@@ -272,10 +296,13 @@ private:
         }
     }
     
-    void parse_detailed_timing_descriptor(const uint8_t* dtd) {
+    // Decode a Detailed Timing Descriptor. Returns false when the descriptor is not a
+    // timing at all (the first two bytes are zero) or when it carries nothing usable.
+    bool decode_detailed_timing(const uint8_t* dtd, int& h_active, int& v_active,
+                                double& refresh_rate, bool& interlaced) {
         if (dtd[0] == 0 && dtd[1] == 0) {
             // Display descriptor, not timing
-            return;
+            return false;
         }
         
         // 32 bits, not 16: read_uint16_le returns the raw clock in units of
@@ -285,20 +312,94 @@ private:
         // 1920x1080 at 148.5 MHz was reported as 7 Hz, and the profile the tool
         // wrote that into is the profile the driver reads.
         uint32_t pixel_clock = static_cast<uint32_t>(read_uint16_le(dtd)) * 10; // in kHz
-        uint16_t h_active = dtd[2] | ((dtd[4] & 0xF0) << 4);
-        uint16_t h_blanking = dtd[3] | ((dtd[4] & 0x0F) << 8);
-        uint16_t v_active = dtd[5] | ((dtd[7] & 0xF0) << 4);
-        uint16_t v_blanking = dtd[6] | ((dtd[7] & 0x0F) << 8);
+        h_active = dtd[2] | ((dtd[4] & 0xF0) << 4);
+        int h_blanking = dtd[3] | ((dtd[4] & 0x0F) << 8);
+        v_active = dtd[5] | ((dtd[7] & 0xF0) << 4);
+        int v_blanking = dtd[6] | ((dtd[7] & 0x0F) << 8);
+        interlaced = (dtd[17] & 0x80) != 0;
         
-        if (h_active && v_active && pixel_clock) {
-            uint32_t total_pixels = (h_active + h_blanking) * (v_active + v_blanking);
-            double refresh_rate = (pixel_clock * 1000.0) / total_pixels;
-            
-            int nominal_refresh = static_cast<int>(refresh_rate + 0.5);
-            int z_multiplier = calculate_z_multiplier(refresh_rate, nominal_refresh);
-            
-            video_modes.emplace_back(h_active, v_active, z_multiplier, nominal_refresh);
+        if (!h_active || !v_active || !pixel_clock) {
+            return false;
         }
+        
+        uint32_t total_pixels = (h_active + h_blanking) * (v_active + v_blanking);
+        refresh_rate = (pixel_clock * 1000.0) / total_pixels;
+        return true;
+    }
+    
+    void parse_detailed_timing_descriptor(const uint8_t* dtd) {
+        int h_active = 0, v_active = 0;
+        double refresh_rate = 0.0;
+        bool interlaced = false;
+        
+        if (!decode_detailed_timing(dtd, h_active, v_active, refresh_rate, interlaced)) {
+            return;
+        }
+        
+        if (interlaced) {
+            // The vertical values of an interlaced descriptor are per field, so the frame
+            // is twice as tall and runs at half the field rate. The 1080i24 descriptor in
+            // digihome_edid.bin decoded as a 1920x540 mode at 48 Hz: a resolution the
+            // display does not have, at a rate that is not the frame rate. The mode list
+            // has no interlace field -- the driver reports (width, height, vsyncNum,
+            // vsyncDen) -- so an interlaced mode would be reported as progressive, which
+            // is a different mode than the display has. Skip it, the same way the
+            // interlaced CTA VICs are skipped.
+            std::cout << "  Interlaced detailed timing " << h_active << "x" << (v_active * 2)
+                      << " skipped: the mode list cannot express interlace" << std::endl;
+            return;
+        }
+        
+        int nominal_refresh = static_cast<int>(refresh_rate + 0.5);
+        if (nominal_refresh <= 0) {
+            return;
+        }
+        int z_multiplier = calculate_z_multiplier(refresh_rate, nominal_refresh);
+        
+        video_modes.emplace_back(h_active, v_active, z_multiplier, nominal_refresh);
+    }
+    
+    // The EDID carries the display's preferred timing in the first detailed timing
+    // descriptor of the base block (bytes 54-71), and byte 24 bit 1 is the flag that
+    // says the descriptor is there. The profile used to pick the mode with the most
+    // pixels instead, which named a resolution the display never said it preferred.
+    void capture_preferred_mode() {
+        int h_active = 0, v_active = 0;
+        double refresh_rate = 0.0;
+        bool interlaced = false;
+        bool found = false;
+        
+        if (edid_data[24] & 0x02) {
+            found = decode_detailed_timing(&edid_data[54], h_active, v_active,
+                                           refresh_rate, interlaced);
+        }
+        
+        if (!found) {
+            // The EDID does not flag descriptor 1, or descriptor 1 is not a timing:
+            // take the first timing the descriptor block holds.
+            for (int i = 0; i < 4 && !found; i++) {
+                found = decode_detailed_timing(&edid_data[54 + i * 18], h_active, v_active,
+                                               refresh_rate, interlaced);
+            }
+        }
+        
+        if (!found || interlaced) {
+            return;
+        }
+        
+        int nominal_refresh = static_cast<int>(refresh_rate + 0.5);
+        if (nominal_refresh <= 0) {
+            return;
+        }
+        
+        preferred_mode = VideoMode(h_active, v_active,
+                                   calculate_z_multiplier(refresh_rate, nominal_refresh),
+                                   nominal_refresh);
+        has_preferred_mode = true;
+        
+        std::cout << "  Preferred timing: " << preferred_mode.x << "x" << preferred_mode.y
+                  << " @ " << (preferred_mode.Z * preferred_mode.refresh) / 1000.0
+                  << " Hz" << std::endl;
     }
     
     void parse_chromaticity() {
@@ -552,22 +653,31 @@ private:
     void parse_vendor_specific_block(const uint8_t* vsdb, uint8_t length) {
         if (length < 3) return;
         
-        // Check for vendor OUI
+        // An IEEE OUI is stored in an EDID vendor specific data block least significant
+        // byte first. Measured in the three EDIDs of this repository: the HDMI LLC OUI
+        // (00-0C-03) appears as 03 0C 00, the HDMI Forum OUI (C4-5D-D8) as D8 5D C4 and
+        // the Dolby OUI (00-0D-1E) as 1E 0D 00. The accumulation below is that order.
+        // The HDR10+ constant was 0x90848B, which is neither this order nor the other
+        // one, so that branch could never be taken -- and the HDMI Forum had no branch
+        // at all.
         uint32_t oui = vsdb[0] | (vsdb[1] << 8) | (vsdb[2] << 16);
         
         std::cout << "  Vendor Specific Data Block:" << std::endl;
         std::cout << "    OUI: 0x" << std::hex << std::setw(6) << std::setfill('0') << oui << std::dec << std::endl;
         
-        if (oui == 0x000C03) { // HDMI LLC OUI
+        if (oui == 0x000C03) { // HDMI LLC OUI (00-0C-03, stored least significant byte first)
             std::cout << "    → HDMI LLC Vendor Specific Data Block" << std::endl;
             if (length > 5) {
                 // Parse HDMI capabilities
                 std::cout << "    HDMI capabilities found" << std::endl;
             }
-        } else if (oui == 0x000D1E) { // Dolby Laboratories OUI (00-0D-1E, stored LSB-first)
+        } else if (oui == 0xC45DD8) { // HDMI Forum OUI (C4-5D-D8)
+            std::cout << "    → HDMI Forum Vendor Specific Data Block" << std::endl;
+            parse_hdmi_forum_vsdb(vsdb, length);
+        } else if (oui == 0x000D1E) { // Dolby Laboratories OUI (00-0D-1E)
             std::cout << "    → Dolby Laboratories Vendor Specific Data Block" << std::endl;
             parse_dolby_vendor_block(&vsdb[3], length - 3);
-        } else if (oui == 0x90848B) { // HDR10+ Technologies OUI  
+        } else if (oui == 0x8B4890) { // HDR10+ Technologies OUI (8B-48-90, stored least significant byte first)
             std::cout << "    → HDR10+ Technologies Vendor Specific Data Block" << std::endl;
             parse_hdr10plus_vendor_block(&vsdb[3], length - 3);
         } else {
@@ -794,11 +904,24 @@ private:
         std::cout << "      Dolby Vision Support Set: " << (hdr_metadata.dolby_vision_supported ? "Yes" : "No") << std::endl;
     }
     
+    // The HDMI Forum VSDB carries what the forum added on top of the HDMI LLC block.
+    // The block starts with the IEEE OUI, both in a CTA-861 extension and in the
+    // DisplayID extended tag, so the OUI is part of the data handed over.
     void parse_hdmi_forum_vsdb(const uint8_t* hf_data, uint8_t length) {
-        if (length < 4) return;
+        if (length < 3) return;
         
-        // HDMI Forum VSDB provides additional capabilities
-        // This can include higher refresh rates, VRR support, etc.
+        uint32_t oui = hf_data[0] | (hf_data[1] << 8) | (hf_data[2] << 16);
+        if (oui != 0xC45DD8) {
+            return;
+        }
+        
+        std::cout << "      HDMI Forum Vendor Block parsing:" << std::endl;
+        std::cout << "      Length: " << (int)(length - 3) << " bytes" << std::endl;
+        std::cout << "      HDMI Forum data: ";
+        for (uint8_t i = 3; i < length; i++) {
+            std::cout << std::hex << std::setw(2) << std::setfill('0') << (int)hf_data[i] << " ";
+        }
+        std::cout << std::dec << std::endl;
     }
 
 public:
@@ -1002,6 +1125,10 @@ public:
             return "No video modes found";
         }
         
+        // The EDID's preferred timing wins over "the mode with the most pixels": the
+        // SONY TV in this repository prefers 3840x2160 and the profile said 4096x2160.
+        const VideoMode& preferred = has_preferred_mode ? preferred_mode : *highest_mode;
+        
         profile << "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n";
         profile << "<IddCxMonitorConfig>\n";
         profile << "  <MonitorModes>\n";
@@ -1066,11 +1193,11 @@ public:
         profile << "    </Chromaticity>\n";
         profile << "  </ColorProfile>\n";
         
-        // Preferred mode (highest specs)
+        // Preferred mode (the EDID's own preferred timing when it has one)
         profile << "  <PreferredMode>\n";
-        profile << "    <Width>" << highest_mode->x << "</Width>\n";
-        profile << "    <Height>" << highest_mode->y << "</Height>\n";
-        profile << "    <RefreshRate>" << std::fixed << std::setprecision(3) << (highest_mode->Z * highest_mode->refresh) / 1000.0 << "</RefreshRate>\n";
+        profile << "    <Width>" << preferred.x << "</Width>\n";
+        profile << "    <Height>" << preferred.y << "</Height>\n";
+        profile << "    <RefreshRate>" << std::fixed << std::setprecision(3) << (preferred.Z * preferred.refresh) / 1000.0 << "</RefreshRate>\n";
         profile << "  </PreferredMode>\n";
         
         profile << "</IddCxMonitorConfig>\n";
@@ -1118,6 +1245,14 @@ public:
         std::cout << "  Chromaticity - Green: (" << color_profile.green_x << ", " << color_profile.green_y << ")" << std::endl;
         std::cout << "  Chromaticity - Blue: (" << color_profile.blue_x << ", " << color_profile.blue_y << ")" << std::endl;
         std::cout << "  Chromaticity - White: (" << color_profile.white_x << ", " << color_profile.white_y << ")" << std::endl;
+        
+        if (has_preferred_mode) {
+            std::cout << "\nPreferred Mode:" << std::endl;
+            std::cout << "  " << preferred_mode.x << "x" << preferred_mode.y << "@"
+                      << std::fixed << std::setprecision(2)
+                      << (preferred_mode.Z * preferred_mode.refresh) / 1000.0
+                      << "Hz" << std::endl;
+        }
     }
 };
 
