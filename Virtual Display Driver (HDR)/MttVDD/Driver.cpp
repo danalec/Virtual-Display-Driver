@@ -1716,6 +1716,10 @@ bool LoadEdidProfile(const wstring& profilePath, EdidProfileData& profile) {
 		case XmlNodeType_Text:
 			hr = pReader->GetValue(&pwszValue, &cwchValue);
 			if (FAILED(hr)) return false;
+			// GetValue can report success and still leave the pointer null, and
+			// constructing a wstring from a null pointer is undefined behaviour. The
+			// sibling call in this function, GetLocalName, was already checked.
+			if (pwszValue == nullptr) return false;
 			
 			wstring value = wstring(pwszValue, cwchValue);
 			
@@ -1806,6 +1810,14 @@ bool LoadEdidProfile(const wstring& profilePath, EdidProfileData& profile) {
 			}
 			break;
 		}
+	}
+
+	// The read loop stops on a parse error as well as at the end of the file, and the
+	// error was swallowed: a malformed profile was reported as "EDID Profile loaded"
+	// and applied with whatever the parser had managed to read before giving up.
+	if (FAILED(hr)) {
+		vddlog("e", "LoadEdidProfile: the profile is not well-formed XML");
+		return false;
 	}
 
 	stringstream ss;
@@ -4940,28 +4952,52 @@ vector<BYTE> loadEdid(const string& filePath) {
 		// that ship with the project, all of which the rule keeps: the embedded one and
 		// the two 256-byte ones have one extension, and 8K240HzHDR.edid is 384 bytes
 		// with two, so 128 * (1 + count) holds for each.
-		if ((size % 128) != 0 || size < 128 * (static_cast<streamsize>(buffer[126]) + 1)) {
+		const streamsize declared = 128 * (static_cast<streamsize>(buffer[126]) + 1);
+		if ((size % 128) != 0 || size < declared) {
 			vddlog("e", "Custom edid does not match the extension count it declares, ignoring it");
 			vddlog("i", "Using hardcoded edid");
 			return hardcodedEdid;
 		}
+		if (size > declared) {
+			// The file carries blocks the EDID does not declare. The OS would ignore
+			// them, so drop them here and say so: the buffer handed over is exactly
+			// what the EDID says it is.
+			vddlog("w", "Custom edid carries more blocks than it declares, dropping the extra ones");
+			buffer.resize(static_cast<size_t>(declared));
+		}
 
-		//calculate checksum and compare it to 127 byte, if false then return hardcoded if true then return buffer to prevent loading borked edid.
-		BYTE calculatedChecksum = calculateChecksum(buffer);
-		if (calculatedChecksum != buffer[127]) {
-			vddlog("e", "Custom edid failed due to invalid checksum");
-			vddlog("i", "Using hardcoded edid");
-			return hardcodedEdid;
+		// Every 128-byte block carries its own checksum, and the sum of a whole block
+		// has to be a multiple of 256. Only the base block was checked, so a file whose
+		// extension block was corrupt passed and the OS was handed an EDID with a bad
+		// extension. Measured: the embedded EDID and the three shipped files have a
+		// correct checksum in every block.
+		for (size_t block = 0; block + 128 <= buffer.size(); block += 128) {
+			BYTE sum = 0;
+			for (size_t i = 0; i < 128; ++i) {
+				sum = static_cast<BYTE>(sum + buffer[block + i]);
+			}
+			if (sum != 0) {
+				vddlog("e", "Custom edid failed due to invalid checksum in one of its blocks");
+				vddlog("i", "Using hardcoded edid");
+				return hardcodedEdid;
+			}
 		}
 
 		if (edidCeaOverride) {
-			if (buffer.size() == 256) {
-				for (int i = 128; i < 256; ++i) {
+			// The override replaces the CEA extension block -- the first one -- with the
+			// driver's own. The old code only handled a file of exactly 256 or exactly 128
+			// bytes and did nothing at all for any other size, silently: the project
+			// ships an 8K240HzHDR.edid of 384 bytes, so the setting did nothing for it
+			// and the log still said "Using custom edid".
+			if (buffer.size() >= 256) {
+				for (size_t i = 128; i < 256; ++i) {
 					buffer[i] = hardcodedEdid[i];
 				}
-				updateCeaExtensionCount(buffer, 1);
+				// The number of blocks does not change: the file still has as many as it
+				// declared, and the extension count in the base block says so.
 			}
-			else if (buffer.size() == 128) {
+			else {
+				// The custom EDID is only the base block, so append the hardcoded extension.
 				buffer.insert(buffer.end(), hardcodedEdid.begin() + 128, hardcodedEdid.end());
 				updateCeaExtensionCount(buffer, 1);
 			}
