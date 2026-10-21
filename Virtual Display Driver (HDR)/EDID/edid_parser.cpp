@@ -1141,13 +1141,20 @@ public:
                 return a.refresh < b.refresh;
             });
         
-        if (highest_mode == video_modes.end()) {
-            return "No video modes found";
-        }
+        // An EDID that yields no mode at all still gets a profile: the file the driver
+        // reads has to be XML. The tool used to write the sentence "No video modes
+        // found" into monitor_profile.xml, report the profile as saved and exit 0, and
+        // the driver rejected the file as malformed. The driver copes with a profile
+        // that carries no modes: it loads it, finds no EDID mode and falls back to the
+        // modes from vdd_settings.xml.
+        const bool have_modes = highest_mode != video_modes.end();
         
         // The EDID's preferred timing wins over "the mode with the most pixels": the
         // SONY TV in this repository prefers 3840x2160 and the profile said 4096x2160.
-        const VideoMode& preferred = has_preferred_mode ? preferred_mode : *highest_mode;
+        const VideoMode* preferred = nullptr;
+        if (have_modes) {
+            preferred = has_preferred_mode ? &preferred_mode : &(*highest_mode);
+        }
         
         profile << "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n";
         profile << "<IddCxMonitorConfig>\n";
@@ -1199,7 +1206,10 @@ public:
         }
         
         profile << "    <PrimaryColorSpace>" << colorspace_name << "</PrimaryColorSpace>\n";
-        profile << "    <Gamma>" << color_profile.gamma << "</Gamma>\n";
+        // The gamma used to be written on the profile stream, which carries std::fixed
+        // and whatever precision the last write set: it came out as 2.200 when the
+        // EDID had modes and as 2.2 when it had none. Say what it is.
+        profile << "    <Gamma>" << std::fixed << std::setprecision(3) << color_profile.gamma << "</Gamma>\n";
         
         profile << "    <Chromaticity>\n";
         profile << "      <RedX>" << std::fixed << std::setprecision(4) << color_profile.red_x << "</RedX>\n";
@@ -1214,11 +1224,13 @@ public:
         profile << "  </ColorProfile>\n";
         
         // Preferred mode (the EDID's own preferred timing when it has one)
-        profile << "  <PreferredMode>\n";
-        profile << "    <Width>" << preferred.x << "</Width>\n";
-        profile << "    <Height>" << preferred.y << "</Height>\n";
-        profile << "    <RefreshRate>" << std::fixed << std::setprecision(3) << (preferred.Z * preferred.refresh) / 1000.0 << "</RefreshRate>\n";
-        profile << "  </PreferredMode>\n";
+        if (preferred) {
+            profile << "  <PreferredMode>\n";
+            profile << "    <Width>" << preferred->x << "</Width>\n";
+            profile << "    <Height>" << preferred->y << "</Height>\n";
+            profile << "    <RefreshRate>" << std::fixed << std::setprecision(3) << (preferred->Z * preferred->refresh) / 1000.0 << "</RefreshRate>\n";
+            profile << "  </PreferredMode>\n";
+        }
         
         profile << "</IddCxMonitorConfig>\n";
         
@@ -1228,6 +1240,11 @@ public:
     void print_summary() const {
         std::cout << "=== EDID Parser Results ===" << std::endl;
         std::cout << "Video Modes Found: " << video_modes.size() << std::endl;
+        
+        if (video_modes.empty()) {
+            std::cout << "  No mode could be read from this EDID. The profile carries no mode"
+                      << " and the driver falls back to the modes from vdd_settings.xml." << std::endl;
+        }
         
         for (const auto& mode : video_modes) {
             double actual_refresh = (mode.Z * mode.refresh) / 1000.0;
@@ -1306,6 +1323,12 @@ int main(int argc, char* argv[]) {
     // Generate IDDCX profile
     std::cout << "\n=== IDDCX Profile ===" << std::endl;
     std::cout << parser.generate_iddcx_profile() << std::endl;
+    
+    if (modes.empty()) {
+        std::cerr << "Warning: no video mode could be read from " << argv[1]
+                  << ". The profile carries no mode and the driver will use the modes from"
+                  << " vdd_settings.xml." << std::endl;
+    }
     
     // Save profile to file
     std::ofstream profile_file("monitor_profile.xml");
