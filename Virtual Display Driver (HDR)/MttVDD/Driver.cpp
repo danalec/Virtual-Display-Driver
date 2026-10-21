@@ -1449,19 +1449,48 @@ tuple<int, int, int, int> FindPreferredModeFromEdid(const EdidProfileData& profi
         return preferredMode;
     }
     
-    // Look for EDID preferred mode in available modes
+    // Look for the EDID preferred mode in the available modes. The resolution is what
+    // identifies it and the refresh rate says which of the modes with that resolution
+    // the display prefers. A display that prefers 3840x2160 at 60 Hz and also reports
+    // 3840x2160 at 120 Hz used to be given the 120 Hz mode: the modes are sorted by
+    // rate and the first resolution match won. The rate the profile carries was parsed
+    // and then dropped on the floor.
+    tuple<int, int, int, int> resolutionMatch = preferredMode;
+    bool haveResolutionMatch = false;
+    
     for (const auto& mode : availableModes) {
-        if (get<0>(mode) == profile.preferredWidth && 
+        if (get<0>(mode) == profile.preferredWidth &&
             get<1>(mode) == profile.preferredHeight) {
-            // Found matching resolution, use it
-            preferredMode = mode;
+            const double rate = get<3>(mode) ? static_cast<double>(get<2>(mode)) / get<3>(mode) : 0.0;
             
-            stringstream ss;
-            ss << "Found EDID preferred mode: " << profile.preferredWidth << "x" << profile.preferredHeight 
-               << "@" << (get<3>(mode) ? static_cast<double>(get<2>(mode)) / get<3>(mode) : 0.0) << "Hz";
-            vddlog("i", ss.str().c_str());
-            break;
+            if (abs(rate - profile.preferredRefresh) < 0.5) {
+                // The resolution and the rate the EDID asked for.
+                preferredMode = mode;
+                
+                stringstream ss;
+                ss << "Found EDID preferred mode: " << profile.preferredWidth << "x" << profile.preferredHeight 
+                   << "@" << rate << "Hz";
+                vddlog("i", ss.str().c_str());
+                return preferredMode;
+            }
+            
+            if (!haveResolutionMatch) {
+                resolutionMatch = mode;
+                haveResolutionMatch = true;
+            }
         }
+    }
+    
+    if (haveResolutionMatch) {
+        // The resolution is among the reported modes but not at the rate the EDID asked
+        // for, so the first of them stands.
+        preferredMode = resolutionMatch;
+        
+        stringstream ss;
+        ss << "Found EDID preferred mode: " << profile.preferredWidth << "x" << profile.preferredHeight 
+           << "@" << (get<3>(preferredMode) ? static_cast<double>(get<2>(preferredMode)) / get<3>(preferredMode) : 0.0) << "Hz"
+           << " (the EDID asks for " << profile.preferredRefresh << "Hz, which is not among the reported modes)";
+        vddlog("i", ss.str().c_str());
     }
     
     return preferredMode;
