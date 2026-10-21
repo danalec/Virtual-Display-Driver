@@ -4897,33 +4897,29 @@ static UINT64 Gcd64(UINT64 a, UINT64 b) {
 }
 
 DISPLAYCONFIG_VIDEO_SIGNAL_INFO dispinfo(UINT32 h, UINT32 v, UINT32 rn, UINT32 rd) {
-	// The 32-bit product here used to wrap before it reached the headline modes. option.txt
-	// shipped "7680, 4320, 500": 500 * 4324 * 4324 = 9,348,488,000 exceeds UINT32 and wrapped
-	// to 758,553,408, so an 8K mode was reported at a 758 MHz pixel clock. PixelRate is UINT32,
-	// so this computes wide and saturates, the same way Mode.pixelRate does.
-	// totalLines is UINT64 throughout: keeping "(v + 4)" in UINT32 inside the product trips
-	// C4754 under the Debug configurations, which analyse harder than Release.
-	const UINT64 totalLines = static_cast<UINT64>(v) + 4;
-	const UINT64 totalPixels = static_cast<UINT64>(h) + 4;
-	// The pixel clock has to be the refresh rate times the number of pixels in a
-	// frame, and the total size below is (h + 4) by (v + 4). The old code multiplied
-	// the refresh by (v + 4) squared -- a square model -- so the clock it reported was
-	// short by the factor (v + 4) / (h + 4): 56% of the real value for 1920x1080 and
-	// 75% for 1024x768. The mode contradicted itself, and it contradicted the target
-	// mode the driver builds for the same resolution, which uses the active size and
-	// is internally consistent. The refresh rate the driver reports does not change.
-	const UINT64 denominator = rd ? rd : 1;
-	const UINT64 wideClock = static_cast<UINT64>(rn) * totalPixels * totalLines / denominator + 1000;
-	const UINT32 clock_rate = wideClock > UINT_MAX ? UINT_MAX : static_cast<UINT32>(wideClock);
+	// The monitor mode and the target mode describe the same mode, and the operating
+	// system intersects the two lists, so the two have to agree. This one used to
+	// describe the mode with a total size of (h + 4) by (v + 4) and a pixel clock of
+	// refresh * (h + 4) * (v + 4) + 1000, while the target mode used the active size
+	// and no fudge: the same mode carried two different timings, and the clock did
+	// not match the refresh rate and the geometry the mode reported. Microsoft's own
+	// IddSampleDriver builds both with the same helper, and the only difference
+	// between them is the vertical sync divider.
 	//
-	// The two rates come from the mode's own numbers, not from the clock. The clock
-	// is clamped when it does not fit in the UINT32 the structure carries, and
-	// deriving the rates from the clamped clock made the mode report 137.867 Hz for
-	// a 144 Hz mode -- and made the monitor mode and the target mode disagree about
-	// the refresh rate of the same mode. The horizontal rate is the line rate (the
-	// refresh times the lines in a frame) and the vertical rate is the refresh
-	// itself; both are reduced so that neither part overflows.
-	UINT64 hSyncNumerator = static_cast<UINT64>(rn) * totalLines;
+	// The 32-bit product here used to wrap before it reached the headline modes. option.txt
+	// shipped "7680, 4320, 500": 500 * 4324 * 4324 = 9,348,488,000 exceeds UINT32 and
+	// wrapped to 758,553,408, so an 8K mode was reported at a 758 MHz pixel clock. The
+	// clock is computed in 64 bits, and the field it lands in is UINT64, so it fits.
+	const UINT64 denominator = rd ? rd : 1;
+	const UINT64 wideClock = static_cast<UINT64>(rn) * h * v / denominator;
+	//
+	// The two rates come from the mode's own numbers, not from the clock. Deriving them
+	// from the clamped clock made the mode report 137.867 Hz for a 144 Hz mode -- and
+	// made the monitor mode and the target mode disagree about the refresh rate of the
+	// same mode. The horizontal rate is the line rate (the refresh times the lines in a
+	// frame) and the vertical rate is the refresh itself; both are reduced so that
+	// neither part overflows.
+	UINT64 hSyncNumerator = static_cast<UINT64>(rn) * v;
 	UINT64 hSyncDenominator = denominator;
 	const UINT64 hSyncDivisor = Gcd64(hSyncNumerator, hSyncDenominator);
 	hSyncNumerator /= hSyncDivisor;
@@ -4933,22 +4929,12 @@ DISPLAYCONFIG_VIDEO_SIGNAL_INFO dispinfo(UINT32 h, UINT32 v, UINT32 rn, UINT32 r
 	const UINT64 vSyncDivisor = Gcd64(vSyncNumerator, vSyncDenominator);
 	vSyncNumerator /= vSyncDivisor;
 	vSyncDenominator /= vSyncDivisor;
-	if (wideClock > UINT_MAX) {
-		// The clock does not fit in the UINT32 the structure carries. It has to be
-		// clamped -- there is no other way to say it -- but the mode has to say so:
-		// the value it carries is not the rate the mode is.
-		stringstream ss;
-		ss << "The pixel clock for " << h << "x" << v << " @ " << rn << "/" << rd
-			<< " is " << wideClock << " Hz and does not fit in a UINT32; it was clamped to "
-			<< UINT_MAX << ". The refresh rate the mode reports is unaffected.";
-		vddlog("w", ss.str().c_str());
-	}
 	return {
-	  clock_rate,                                      // pixel clock rate [Hz]
+	  wideClock,                                      // pixel clock rate [Hz]
 		{ static_cast<UINT>(hSyncNumerator), static_cast<UINT>(hSyncDenominator) }, // fractional horizontal refresh rate [Hz]
 		{ static_cast<UINT>(vSyncNumerator), static_cast<UINT>(vSyncDenominator) }, // fractional vertical refresh rate [Hz]
 	{ h, v },                                    // (horizontal, vertical) active pixel resolution
-	{ h + 4, static_cast<UINT32>(totalLines) }, // (horizontal, vertical) total pixel resolution
+	{ h, v },                                    // (horizontal, vertical) total pixel resolution
 	{ { 255, 0 }},                                   // video standard and vsync divider
 	DISPLAYCONFIG_SCANLINE_ORDERING_PROGRESSIVE
 	};
@@ -5725,10 +5711,10 @@ void CreateTargetMode(DISPLAYCONFIG_VIDEO_SIGNAL_INFO& Mode, UINT Width, UINT He
 	Mode.AdditionalSignalInfo.videoStandard = 255;
 	Mode.vSyncFreq.Numerator = VSyncNum;
 	Mode.vSyncFreq.Denominator = VSyncDen;
-	// pixelRate and hSyncFreq.Numerator are UINT32, but the 32-bit product below wraps long
-	// before the headline modes: 8K@240 is 240 * 7680 * 4320 = 7,962,624,000, which exceeds
-	// UINT32_MAX. Wrapping silently reported 3,667,656,704 for 8K@240. Compute in 64 bits and
-	// saturate loudly rather than handing the compositor a nonsense rate.
+	// The 32-bit product below wraps long before the headline modes: 8K@240 is
+	// 240 * 7680 * 4320 = 7,962,624,000, which exceeds UINT32_MAX. Wrapping silently
+	// reported 3,667,656,704 for 8K@240. Compute in 64 bits: pixelRate is UINT64, so
+	// the value fits and there is nothing to saturate.
 	// hSyncFreq is a fraction, so the overflow is avoidable: the numerator only
 	// overflowed because the denominator was pinned at the refresh rate's. Reduce
 	// the fraction instead of clamping the numerator, or the mode reports a rate
@@ -5741,18 +5727,20 @@ void CreateTargetMode(DISPLAYCONFIG_VIDEO_SIGNAL_INFO& Mode, UINT Width, UINT He
 	hSyncDenominator /= hSyncDivisor;
 	UINT64 pixelRate = static_cast<UINT64>(VSyncNum) * Width * Height / (VSyncDen ? VSyncDen : 1);
 
-	if (hSyncNumerator > UINT_MAX || pixelRate > UINT_MAX) {
+	if (hSyncNumerator > UINT_MAX) {
+		// DISPLAYCONFIG_RATIONAL carries UINT32 parts, so the horizontal rate has to be
+		// clamped. The pixel clock does not: its field is UINT64.
 		logStream.str("");
-		logStream << "WARNING: timing for " << Width << "x" << Height << " @ " << VSyncNum << "/"
-			<< VSyncDen << " exceeds UINT32 (hSync " << hSyncNumerator << ", pixelRate "
-			<< pixelRate << "); saturating.";
+		logStream << "WARNING: the horizontal rate for " << Width << "x" << Height << " @ "
+			<< VSyncNum << "/" << VSyncDen << " is " << hSyncNumerator << " and does not fit in "
+			"a UINT32; saturating. The pixel clock is " << pixelRate << " Hz and is unaffected.";
 		vddlog("w", logStream.str().c_str());
 	}
 
 	Mode.hSyncFreq.Numerator = static_cast<UINT>(hSyncNumerator);
 	Mode.hSyncFreq.Denominator = static_cast<UINT>(hSyncDenominator);
 	Mode.scanLineOrdering = DISPLAYCONFIG_SCANLINE_ORDERING_PROGRESSIVE;
-	Mode.pixelRate = pixelRate > UINT_MAX ? UINT_MAX : static_cast<UINT>(pixelRate);
+	Mode.pixelRate = pixelRate;
 
 	logStream.str("");
 	logStream << "Target mode configured with:"
