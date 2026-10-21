@@ -47,5 +47,10 @@ if ( $profi -eq "Clone" ) {
 	break
 }
 
-# Neither profile matched: say so instead of exiting silently.
-Write-Error "Current display profile is '$profi', which is neither Extend nor Clone. Nothing was changed.";
+# Neither profile matched. The other two are External (a single active display) and
+# Internal (one display driving the panel), and External is exactly the state a rig whose
+# only display is the virtual one reports -- so refusing there made the toggle
+# unreachable from the state a fresh install produces. The toggle means "mirror the
+# virtual display on the others, or stop mirroring it", and from External there is
+# nothing to stop: Extend is the state to move to.
+Set-DisplayProfile Extend

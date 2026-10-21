@@ -44,13 +44,23 @@ $disp = Get-VddDisplay
 # record for an API failure -- which the global $ErrorActionPreference = 'Stop'
 # promotes to terminating. The script then died with the raw API error instead
 # of reaching the branch that says the display has no BitsPerColorChannel.
-$bpcc = Get-DisplayColorInfo -DisplayId $disp.DisplayId -ErrorAction SilentlyContinue |
-    Select-Object -ExpandProperty BitsPerColorChannel
+$colorInfo = Get-DisplayColorInfo -DisplayId $disp.DisplayId -ErrorAction SilentlyContinue
 
-if ($null -eq $bpcc) {
-    Write-Error "Get-DisplayColorInfo returned no BitsPerColorChannel for display $($disp.DisplayId)."
+$bpcc = $colorInfo | Select-Object -ExpandProperty BitsPerColorChannel
+$advanced = $colorInfo | Select-Object -ExpandProperty AdvancedColorEnabled
+
+if ($null -eq $advanced) {
+    Write-Error "Get-DisplayColorInfo returned no AdvancedColorEnabled for display $($disp.DisplayId) (BitsPerColorChannel: $bpcc)."
 }
-elseif ($bpcc -ge 10) {
+elseif ($advanced) {
+    # The direction comes from the advanced colour state, which is the flag the API
+    # reports about HDR. BitsPerColorChannel is the SDR pipeline's depth and says
+    # nothing about whether HDR is on: with the recommended force_bit_depth of 10 or 12
+    # the SDR path already reported 10 bpc, so the script always chose "disable" and
+    # could never turn HDR on; with the shipped value of 8 it always chose "enable" and
+    # could never turn it off. Disabling colour that is already disabled succeeds, so the
+    # script reported success having changed nothing.
+    #
     # Pass the display identifier, not the whole object returned by Get-DisplayInfo.
     Disable-DisplayAdvancedColor -DisplayId $disp.DisplayId
 }
