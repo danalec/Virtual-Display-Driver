@@ -4357,10 +4357,19 @@ NTSTATUS VirtualDisplayDriverDeviceD0Entry(WDFDEVICE Device, WDF_POWER_DEVICE_ST
 		vddlog("d", logStream.str().c_str());
 
 
-		pContext->pContext->InitAdapter();
-		logStream.str(""); 
-		logStream << "InitAdapter called successfully.";
-		vddlog("d", logStream.str().c_str());
+		const bool adapterUp = pContext->pContext->InitAdapter();
+		logStream.str("");
+		if (adapterUp) {
+			logStream << "InitAdapter called successfully.";
+			vddlog("d", logStream.str().c_str());
+		}
+		else {
+			// The adapter did not come up: IddCxAdapterInitAsync failed and there is no
+			// adapter. Saying it was called successfully was a false success on exactly
+			// the path where the driver has nothing.
+			logStream << "InitAdapter did not bring the adapter up.";
+			vddlog("e", logStream.str().c_str());
+		}
 	}
 	else
 	{
@@ -5247,7 +5256,7 @@ IndirectDeviceContext::~IndirectDeviceContext()
 
 #define NUM_VIRTUAL_DISPLAYS 1   //What is this even used for ?? Its never referenced
 
-void IndirectDeviceContext::InitAdapter()
+bool IndirectDeviceContext::InitAdapter()
 {
 	// IddCxAdapterInitAsync is a one-shot per adapter. The D0 callback calls
 	// this on every power transition, and a second call would leave the live
@@ -5256,7 +5265,7 @@ void IndirectDeviceContext::InitAdapter()
 	// overwritten, orphaning the first one.
 	if (m_Adapter != nullptr) {
 		vddlog("d", "The adapter is already initialised; not bringing up a second one.");
-		return;
+		return true;
 	}
 
 	maincalc();
@@ -5348,13 +5357,25 @@ void IndirectDeviceContext::InitAdapter()
 	else {
 		logStream << "Failed to initialize adapter. Status: " << Status;
 		vddlog("e", logStream.str().c_str());
+		return false;
 	}
+	
+	return true;
 }
 
 void IndirectDeviceContext::FinishInit()
 {
 	Options.Adapter.apply(m_Adapter);
-	vddlog("i", "Applied Adapter configs.");
+	if (Options.Adapter.hasTargetAdapter) {
+		vddlog("i", "Applied Adapter configs.");
+	}
+	else {
+		// apply() is a no-op when no render adapter was selected: there was no name to
+		// match and no bus to resolve, and the OS picks the render adapter itself.
+		// Saying that the configuration was applied was a false success.
+		vddlog("w", "No render adapter was selected, so the adapter configuration was not "
+			"applied; the operating system will choose the render adapter itself.");
+	}
 	for (unsigned int i = 0; i < numVirtualDisplays; i++) {
 		CreateMonitor(i);
 	}

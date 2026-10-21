@@ -120,7 +120,9 @@ namespace Microsoft
             IndirectDeviceContext(_In_ WDFDEVICE WdfDevice);
             virtual ~IndirectDeviceContext();
 
-            void InitAdapter();
+            // true when the adapter is up. It returns false when the adapter did not
+            // come up, and the caller has to be able to say so.
+            bool InitAdapter();
             void FinishInit();
 
             void CreateMonitor(unsigned int index);
