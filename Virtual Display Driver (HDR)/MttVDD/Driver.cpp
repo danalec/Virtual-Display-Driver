@@ -2845,7 +2845,7 @@ void HandleClient(HANDLE hPipe) {
 			// Wait for the cancellation to finish before letting the OVERLAPPED and its event
 			// go out of scope. CancelIoEx only requests it: the kernel still holds a pointer to
 			// this stack structure until the operation completes, and StopNamedPipeServer's
-			// DisconnectNamedPipe is exactly what completes a pending read.
+			// DisconnectNamedPipe on the server handle is what completes a pending read.
 			CancelIoEx(hPipe, &ovRead);
 			DWORD cancelledBytes = 0;
 			GetOverlappedResult(hPipe, &ovRead, &cancelledBytes, TRUE);
@@ -3237,18 +3237,23 @@ void StopNamedPipeServer() {
 		hPipeThread = NULL;
 	}
 	if (thread) {
-		HANDLE hPipe = CreateFileW(
-			PIPE_NAME,
-			GENERIC_READ | GENERIC_WRITE,
-			0,
-			NULL,
-			OPEN_EXISTING,
-			0,
-			NULL);
-
-		if (hPipe != INVALID_HANDLE_VALUE) {
-			DisconnectNamedPipe(hPipe);
-			CloseHandle(hPipe);
+		// Disconnect the SERVER end of the pipe. The old code opened a second,
+		// client-side connection and called DisconnectNamedPipe on that handle,
+		// but DisconnectNamedPipe is server-only: it answered ERROR_INVALID_FUNCTION
+		// and left the server's pending read pending. Worse, the CreateFile failed
+		// with ERROR_PIPE_BUSY whenever a client was still connected, which is
+		// exactly the case this path exists for, so the block was usually skipped
+		// entirely and every unload with a connected-but-silent client stalled the
+		// whole shutdown window before the emergency CancelIoEx fallback ran.
+		// Measured on the real API: on the client handle DisconnectNamedPipe
+		// returns FALSE with ERROR_INVALID_FUNCTION and the server read stays
+		// pending; on the server handle it returns TRUE and the pending read
+		// completes.
+		{
+			lock_guard<mutex> lock(g_PipeMutex);
+			if (g_pipeHandle != INVALID_HANDLE_VALUE) {
+				DisconnectNamedPipe(g_pipeHandle);
+			}
 		}
 
 		// Bounded rather than INFINITE. The server thread polls its run flag every
@@ -5454,7 +5459,11 @@ NTSTATUS VirtualDisplayDriverMonitorQueryModes(IDDCX_MONITOR MonitorObject, cons
 
 		logStream << "Created target mode " << i << ": Width = " << std::get<0>(monitorModes[i])
 			<< ", Height = " << std::get<1>(monitorModes[i])
-			<< ", VSync = " << std::get<2>(monitorModes[i]) << "\n";
+			<< ", VSync = "
+			// The tuple is (width, height, vsyncNum, vsyncDen) and the rate is num/den.
+			// Printing the numerator alone logged "VSync = 2997" for a 59.94 Hz mode.
+			<< (std::get<3>(monitorModes[i]) ? static_cast<double>(std::get<2>(monitorModes[i])) / std::get<3>(monitorModes[i]) : 0.0)
+			<< "Hz\n";
 	}
 
 	if (!monitorModes.empty()) {
@@ -6100,7 +6109,11 @@ NTSTATUS CreateFallbackConfiguration()
 	logStream.str("");
 	logStream << "Fallback modes created:";
 	for (const auto& mode : fallbackModes) {
-		logStream << "\n  " << get<0>(mode) << "x" << get<1>(mode) << "@" << get<2>(mode) << "Hz";
+		// Same tuple convention as everywhere else: the rate is num/den, so printing the
+		// numerator alone is wrong for a fraction. Every fallback mode is 60/1 today, which
+		// is why this was only a latent bug.
+		logStream << "\n  " << get<0>(mode) << "x" << get<1>(mode) << "@"
+			<< (get<3>(mode) ? static_cast<double>(get<2>(mode)) / get<3>(mode) : 0.0) << "Hz";
 	}
 	vddlog("d", logStream.str().c_str());
 
