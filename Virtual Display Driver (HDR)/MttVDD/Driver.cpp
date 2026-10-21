@@ -287,7 +287,7 @@ bool preventManufacturerSpoof = false;
 bool edidCeaOverride = false;
 std::atomic<bool> sendLogsThroughPipe{ true };
 
-constexpr DISPLAYCONFIG_VIDEO_SIGNAL_INFO dispinfo(UINT32 h, UINT32 v, UINT32 rn, UINT32 rd);
+DISPLAYCONFIG_VIDEO_SIGNAL_INFO dispinfo(UINT32 h, UINT32 v, UINT32 rn, UINT32 rd);
 
 namespace
 {
@@ -4823,7 +4823,19 @@ void SwapChainProcessor::RunCore()
 const UINT64 MHZ = 1000000;
 const UINT64 KHZ = 1000;
 
-constexpr DISPLAYCONFIG_VIDEO_SIGNAL_INFO dispinfo(UINT32 h, UINT32 v, UINT32 rn, UINT32 rd) {
+// The GCD of two 64-bit values, for reducing a rational so that neither part
+// overflows. The int version further up is not enough: the numerator of a
+// horizontal rate can exceed an int.
+static UINT64 Gcd64(UINT64 a, UINT64 b) {
+	while (b != 0) {
+		const UINT64 temp = b;
+		b = a % b;
+		a = temp;
+	}
+	return a ? a : 1;
+}
+
+DISPLAYCONFIG_VIDEO_SIGNAL_INFO dispinfo(UINT32 h, UINT32 v, UINT32 rn, UINT32 rd) {
 	// The 32-bit product here used to wrap before it reached the headline modes. option.txt
 	// shipped "7680, 4320, 500": 500 * 4324 * 4324 = 9,348,488,000 exceeds UINT32 and wrapped
 	// to 758,553,408, so an 8K mode was reported at a 758 MHz pixel clock. PixelRate is UINT32,
@@ -4839,14 +4851,41 @@ constexpr DISPLAYCONFIG_VIDEO_SIGNAL_INFO dispinfo(UINT32 h, UINT32 v, UINT32 rn
 	// 75% for 1024x768. The mode contradicted itself, and it contradicted the target
 	// mode the driver builds for the same resolution, which uses the active size and
 	// is internally consistent. The refresh rate the driver reports does not change.
-	const UINT64 wideClock = static_cast<UINT64>(rn) * totalPixels * totalLines / (rd ? rd : 1) + 1000;
-	const UINT64 wideVerticalTotal = totalPixels * totalLines;
+	const UINT64 denominator = rd ? rd : 1;
+	const UINT64 wideClock = static_cast<UINT64>(rn) * totalPixels * totalLines / denominator + 1000;
 	const UINT32 clock_rate = wideClock > UINT_MAX ? UINT_MAX : static_cast<UINT32>(wideClock);
-	const UINT32 verticalTotal = wideVerticalTotal > UINT_MAX ? UINT_MAX : static_cast<UINT32>(wideVerticalTotal);
+	//
+	// The two rates come from the mode's own numbers, not from the clock. The clock
+	// is clamped when it does not fit in the UINT32 the structure carries, and
+	// deriving the rates from the clamped clock made the mode report 137.867 Hz for
+	// a 144 Hz mode -- and made the monitor mode and the target mode disagree about
+	// the refresh rate of the same mode. The horizontal rate is the line rate (the
+	// refresh times the lines in a frame) and the vertical rate is the refresh
+	// itself; both are reduced so that neither part overflows.
+	UINT64 hSyncNumerator = static_cast<UINT64>(rn) * totalLines;
+	UINT64 hSyncDenominator = denominator;
+	const UINT64 hSyncDivisor = Gcd64(hSyncNumerator, hSyncDenominator);
+	hSyncNumerator /= hSyncDivisor;
+	hSyncDenominator /= hSyncDivisor;
+	UINT64 vSyncNumerator = rn;
+	UINT64 vSyncDenominator = denominator;
+	const UINT64 vSyncDivisor = Gcd64(vSyncNumerator, vSyncDenominator);
+	vSyncNumerator /= vSyncDivisor;
+	vSyncDenominator /= vSyncDivisor;
+	if (wideClock > UINT_MAX) {
+		// The clock does not fit in the UINT32 the structure carries. It has to be
+		// clamped -- there is no other way to say it -- but the mode has to say so:
+		// the value it carries is not the rate the mode is.
+		stringstream ss;
+		ss << "The pixel clock for " << h << "x" << v << " @ " << rn << "/" << rd
+			<< " is " << wideClock << " Hz and does not fit in a UINT32; it was clamped to "
+			<< UINT_MAX << ". The refresh rate the mode reports is unaffected.";
+		vddlog("w", ss.str().c_str());
+	}
 	return {
 	  clock_rate,                                      // pixel clock rate [Hz]
-		{ clock_rate, static_cast<UINT32>(totalPixels) }, // fractional horizontal refresh rate [Hz]
-	{ clock_rate, verticalTotal },                  // fractional vertical refresh rate [Hz]
+		{ static_cast<UINT>(hSyncNumerator), static_cast<UINT>(hSyncDenominator) }, // fractional horizontal refresh rate [Hz]
+		{ static_cast<UINT>(vSyncNumerator), static_cast<UINT>(vSyncDenominator) }, // fractional vertical refresh rate [Hz]
 	{ h, v },                                    // (horizontal, vertical) active pixel resolution
 	{ h + 4, static_cast<UINT32>(totalLines) }, // (horizontal, vertical) total pixel resolution
 	{ { 255, 0 }},                                   // video standard and vsync divider
@@ -5617,7 +5656,16 @@ void CreateTargetMode(DISPLAYCONFIG_VIDEO_SIGNAL_INFO& Mode, UINT Width, UINT He
 	// before the headline modes: 8K@240 is 240 * 7680 * 4320 = 7,962,624,000, which exceeds
 	// UINT32_MAX. Wrapping silently reported 3,667,656,704 for 8K@240. Compute in 64 bits and
 	// saturate loudly rather than handing the compositor a nonsense rate.
+	// hSyncFreq is a fraction, so the overflow is avoidable: the numerator only
+	// overflowed because the denominator was pinned at the refresh rate's. Reduce
+	// the fraction instead of clamping the numerator, or the mode reports a rate
+	// that is not the one it computed and contradicts its own pixel clock --
+	// 3840x2160@240 reported 429 496.73 Hz for a 518 400 Hz line rate, 17% low.
 	UINT64 hSyncNumerator = static_cast<UINT64>(VSyncNum) * Height;
+	UINT64 hSyncDenominator = VSyncDen ? VSyncDen : 1;
+	const UINT64 hSyncDivisor = Gcd64(hSyncNumerator, hSyncDenominator);
+	hSyncNumerator /= hSyncDivisor;
+	hSyncDenominator /= hSyncDivisor;
 	UINT64 pixelRate = static_cast<UINT64>(VSyncNum) * Width * Height / (VSyncDen ? VSyncDen : 1);
 
 	if (hSyncNumerator > UINT_MAX || pixelRate > UINT_MAX) {
@@ -5628,8 +5676,8 @@ void CreateTargetMode(DISPLAYCONFIG_VIDEO_SIGNAL_INFO& Mode, UINT Width, UINT He
 		vddlog("w", logStream.str().c_str());
 	}
 
-	Mode.hSyncFreq.Numerator = hSyncNumerator > UINT_MAX ? UINT_MAX : static_cast<UINT>(hSyncNumerator);
-	Mode.hSyncFreq.Denominator = VSyncDen;
+	Mode.hSyncFreq.Numerator = static_cast<UINT>(hSyncNumerator);
+	Mode.hSyncFreq.Denominator = static_cast<UINT>(hSyncDenominator);
 	Mode.scanLineOrdering = DISPLAYCONFIG_SCANLINE_ORDERING_PROGRESSIVE;
 	Mode.pixelRate = pixelRate > UINT_MAX ? UINT_MAX : static_cast<UINT>(pixelRate);
 
