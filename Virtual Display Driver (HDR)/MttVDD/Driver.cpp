@@ -1490,7 +1490,7 @@ vector<tuple<int, int, int, int>> MergeAndOptimizeModes(const vector<tuple<int, 
             for (const auto& manualMode : manualModes) {
                 if (get<0>(edidMode) == get<0>(manualMode) && 
                     get<1>(edidMode) == get<1>(manualMode) && 
-                    get<2>(edidMode) == get<2>(manualMode) && 
+                    get<2>(edidMode) == get<2>(manualMode) &&
                     get<3>(edidMode) == get<3>(manualMode)) {
                     isDuplicate = true;
                     break;
@@ -2364,27 +2364,43 @@ bool UpdateXmlToggleSetting(bool toggle, const wchar_t* variable) {
 	const wchar_t* pwszLocalName;
 	const wchar_t* pwszValue;
 	bool variableElementFound = false;
+	// The depth of the element that matched, and the depth the reader is at. The value
+	// that gets replaced has to be that element's OWN text: matching the name alone was
+	// not enough, because vdd_settings.xml has a <logging> section with a <logging>
+	// element inside it. The flag set on the section survived the whitespace and the
+	// child elements, so it landed on the first text inside the section, which is
+	// <SendLogsThroughPipe>: "LOGGING false" turned the pipe logging off and left
+	// <logging> alone. Measured, with this function extracted and run against the
+	// shipped file. The deepest match wins, because the deepest one is the leaf the
+	// driver reads -- the settings cache keeps the first leaf with a given name, and
+	// that is the inner <logging>.
+	int elementDepth = 0;
+	int depth = 0;
 
 	while (S_OK == pReader->Read(&nodeType)) {
 		switch (nodeType) {
 		case XmlNodeType_Element:
 			pReader->GetLocalName(&pwszLocalName, nullptr);
 			pWriter->WriteStartElement(nullptr, pwszLocalName, nullptr);
+			depth++;
 			break;
 
 		case XmlNodeType_EndElement:
 			pReader->GetLocalName(&pwszLocalName, nullptr);
+			// The matching element ended without a text of its own, so it was written as
+			// <logging/>: give it the value now, before the end tag. The old code cleared
+			// the flag on the way out and lost the toggle for an empty element entirely.
+			if (variableElementFound && depth == elementDepth) {
+				pWriter->WriteString(toggle ? L"true" : L"false");
+				variableElementFound = false;
+			}
 			pWriter->WriteEndElement();
-			// An empty target element never produces a Text node, so the flag set below would
-			// survive past it and the *next* element's text in the document would be replaced
-			// by this toggle. vdd_settings.xml is user-editable, so <logging/> is one edit away;
-			// clearing here too is what keeps the rewrite confined to the element asked for.
-			variableElementFound = false;
+			depth--;
 			break;
 
 		case XmlNodeType_Text:
 			pReader->GetValue(&pwszValue, nullptr);
-			if (variableElementFound) {
+			if (variableElementFound && depth == elementDepth) {
 				pWriter->WriteString(toggle ? L"true" : L"false");
 				variableElementFound = false;
 			}
@@ -2427,10 +2443,15 @@ bool UpdateXmlToggleSetting(bool toggle, const wchar_t* variable) {
 			pReader->GetLocalName(&pwszLocalName, nullptr);
 			if (pwszLocalName != nullptr && wcscmp(pwszLocalName, variable) == 0) {
 				variableElementFound = true;
+				// The text of this element lives one level deeper than its parent's.
+				elementDepth = depth;
 			}
 		}
 	}
 
+	// Only reached for a document that ends in the middle of the matching element:
+	// a well-formed one closes it, and the EndElement above has already given it the
+	// value.
 	if (variableElementFound) {
 		pWriter->WriteStartElement(nullptr, variable, nullptr);
 		pWriter->WriteString(toggle ? L"true" : L"false");
@@ -3871,7 +3892,7 @@ void loadSettings() {
         vddlog("w", "option.txt has no display count before its mode lines, assuming 1 virtual display");
     }
 
-    vector<tuple<int, int, int, int>> res; 
+    vector<tuple<int, int, int, int>> res;
 
     while (getline(ifs, line)) {
         string trimmed = TrimAsciiSpace(line);
