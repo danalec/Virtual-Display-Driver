@@ -2005,6 +2005,47 @@ void float_to_vsync(float refresh_rate, int& num, int& den) {
 	den /= divisor;
 }
 
+// Write to the pipe with a deadline. The server side of the pipe is opened with
+// FILE_FLAG_OVERLAPPED, and a write on an overlapped handle with a NULL OVERLAPPED is
+// not treated as an overlapped operation: the call blocks uninterruptibly until the
+// client reads. A client that connects and then stops reading fills the pipe's buffer,
+// and the thread that is writing -- the pipe server's own thread -- stays inside that
+// write for as long as the client stays silent. The shutdown path waits for that
+// thread, and a thread that never comes back is the one case where the driver gives up
+// on it and the UMDF host unmaps the driver image while the thread is still executing
+// in it.
+//
+// So the write gets a real OVERLAPPED and a deadline, and the OVERLAPPED outlives the
+// operation: the kernel keeps a pointer to it until the operation completes, so it
+// cannot go out of scope before then.
+//
+// Returns false when the write could not be made at all. It does not log: this runs
+// inside SendToPipe, and vddlog calls SendToPipe.
+bool WriteToPipeBounded(HANDLE pipe, LPCVOID data, DWORD bytesToWrite) {
+	OVERLAPPED ov = {};
+	ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+	if (ov.hEvent == nullptr) {
+		// No event, so no way to wait and no way to bound the write. Dropping the line is
+		// better than blocking the pipe server's thread for as long as the client stays
+		// silent.
+		return false;
+	}
+	DWORD bytesWritten = 0;
+	if (!WriteFile(pipe, data, bytesToWrite, &bytesWritten, &ov) &&
+		GetLastError() == ERROR_IO_PENDING) {
+		if (WaitForSingleObject(ov.hEvent, PIPE_WRITE_TIMEOUT_MS) == WAIT_TIMEOUT) {
+			// The client is not reading. Cancel the write instead of staying inside it,
+			// and let the thread go on.
+			CancelIoEx(pipe, &ov);
+		}
+	}
+	// Wait for the operation itself to complete before the OVERLAPPED and the event go
+	// away.
+	GetOverlappedResult(pipe, &ov, &bytesWritten, TRUE);
+	CloseHandle(ov.hEvent);
+	return true;
+}
+
 void  SendToPipe(const std::string& logMessage) {
 	// Write through a duplicate of the handle rather than g_pipeHandle itself. The pipe server
 	// can call ClearPipeHandle() and CloseHandle() on any thread at any moment; holding
@@ -2026,41 +2067,8 @@ void  SendToPipe(const std::string& logMessage) {
 		return;
 	}
 
-	DWORD bytesWritten = 0;
 	DWORD logMessageSize = static_cast<DWORD>(logMessage.size());
-	// The write has to be bounded. The server side of the pipe is opened with
-	// FILE_FLAG_OVERLAPPED, and a write on an overlapped handle with a NULL
-	// OVERLAPPED is not treated as an overlapped operation: the call blocks
-	// uninterruptibly until the client reads. A client that connects and then
-	// stops reading fills the pipe's buffer, and the thread that is writing --
-	// the pipe server's own thread -- stays inside that write for as long as
-	// the client stays silent. The shutdown path waits for that thread, and a
-	// thread that never comes back is the one case where the driver gives up
-	// on it and the UMDF host unmaps the driver image while the thread is
-	// still executing in it.
-	//
-	// So the write gets a real OVERLAPPED and a deadline, and the OVERLAPPED
-	// outlives the operation: the kernel keeps a pointer to it until the
-	// operation completes, so it cannot go out of scope before then.
-	OVERLAPPED ov = {};
-	ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-	if (ov.hEvent != nullptr) {
-		if (!WriteFile(pipe, logMessage.c_str(), logMessageSize, &bytesWritten, &ov) &&
-			GetLastError() == ERROR_IO_PENDING) {
-			if (WaitForSingleObject(ov.hEvent, PIPE_WRITE_TIMEOUT_MS) == WAIT_TIMEOUT) {
-				// The client is not reading. Cancel the write instead of
-				// staying inside it, and let the thread go on.
-				CancelIoEx(pipe, &ov);
-			}
-		}
-		// Wait for the operation itself to complete before the OVERLAPPED and
-		// the event go away.
-		GetOverlappedResult(pipe, &ov, &bytesWritten, TRUE);
-		CloseHandle(ov.hEvent);
-	}
-	else {
-		WriteFile(pipe, logMessage.c_str(), logMessageSize, &bytesWritten, NULL);
-	}
+	WriteToPipeBounded(pipe, logMessage.c_str(), logMessageSize);
 	CloseHandle(pipe);
 }
 
@@ -3196,9 +3204,12 @@ void HandleClient(HANDLE hPipe) {
 			settingsResponse += debugEnabled ? L"DEBUG=true " : L"DEBUG=false ";
 			settingsResponse += loggingEnabled ? L"LOG=true" : L"LOG=false";
 
-			DWORD bytesWritten;
 			DWORD bytesToWrite = static_cast<DWORD>((settingsResponse.length() + 1) * sizeof(wchar_t));
-			WriteFile(hPipe, settingsResponse.c_str(), bytesToWrite, &bytesWritten, NULL);
+			// The same bounded write the log path uses. A write with a NULL OVERLAPPED on an
+			// overlapped handle blocks uninterruptibly until the client reads, and this is
+			// the pipe server's own thread: a client that asks for the settings and then
+			// stops reading would wedge it for good.
+			WriteToPipeBounded(hPipe, settingsResponse.c_str(), bytesToWrite);
 
 		}
 		else if (wcsncmp(buffer, L"PING", 4) == 0) {
@@ -3248,10 +3259,18 @@ DWORD WINAPI NamedPipeServer(LPVOID lpParam) {
 	// while opening it for write fails with ERROR_ACCESS_DENIED and not one command byte
 	// reaches the dispatcher.
 	//
-	// Everyone also no longer gets GENERIC_ALL, which is what FILE_CREATE_PIPE_INSTANCE
-	// (0x0008), DELETE, WRITE_DAC and WRITE_OWNER ride on: with those, any unprivileged
-	// session could spawn extra instances of this named pipe -- the classic named-pipe
-	// squatting route to impersonation -- or rewrite the DACL and then claim full access.
+	// Everyone also no longer gets GENERIC_ALL, which is what DELETE, WRITE_DAC and
+	// WRITE_OWNER ride on: with those, an unprivileged session could rewrite the DACL
+	// and then claim full access.
+	//
+	// It does not close the pipe squatting route, though. FILE_CREATE_PIPE_INSTANCE is
+	// 0x0004 -- 0x0008 is FILE_READ_EA -- and a client can ask for it on its own, so
+	// under this descriptor an unelevated session can still create an extra instance
+	// of the pipe. Measured: CreateFileW with FILE_CREATE_PIPE_INSTANCE succeeds
+	// unelevated, a descriptor that grants Everyone nothing denies it, and a deny ACE
+	// does not block it either. The driver never calls ImpersonateNamedPipeClient, so
+	// the squatting cannot become an impersonation, but the route is open and this
+	// comment does not claim it closed.
 	//
 	// Every helper in this repo requires an Administrator session and the driver rewrites
 	// vdd_settings.xml as SYSTEM, so requiring elevation to mutate is the intent rather
