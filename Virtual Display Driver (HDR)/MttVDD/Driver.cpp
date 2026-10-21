@@ -1458,8 +1458,15 @@ vector<tuple<int, int, int, int>> GenerateModesFromEdid(const EdidProfileData& p
 // Find and validate preferred mode from EDID
 tuple<int, int, int, int> FindPreferredModeFromEdid(const EdidProfileData& profile, 
                                                    const vector<tuple<int, int, int, int>>& availableModes) {
-    // Default fallback mode
-    tuple<int, int, int, int> preferredMode = make_tuple(fallbackWidth, fallbackHeight, 1000, fallbackRefresh);
+    // Default fallback mode. The last two slots are the vsync fraction, and the
+    // fallback was 1000/fallbackRefresh -- the same mistake the generated modes
+    // had: 1000/60 is 16.67 Hz, not 60. The preferred mode is the one the driver
+    // tells the OS, and this is the default path: the shipped vdd_settings.xml
+    // ships use_edid_preferred=false, so the fallback is what the driver uses
+    // whenever the EDID integration is on.
+    int vsyncNum = 0, vsyncDen = 1;
+    float_to_vsync(static_cast<float>(fallbackRefresh), vsyncNum, vsyncDen);
+    tuple<int, int, int, int> preferredMode = make_tuple(fallbackWidth, fallbackHeight, vsyncNum, vsyncDen);
     
     if (!useEdidPreferred) {
         vddlog("i", "EDID preferred mode disabled, using fallback");
@@ -1628,18 +1635,21 @@ bool ValidateModeList(const vector<tuple<int, int, int, int>>& modes) {
     
     // Analyze resolution distribution
     map<pair<int, int>, int> resolutionCount;
-    map<int, int> refreshRateCount;
+    // The rate is the fraction num/den, and the fraction is reduced, so the pair
+    // identifies the rate. Counting by the denominator alone counted how many
+    // different denominators the list had, which is not a count of rates.
+    map<pair<int, int>, int> refreshRateCount;
     
     for (const auto& mode : modes) {
         pair<int, int> resolution = {get<0>(mode), get<1>(mode)};
         resolutionCount[resolution]++;
-        refreshRateCount[get<3>(mode)]++;
+        refreshRateCount[{get<2>(mode), get<3>(mode)}]++;
     }
     
     validationReport << "Unique resolutions: " << resolutionCount.size() << "\n";
     validationReport << "Unique refresh rates: " << refreshRateCount.size() << "\n";
     validationReport << "Preferred mode: " << get<0>(modes[0]) << "x" << get<1>(modes[0]) 
-                    << "@" << get<3>(modes[0]) << "Hz";
+                    << "@" << (get<3>(modes[0]) ? static_cast<double>(get<2>(modes[0])) / get<3>(modes[0]) : 0.0) << "Hz";
     
     vddlog("i", validationReport.str().c_str());
     
