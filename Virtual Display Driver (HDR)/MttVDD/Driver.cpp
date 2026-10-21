@@ -62,6 +62,11 @@ constexpr DWORD PIPE_READ_POLL_MS = 5000;
 // Upper bound on waiting for the server thread to wind down at unload. Past this the thread is
 // left to finish on its own; it will notice g_Running within PIPE_CONNECT_POLL_MS.
 constexpr DWORD PIPE_SHUTDOWN_WAIT_MS = 5000;
+// Upper bound on a single write to a client that has stopped reading. Without it
+// the pipe server's thread can sit inside the write until the client goes away,
+// and the shutdown path below would then give up on the thread while it was
+// still executing in the driver image.
+constexpr DWORD PIPE_WRITE_TIMEOUT_MS = 1000;
 
 std::atomic<bool> g_Running{ true }; // written under g_Mutex but read without it in the server loop
 mutex g_Mutex;
@@ -278,10 +283,6 @@ std::atomic<bool> debugLogs{ false };
 bool HDRPlus = false;
 bool SDR10 = false;
 bool customEdid = false;
-// The compiled value only matters on the path with no vdd_settings.xml, because DriverEntry
-// overwrites it unconditionally on every other path. HardwareCursor ships as true in that file,
-// so true is what this has to say; EnabledOr below is what makes it survive a missing key.
-bool hardwareCursor = true;
 bool preventManufacturerSpoof = false;
 bool edidCeaOverride = false;
 std::atomic<bool> sendLogsThroughPipe{ true };
@@ -321,11 +322,6 @@ namespace
 	}
 }
 
-//Mouse settings
-bool alphaCursorSupport = true;
-int CursorMaxX = 128;
-int CursorMaxY = 128;
-IDDCX_XOR_CURSOR_SUPPORT XorCursorSupportLevel = IDDCX_XOR_CURSOR_SUPPORT_FULL;
 
 
 //Rest
@@ -407,13 +403,6 @@ std::map<std::wstring, std::pair<std::wstring, std::wstring>> SettingsQueryMap =
 	{L"EdidCeaOverride", {L"EDIDCEAOVERRIDE", L"EdidCeaOverride"}},
 	{L"SendLogsThroughPipe", {L"SENDLOGSTHROUGHPIPE", L"SendLogsThroughPipe"}},
 	
-	//Cursor Begin
-	{L"HardwareCursorEnabled", {L"HARDWARECURSOR", L"HardwareCursor"}},
-	{L"AlphaCursorSupport", {L"ALPHACURSORSUPPORT", L"AlphaCursorSupport"}},
-	{L"CursorMaxX", {L"CURSORMAXX", L"CursorMaxX"}},
-	{L"CursorMaxY", {L"CURSORMAXY", L"CursorMaxY"}},
-	{L"XorCursorSupportLevel", {L"XORCURSORSUPPORTLEVEL", L"XorCursorSupportLevel"}},
-	//Cursor End
 	
 	//Colour Begin
 	{L"HDRPlusEnabled", {L"HDRPLUS", L"HDRPlus"}},
@@ -474,20 +463,6 @@ std::map<std::wstring, std::pair<std::wstring, std::wstring>> SettingsQueryMap =
 	//parser because nothing ever read them.
 };
 
-const char* XorCursorSupportLevelToString(IDDCX_XOR_CURSOR_SUPPORT level) {
-	switch (level) {
-	case IDDCX_XOR_CURSOR_SUPPORT_UNINITIALIZED:
-		return "IDDCX_XOR_CURSOR_SUPPORT_UNINITIALIZED";
-	case IDDCX_XOR_CURSOR_SUPPORT_NONE:
-		return "IDDCX_XOR_CURSOR_SUPPORT_NONE";
-	case IDDCX_XOR_CURSOR_SUPPORT_FULL:
-		return "IDDCX_XOR_CURSOR_SUPPORT_FULL";
-	case IDDCX_XOR_CURSOR_SUPPORT_EMULATION:
-		return "IDDCX_XOR_CURSOR_SUPPORT_EMULATION";
-	default:
-		return "Unknown";
-	}
-}
 
 
 vector<unsigned char> Microsoft::IndirectDisp::IndirectDeviceContext::s_KnownMonitorEdid; //Changed to support static vector
@@ -2050,9 +2025,41 @@ void  SendToPipe(const std::string& logMessage) {
 		return;
 	}
 
-	DWORD bytesWritten;
+	DWORD bytesWritten = 0;
 	DWORD logMessageSize = static_cast<DWORD>(logMessage.size());
-	WriteFile(pipe, logMessage.c_str(), logMessageSize, &bytesWritten, NULL);
+	// The write has to be bounded. The server side of the pipe is opened with
+	// FILE_FLAG_OVERLAPPED, and a write on an overlapped handle with a NULL
+	// OVERLAPPED is not treated as an overlapped operation: the call blocks
+	// uninterruptibly until the client reads. A client that connects and then
+	// stops reading fills the pipe's buffer, and the thread that is writing --
+	// the pipe server's own thread -- stays inside that write for as long as
+	// the client stays silent. The shutdown path waits for that thread, and a
+	// thread that never comes back is the one case where the driver gives up
+	// on it and the UMDF host unmaps the driver image while the thread is
+	// still executing in it.
+	//
+	// So the write gets a real OVERLAPPED and a deadline, and the OVERLAPPED
+	// outlives the operation: the kernel keeps a pointer to it until the
+	// operation completes, so it cannot go out of scope before then.
+	OVERLAPPED ov = {};
+	ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+	if (ov.hEvent != nullptr) {
+		if (!WriteFile(pipe, logMessage.c_str(), logMessageSize, &bytesWritten, &ov) &&
+			GetLastError() == ERROR_IO_PENDING) {
+			if (WaitForSingleObject(ov.hEvent, PIPE_WRITE_TIMEOUT_MS) == WAIT_TIMEOUT) {
+				// The client is not reading. Cancel the write instead of
+				// staying inside it, and let the thread go on.
+				CancelIoEx(pipe, &ov);
+			}
+		}
+		// Wait for the operation itself to complete before the OVERLAPPED and
+		// the event go away.
+		GetOverlappedResult(pipe, &ov, &bytesWritten, TRUE);
+		CloseHandle(ov.hEvent);
+	}
+	else {
+		WriteFile(pipe, logMessage.c_str(), logMessageSize, &bytesWritten, NULL);
+	}
 	CloseHandle(pipe);
 }
 
@@ -2950,17 +2957,12 @@ void HandleClient(HANDLE hPipe) {
 			}
 		}
 		else if (wcsncmp(buffer, L"HARDWARECURSOR", 14) == 0) {
-			wchar_t* param = buffer + 15;
-			if (wcsncmp(param, L"true", 4) == 0) {
-				UpdateXmlToggleSetting(true, L"HardwareCursor");
-				vddlog("c", "Hardware Cursor Enabled");
-				ReloadDriver();
-			}
-			else if (wcsncmp(param, L"false", 5) == 0) {
-				UpdateXmlToggleSetting(false, L"HardwareCursor");
-				vddlog("c", "Hardware Cursor Disabled");
-				ReloadDriver();
-			}
+			// The hardware cursor is not claimed any more. The driver never
+			// queried the cursor shape, so claiming it took the cursor away
+			// from the OS compositor and left the display without one. The
+			// setting is gone from the file as well, and writing it would
+			// only add a key nothing reads.
+			vddlog("w", "Hardware cursor is not supported and the setting no longer exists; the OS software cursor is used");
 		}
 		else if (wcsncmp(buffer, L"D3DDEVICEGPU", 12) == 0) {
 			vddlog("c", "Retrieving D3D GPU (This information may be inaccurate without reloading the driver first)");
@@ -3253,7 +3255,27 @@ void StopNamedPipeServer() {
 		// in-flight read; waiting forever only turned a slow shutdown into a hung one.
 		const DWORD waitResult = WaitForSingleObject(thread, PIPE_SHUTDOWN_WAIT_MS);
 		if (waitResult == WAIT_TIMEOUT) {
-			vddlog("w", "Pipe server thread did not stop within the shutdown window; leaving it to finish");
+			// The thread is still inside the driver. Unloading now leaves the
+			// UMDF host unmapping the driver image while a thread is executing
+			// in it, and the host crashes when that thread finally returns.
+			// Break whatever I/O the thread is stuck on and wait again: the
+			// pipe's writes are bounded, so the only thing that can still hold
+			// it is an I/O that has to be cancelled.
+			vddlog("w", "Pipe server thread did not stop within the shutdown window; cancelling its I/O");
+			{
+				lock_guard<mutex> lock(g_PipeMutex);
+				if (g_pipeHandle != INVALID_HANDLE_VALUE) {
+					CancelIoEx(g_pipeHandle, NULL);
+				}
+			}
+			if (WaitForSingleObject(thread, PIPE_SHUTDOWN_WAIT_MS) == WAIT_TIMEOUT) {
+				// Still running. There is no safe way to unload the driver image
+				// under a running thread, so say so loudly.
+				vddlog("e", "Pipe server thread did not stop even after cancelling its I/O; the driver is being unloaded with the thread still running");
+			}
+			else {
+				vddlog("p", "Stopped Pipe");
+			}
 		}
 		else {
 			vddlog("p", "Stopped Pipe");
@@ -3382,22 +3404,7 @@ extern "C" NTSTATUS DriverEntry(
 		return value;
 	};
 
-	//Cursor
-	hardwareCursor = EnabledOr(L"HardwareCursorEnabled", true);
-	alphaCursorSupport = EnabledOr(L"AlphaCursorSupport", true);
-	CursorMaxX = positiveOr(GetIntegerSetting(L"CursorMaxX"), 128, L"CursorMaxX");
-	CursorMaxY = positiveOr(GetIntegerSetting(L"CursorMaxY"), 128, L"CursorMaxY");
 
-	int xorCursorSupportLevelInt = GetIntegerSetting(L"XorCursorSupportLevel");
-	std::string xorCursorSupportLevelName;
-
-	if (xorCursorSupportLevelInt < 0 || xorCursorSupportLevelInt > 3) {
-		vddlog("w", "Selected Xor Level unsupported, defaulting to IDDCX_XOR_CURSOR_SUPPORT_FULL");
-		XorCursorSupportLevel = IDDCX_XOR_CURSOR_SUPPORT_FULL;
-	}
-	else {
-		XorCursorSupportLevel = static_cast<IDDCX_XOR_CURSOR_SUPPORT>(xorCursorSupportLevelInt);
-	}
 
 	// === LOAD NEW EDID INTEGRATION SETTINGS ===
 	edidIntegrationEnabled = EnabledQuery(L"EdidIntegrationEnabled");
@@ -3487,9 +3494,6 @@ extern "C" NTSTATUS DriverEntry(
 		vddlog("i", ("Bit depth picked from colour space " + WStringToString(primaryColorSpace)).c_str());
 	}
 
-	xorCursorSupportLevelName = XorCursorSupportLevelToString(XorCursorSupportLevel);
-
-	vddlog("i", ("Selected Xor Cursor Support Level: " + xorCursorSupportLevelName).c_str());
 
 
 
@@ -4878,14 +4882,6 @@ IndirectDeviceContext::~IndirectDeviceContext()
 	{
 		std::lock_guard<std::mutex> lock(m_ProcessingThreadsMutex);
 		processingThreads.swap(m_ProcessingThreads);
-		for (auto& entry : m_CursorEvents)
-		{
-			if (entry.second)
-			{
-				CloseHandle(entry.second);
-			}
-		}
-		m_CursorEvents.clear();
 	}
 	ForgetAllMonitorMetadata();
 	logStream.str("");
@@ -5133,68 +5129,17 @@ void IndirectDeviceContext::AssignSwapChain(IDDCX_MONITOR Monitor, IDDCX_SWAPCHA
 			vddlog("d", "Created a new processing thread for this monitor.");
 		}
 
-		if (hardwareCursor){
-			HANDLE mouseEvent = CreateEventA(
-				nullptr, 
-				false,   
-				false,   
-				"VirtualDisplayDriverMouse"
-			);
-
-			if (!mouseEvent)
-			{
-				vddlog("e", "Failed to create mouse event. No hardware cursor supported!");
-				return;
-			}
-
-			IDDCX_CURSOR_CAPS cursorInfo = {};
-			cursorInfo.Size = sizeof(cursorInfo);
-			cursorInfo.ColorXorCursorSupport = IDDCX_XOR_CURSOR_SUPPORT_FULL; 
-			cursorInfo.AlphaCursorSupport = alphaCursorSupport;
-
-			cursorInfo.MaxX = CursorMaxX;       //Apparently in most cases 128 is fine but for safe guarding we will go 512, older intel cpus may be limited to 64x64
-			cursorInfo.MaxY = CursorMaxY;
-
-			//DirectXDevice->QueryMaxCursorSize(&cursorInfo.MaxX, &cursorInfo.MaxY);                 Experimental to get max cursor size - THIS IS NTO WORKING CODE
-
-
-			IDARG_IN_SETUP_HWCURSOR hwCursor = {};
-			hwCursor.CursorInfo = cursorInfo;
-			hwCursor.hNewCursorDataAvailable = mouseEvent;
-
-			NTSTATUS Status = IddCxMonitorSetupHardwareCursor(
-				Monitor,
-				&hwCursor
-			);
-
-			if (FAILED(Status))
-			{
-				// Without this the hardware cursor silently stops working and nothing in the
-				// log says why.
-				vddlog("e", ("Failed to set up hardware cursor. NTSTATUS: " + to_string(static_cast<long>(Status))).c_str());
-				CloseHandle(mouseEvent); 
-				return;
-			}
-
-			// The driver owns this handle from here on. The OS reassigns the swap chain on
-			// every resolution and refresh-rate change, so this used to leak one handle each
-			// time: the name is a constant, so each CreateEventA returned a new handle to the
-			// same kernel object and nothing ever closed the previous one.
-			{
-				std::lock_guard<std::mutex> lock(m_ProcessingThreadsMutex);
-				auto previous = m_CursorEvents.find(Monitor);
-				if (previous != m_CursorEvents.end())
-				{
-					CloseHandle(previous->second);
-					m_CursorEvents.erase(previous);
-				}
-				m_CursorEvents[Monitor] = mouseEvent;
-			}
-			vddlog("d", "Hardware cursor setup completed successfully.");
-		}
-		else {
-			vddlog("d", "Hardware cursor is disabled, Skipped creation.");
-		}
+		// The hardware cursor is not claimed, and the settings that used to
+		// ask for it are gone with it. IddCx.h is explicit about the
+		// direction: "By default when a mode is committed on a path software
+		// cursor is enabled, if the driver want to accelerate the cursor on that
+		// path it uses this callback to enable hardware cursor support." So
+		// this call takes the cursor away from the OS compositor -- and the
+		// driver never draws the shape it would have to draw, because
+		// IddCxMonitorQueryHardwareCursor is the only way to get it and it is
+		// not called anywhere. The display would be left without a cursor.
+		// The software cursor stays, which is what the OS does by default.
+		vddlog("d", "Hardware cursor is not claimed; the OS software cursor is used.");
 		// At this point, the swap-chain is set up and the hardware cursor is enabled
 		// Further swap-chain and cursor processing will occur in the new processing thread.
 	}
@@ -5222,15 +5167,6 @@ void IndirectDeviceContext::UnassignSwapChain(IDDCX_MONITOR Monitor)
 	else
 	{
 		vddlog("w", "UnassignSwapChain called for a monitor without an active processing thread.");
-	}
-	{
-		std::lock_guard<std::mutex> lock(m_ProcessingThreadsMutex);
-		auto it = m_CursorEvents.find(Monitor);
-		if (it != m_CursorEvents.end())
-		{
-			CloseHandle(it->second);
-			m_CursorEvents.erase(it);
-		}
 	}
 	ForgetMonitorMetadata(Monitor);
 }
@@ -5706,9 +5642,15 @@ NTSTATUS VirtualDisplayDriverEvtIddCxParseMonitorDescription2(
 
 	RebuildKnownMonitorModesCache();
 	const vector<DISPLAYCONFIG_VIDEO_SIGNAL_INFO> knownModes = SnapshotKnownMonitorModes();
-	pOutArgs->MonitorModeBufferOutputCount = (UINT)monitorModes.size();
+	// One number decides three things: the count the OS is told, the count the
+	// buffer is checked against, and the count that is copied. They were two
+	// different reads of the same unlocked global, and the copy was driven by
+	// the snapshot while the check was driven by the live list -- so a list that
+	// shrank in between let the copy run past the buffer the OS gave us.
+	const UINT modeCount = (UINT)knownModes.size();
+	pOutArgs->MonitorModeBufferOutputCount = modeCount;
 
-	if (pInArgs->MonitorModeBufferInputCount < monitorModes.size())
+	if (pInArgs->MonitorModeBufferInputCount < modeCount)
 	{
 		// Return success if there was no buffer, since the caller was only asking for a count of modes
 		return (pInArgs->MonitorModeBufferInputCount > 0) ? STATUS_BUFFER_TOO_SMALL : STATUS_SUCCESS;
@@ -5723,7 +5665,7 @@ NTSTATUS VirtualDisplayDriverEvtIddCxParseMonitorDescription2(
 		
 		logStream.str(""); // Clear the stream
 		logStream << "Writing monitor modes to output buffer:";
-		for (DWORD ModeIndex = 0; ModeIndex < knownModes.size(); ModeIndex++)
+		for (DWORD ModeIndex = 0; ModeIndex < modeCount; ModeIndex++)
 		{
 			pInArgs->pMonitorModes[ModeIndex].Size = sizeof(IDDCX_MONITOR_MODE2);
 			pInArgs->pMonitorModes[ModeIndex].Origin = IDDCX_MONITOR_MODE_ORIGIN_MONITORDESCRIPTOR;

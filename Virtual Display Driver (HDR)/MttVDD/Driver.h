@@ -130,8 +130,6 @@ namespace Microsoft
             // The hardware-cursor event passed to IddCxMonitorSetupHardwareCursor. IddCx
             // signals it, it does not own it, so the driver has to close it: the previous one
             // on reassignment for the same monitor, and the last one on unassign. It shares
-            // m_ProcessingThreadsMutex because its lifetime is exactly the processor's.
-            std::map<IDDCX_MONITOR, HANDLE> m_CursorEvents;
             std::mutex m_ProcessingThreadsMutex;
 
         public:

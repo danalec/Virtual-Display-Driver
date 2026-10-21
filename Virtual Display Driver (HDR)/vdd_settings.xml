@@ -63,15 +63,6 @@
         <ColourFormat>RGB</ColourFormat> <!-- Options: RGB, YCbCr444, YCbCr422, YCbCr420 -->
     </colour>
 
-    <!-- === CURSOR CONFIGURATION === -->
-    <cursor>
-        <HardwareCursor>true</HardwareCursor>
-        <CursorMaxX>128</CursorMaxX>
-        <CursorMaxY>128</CursorMaxY>
-        <AlphaCursorSupport>true</AlphaCursorSupport>
-        <!-- NOTE: XorCursorSupportLevel has implementation bug - loaded but not used -->
-        <XorCursorSupportLevel>2</XorCursorSupportLevel>
-    </cursor>
 
     <!-- === CUSTOM EDID CONFIGURATION === -->
     <edid>
@@ -165,6 +156,14 @@
 
     3. color_advanced/color_format_extended (3 keys)
        - sdr_white_level, wide_color_gamut, hdr_tone_mapping
+
+    4. cursor (5 keys)
+       - HardwareCursor, CursorMaxX, CursorMaxY, AlphaCursorSupport, XorCursorSupportLevel
+
+       The driver never claimed a hardware cursor: claiming it takes the cursor away
+       from the OS compositor, and the driver never queried the shape it would have
+       to draw, so the display would have been left without a cursor. The OS software
+       cursor is used instead, which is what IddCx does by default.
        The driver always reports IDDCX_TARGET_CAPS_HIGH_COLOR_SPACE and
        IDDCX_TARGET_CAPS_WIDE_COLOR_SPACE.
     === -->
