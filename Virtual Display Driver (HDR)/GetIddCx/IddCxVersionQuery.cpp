@@ -182,7 +182,12 @@ int wmain(int argc, wchar_t** argv) {
         kitsRoot = argv[1];
     } else {
         wchar_t buf[MAX_PATH] = { 0 };
-        if (GetEnvironmentVariableW(L"WindowsSdkDir", buf, MAX_PATH) > 0) {
+        // GetEnvironmentVariableW returns the required size, including the terminator,
+        // when the value does not fit. A value that does not fit would leave a truncated
+        // path in the buffer, and the scan below would then report that no IddCx header
+        // set is installed -- a wrong answer about the machine, not a missing one.
+        const DWORD copied = GetEnvironmentVariableW(L"WindowsSdkDir", buf, MAX_PATH);
+        if (copied > 0 && copied < MAX_PATH) {
             kitsRoot = buf;
         }
     }
