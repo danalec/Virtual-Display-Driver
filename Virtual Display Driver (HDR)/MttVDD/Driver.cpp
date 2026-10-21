@@ -4789,6 +4789,18 @@ void SwapChainProcessor::RunCore()
 		else
 		{
 			logStream.str(""); // Clear the stream
+			if (hr == DXGI_ERROR_ACCESS_LOST)
+			{
+				// The device is gone: a TDR, a driver reset, an eGPU unplugged.
+				// Mark it, so the cache stops handing it out. The swap chain is
+				// deleted when the loop ends, the OS re-assigns one, and the
+				// assignment then builds a NEW device -- which is the only way this
+				// can recover. Handing the same lost device back is what made the
+				// cycle churn forever.
+				if (m_Device) {
+					m_Device->MarkLost();
+				}
+			}
 			if (hr == DXGI_ERROR_ACCESS_LOST && retryCount < maxRetries)
 			{
 				logStream << "DXGI_ERROR_ACCESS_LOST detected. Retry " << (retryCount + 1) << "/" << maxRetries << " after " << retryDelay << "ms delay.";
@@ -5093,17 +5105,22 @@ std::shared_ptr<Direct3DDevice> IndirectDeviceContext::GetOrCreateDevice(LUID Re
 		auto it = s_DeviceCache.find(RenderAdapter);
 		if (it != s_DeviceCache.end()) {
 			Device = it->second;
-			if (Device) {
+			if (Device && !Device->IsLost()) {
 				logStream.str("");
 				logStream << "Reusing cached Direct3DDevice for LUID " << RenderAdapter.HighPart << "-" << RenderAdapter.LowPart;
 				vddlog("d", logStream.str().c_str());
 				return Device;
-			} else {
-				logStream.str("");
-				logStream << "Cached Direct3DDevice is null for LUID " << RenderAdapter.HighPart << "-" << RenderAdapter.LowPart << ", removing from cache";
-				vddlog("d", logStream.str().c_str());
-				s_DeviceCache.erase(it);
 			}
+			// A null device, or one that was lost: neither can be used, and a lost
+			// one never comes back. Handing it out again is what made the recovery
+			// loop churn -- the OS re-assigned the swap chain, the cache returned the
+			// same dead device, and the display stayed frozen.
+			logStream.str("");
+			logStream << "Cached Direct3DDevice for LUID " << RenderAdapter.HighPart << "-" << RenderAdapter.LowPart
+				<< (Device ? " was lost, removing from cache" : " is null, removing from cache")
+				<< "; a new one will be created";
+			vddlog("w", logStream.str().c_str());
+			s_DeviceCache.erase(it);
 		}
 	}
 
@@ -5134,8 +5151,11 @@ void IndirectDeviceContext::CleanupExpiredDevices()
 	
 	int removed = 0;
 	for (auto it = s_DeviceCache.begin(); it != s_DeviceCache.end();) {
-		// With shared_ptr cache, we only remove null devices (shouldn't happen)
-		if (!it->second) {
+		// A null device, or one that was lost, cannot be used. The lost ones
+		// used to stay in the cache forever, because nothing ever stored a null
+		// entry -- so this loop never evicted anything and the recovery from a
+		// lost adapter could not converge.
+		if (!it->second || it->second->IsLost()) {
 			it = s_DeviceCache.erase(it);
 			removed++;
 		} else {

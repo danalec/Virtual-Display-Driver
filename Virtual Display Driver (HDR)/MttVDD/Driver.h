@@ -64,6 +64,15 @@ namespace Microsoft
             Microsoft::WRL::ComPtr<IDXGIAdapter1> Adapter;
             Microsoft::WRL::ComPtr<ID3D11Device> Device;
             Microsoft::WRL::ComPtr<ID3D11DeviceContext> DeviceContext;
+
+            // Set when the device is lost: a TDR, a driver reset, an eGPU unplugged.
+            // A lost device never comes back, so the cache must not hand it out
+            // again -- that is what made the recovery loop churn instead of
+            // recovering. Written by the swap-chain thread, read under the cache
+            // mutex, so it is atomic.
+            std::atomic<bool> bLost{ false };
+            void MarkLost() { bLost.store(true); }
+            bool IsLost() const { return bLost.load(); }
         };
 
         /// <summary>
