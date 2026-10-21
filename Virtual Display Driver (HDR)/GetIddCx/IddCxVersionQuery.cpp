@@ -55,8 +55,12 @@ std::map<DWORD, IddCxVersionInfo> versionMap = {
     {18363, {"Windows 10 19H2", "1.4",  0x1400}},
     {18362, {"Windows 10 19H1", "1.4",  0x1400}},
     {17763, {"Windows 10 RS5 (October 2018)", "1.3", 0x1380}},
-    {17134, {"Windows 10 RS5 (April 2018)",   "1.3", 0x1380}},
-    {16299, {"Windows 10 RS4",   "1.3",  0x1300}},
+    // RS3, RS4 and RS5 are the Redstone branch names: 16299 is Redstone 3, the
+    // Fall Creators Update; 17134 is Redstone 4, the April 2018 Update; 17763 is
+    // Redstone 5, the October 2018 Update. The version string is the IddCx version,
+    // and 0x1200 is IddCx 1.2 -- the old table said 1.3 next to it.
+    {17134, {"Windows 10 RS4 (April 2018)",   "1.3", 0x1300}},
+    {16299, {"Windows 10 RS3 (Fall Creators Update)", "1.2", 0x1200}},
     {15063, {"Windows 10 Creators Update", "1.2", 0x1200}}
 };
 
