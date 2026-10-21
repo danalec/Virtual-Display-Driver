@@ -127,15 +127,13 @@ namespace Microsoft
             IDDCX_MONITOR m_Monitor2;
             std::map<IDDCX_MONITOR, std::unique_ptr<SwapChainProcessor>> m_ProcessingThreads;
 
-            // The hardware-cursor event passed to IddCxMonitorSetupHardwareCursor. IddCx
-            // signals it, it does not own it, so the driver has to close it: the previous one
-            // on reassignment for the same monitor, and the last one on unassign. It shares
+            // Guards m_ProcessingThreads, the map of swap-chain processors, one per monitor.
             std::mutex m_ProcessingThreadsMutex;
 
         public:
-            // The live data is the file-static s_KnownMonitorModes2 in Driver.cpp, together
-    // with s_KnownMonitorModesMutex. This declaration had no definition and no
-    // reference anywhere, so the first odr-use of it would have been an LNK2001.
+            // The EDID the driver hands the monitor. maincalc() publishes it on one thread
+            // while the IddCx callbacks read it on another, so the swap and the read are
+            // both under s_KnownMonitorEdidMutex.
             static std::vector<BYTE> s_KnownMonitorEdid;
             static std::mutex s_KnownMonitorEdidMutex;
 

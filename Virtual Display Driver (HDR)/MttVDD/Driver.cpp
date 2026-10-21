@@ -349,7 +349,8 @@ bool colorPrimariesEnabled = false;
 // numbers "sRGB color space (safe defaults)". These used to be BT.2020 (0.708/0.292,
 // 0.170/0.797, 0.131/0.046), so the no-settings-file path answered a different colour gamut
 // than the shipped one -- the same class as the gammaCorrection, forceBitDepth, hardwareCursor
-// and maxResolutionWidth drifts, and the only one of the five still standing.
+// and maxResolutionWidth drifts. All five are resolved now: the hardware cursor was resolved
+// by dropping the setting, because the driver no longer claims a cursor it never drew.
 double redX = 0.640, redY = 0.330;
 double greenX = 0.300, greenY = 0.600;
 double blueX = 0.150, blueY = 0.060;
@@ -675,9 +676,9 @@ bool ReadSettingFromXml(const std::wstring& xmlName, std::wstring& value) {
 // Resolve a boolean setting. present reports whether the key exists in the registry or the XML
 // at all, which EnabledQuery cannot tell apart from "it exists and is false" -- it collapses
 // both to false. DriverEntry needs the distinction for the settings whose compiled default is
-// true: HardwareCursor ships as <HardwareCursor>true</HardwareCursor>, and answering false for
-// "no settings file" turned the hardware cursor off on exactly the configuration nobody had
-// configured.
+// true: SendLogsThroughPipe ships as <SendLogsThroughPipe>true</SendLogsThroughPipe> and
+// fallback_on_error as <fallback_on_error>true</fallback_on_error>, and answering false for
+// "no settings file" turned both off on exactly the configuration nobody had configured.
 bool ResolveEnabledSetting(const std::wstring& settingKey, bool& present) {
 	present = false;
 	auto it = SettingsQueryMap.find(settingKey);
@@ -5179,8 +5180,9 @@ void IndirectDeviceContext::AssignSwapChain(IDDCX_MONITOR Monitor, IDDCX_SWAPCHA
 		// not called anywhere. The display would be left without a cursor.
 		// The software cursor stays, which is what the OS does by default.
 		vddlog("d", "Hardware cursor is not claimed; the OS software cursor is used.");
-		// At this point, the swap-chain is set up and the hardware cursor is enabled
-		// Further swap-chain and cursor processing will occur in the new processing thread.
+		// At this point the swap-chain is set up, and the new processing thread acquires and
+		// releases its buffers. There is no cursor processing in it: the driver does not claim
+		// the cursor, so the OS keeps drawing it.
 	}
 }
 
