@@ -5689,7 +5689,11 @@ NTSTATUS VirtualDisplayDriverMonitorGetDefaultModes(IDDCX_MONITOR MonitorObject,
 	const UINT copies = (available > 0) ? 1u : 0u;
 	if (copies > 0 && pInArgs->pDefaultMonitorModes != nullptr) {
 		pInArgs->pDefaultMonitorModes[0].Size = sizeof(IDDCX_MONITOR_MODE);
-		pInArgs->pDefaultMonitorModes[0].Origin = IDDCX_MONITOR_MODE_ORIGIN_MONITORDESCRIPTOR;
+		// The default mode is the driver's own knowledge of a mode every transport
+		// protocol and nearly every monitor support, not a mode read out of a monitor
+		// description. IDDCX_MONITOR_MODE_ORIGIN_DRIVER is what that is; the driver's
+		// own sample uses it for exactly this callback. It said MONITORDESCRIPTOR.
+		pInArgs->pDefaultMonitorModes[0].Origin = IDDCX_MONITOR_MODE_ORIGIN_DRIVER;
 		pInArgs->pDefaultMonitorModes[0].MonitorVideoSignalInfo = fallback;
 	}
 	// The output count is the number of modes the driver COPIED, so the OS reads only
