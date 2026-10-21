@@ -1618,7 +1618,18 @@ vector<tuple<int, int, int, int>> OptimizeModeList(const vector<tuple<int, int, 
     // Limit total number of modes for performance (Windows typically supports 20-50 modes)
     const size_t maxModes = 32;
     if (optimizedModes.size() > maxModes) {
-        optimizedModes.resize(maxModes);
+        // The list above is ordered from the smallest resolution to the largest, and the
+        // truncation kept the first 32: the preferred mode and the 31 smallest ones. The
+        // modes that were dropped were the ones the EDID integration exists to
+        // contribute -- the high resolutions and the high refresh rates. The largest ones
+        // are the ones that stay, and the order of the survivors does not change.
+        const size_t keep = maxModes - 1;
+        vector<tuple<int, int, int, int>> kept;
+        kept.reserve(maxModes);
+        kept.push_back(optimizedModes.front());
+        kept.insert(kept.end(), optimizedModes.end() - keep, optimizedModes.end());
+        optimizedModes.swap(kept);
+        
         stringstream ss;
         ss << "Limited mode list to " << maxModes << " modes for optimal performance";
         vddlog("i", ss.str().c_str());
