@@ -6267,7 +6267,8 @@ NTSTATUS ValidateAndSanitizeConfiguration()
 	// force then. A limit that has just been corrected leaves that list holding
 	// modes the corrected limit excludes, and the driver would report modes
 	// wider than the ceiling it logged one line above. Rebuild it against the
-	// limits that are now in force.
+	// limits that are now in force -- the resolution ones and the rate ones,
+	// because both are clamped above.
 	{
 		const size_t before = monitorModes.size();
 		// Keep a copy of the list as it was. The limits can exclude every
@@ -6282,19 +6283,27 @@ NTSTATUS ValidateAndSanitizeConfiguration()
 				[&](const std::tuple<int, int, int, int>& mode) {
 					const int w = std::get<0>(mode);
 					const int h = std::get<1>(mode);
-					return w < minWidth || w > maxWidth || h < minHeight || h > maxHeight;
+					// The rate is bounded too. The limits on the rate are clamped
+					// a few lines above, and a list that kept a mode above the
+					// clamped ceiling would report a rate the driver says it does
+					// not use. The rate is a fraction, and the fraction reduces,
+					// so it is compared as the value it stands for.
+					const int den = std::get<3>(mode);
+					const double rate = den > 0 ? static_cast<double>(std::get<2>(mode)) / den : 0.0;
+					return w < minWidth || w > maxWidth || h < minHeight || h > maxHeight ||
+						rate < minRefresh || rate > maxRefresh;
 				}),
 			monitorModes.end());
 		if (monitorModes.empty() && !configuredModes.empty()) {
 			monitorModes = configuredModes;
 			stringstream ss;
-			ss << "The resolution limits exclude every configured mode; keeping the "
+			ss << "The limits exclude every configured mode; keeping the "
 			   << configuredModes.size() << " modes the configuration asked for";
 			vddlog("w", ss.str().c_str());
 		}
 		else if (monitorModes.size() != before) {
 			stringstream ss;
-			ss << "The mode list was rebuilt against the corrected resolution limits: "
+			ss << "The mode list was rebuilt against the corrected limits: "
 			   << before << " -> " << monitorModes.size() << " modes";
 			vddlog("w", ss.str().c_str());
 		}
