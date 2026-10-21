@@ -4932,6 +4932,22 @@ vector<BYTE> loadEdid(const string& filePath) {
 		return hardcodedEdid;
 	}
 	if (file.read((char*)buffer.data(), size)) {
+		// An EDID is the 128-byte base block plus one 128-byte block per extension,
+		// and byte 126 of the base block says how many extensions there are. The size
+		// has to be a whole number of blocks, and every block the EDID claims has to be
+		// there: this buffer is handed to the OS as the monitor description, and a
+		// ragged or truncated one is a description the OS cannot parse. The old check
+		// only had a lower bound, so a 200-byte file passed the checksum test and was
+		// reported as "Using custom edid" as if it had worked. Measured on the EDIDs
+		// that ship with the project, all of which the rule keeps: the embedded one and
+		// the two 256-byte ones have one extension, and 8K240HzHDR.edid is 384 bytes
+		// with two, so 128 * (1 + count) holds for each.
+		if ((size % 128) != 0 || size < 128 * (static_cast<streamsize>(buffer[126]) + 1)) {
+			vddlog("e", "Custom edid does not match the extension count it declares, ignoring it");
+			vddlog("i", "Using hardcoded edid");
+			return hardcodedEdid;
+		}
+
 		//calculate checksum and compare it to 127 byte, if false then return hardcoded if true then return buffer to prevent loading borked edid.
 		BYTE calculatedChecksum = calculateChecksum(buffer);
 		if (calculatedChecksum != buffer[127]) {
