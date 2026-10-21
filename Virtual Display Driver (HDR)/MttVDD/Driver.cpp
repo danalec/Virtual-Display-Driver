@@ -4125,10 +4125,15 @@ void loadSettings() {
 					vddlog("w", "EDID profile loaded but not applied (integration disabled)");
 				}
 			} else {
+				// The flag chooses how loudly the failure is reported, not what the
+				// driver does: an empty mode list is a driver failure, so the manual
+				// settings are used either way. The message used to say the fallback was
+				// disabled while the fallback happened.
 				if (fallbackOnError) {
 					vddlog("w", "EDID profile loading failed, using manual settings");
 				} else {
-					vddlog("e", "EDID profile loading failed and fallback disabled");
+					vddlog("e", "EDID profile loading failed; the manual settings are used "
+						"anyway, because a display without modes is a driver failure");
 				}
 			}
 		}
