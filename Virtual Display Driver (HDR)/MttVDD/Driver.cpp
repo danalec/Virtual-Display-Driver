@@ -4253,6 +4253,18 @@ SwapChainProcessor::SwapChainProcessor(IDDCX_SWAPCHAIN hSwapChain, shared_ptr<Di
 		// would then wait INFINITE on a thread it can never signal, hanging device teardown.
 		// It already tolerates a null m_hThread, so leaving it unset is the safe state.
 		vddlog("e", "Not starting the swap-chain processing thread without a terminate event.");
+		// The processing thread is the only thing that releases the swap chain: Run()
+		// calls WdfObjectDelete on it, and deleting it is also how the OS is
+		// told to hand out a new one. Without the thread nothing would ever
+		// release it, and the virtual display would stop updating.
+		if (m_hSwapChain)
+		{
+			WdfObjectDelete((WDFOBJECT)m_hSwapChain);
+			m_hSwapChain = nullptr;
+			logStream.str("");
+			logStream << "Swap-chain object deleted without a processing thread.";
+			vddlog("d", logStream.str().c_str());
+		}
 		return;
 	}
 	else
@@ -4472,6 +4484,23 @@ void SwapChainProcessor::RunCore()
 	// Acquire and release buffers in a loop
 	for (;;)
 	{
+		// The terminate event has to be looked at on every pass, not only
+		// when the acquire went pending. The OS can keep handing out
+		// buffers -- an animating desktop, or a teardown while the chain is
+		// still live -- and then the acquire keeps succeeding, the loop
+		// never waits, and the event the destructor sets is never observed.
+		// ~SwapChainProcessor then waits for a thread that never comes back,
+		// and the IddCx callback thread that called UnassignSwapChain blocks
+		// forever, so the device is never torn down.
+		if (m_hTerminateEvent.Get() &&
+			WaitForSingleObject(m_hTerminateEvent.Get(), 0) == WAIT_OBJECT_0)
+		{
+			logStream.str("");
+			logStream << "Terminate event signaled. Exiting loop.";
+			vddlog("d", logStream.str().c_str());
+			break;
+		}
+
 		ComPtr<IDXGIResource> AcquiredBuffer;
 
 		// Ask for the next buffer from the producer
@@ -4893,6 +4922,16 @@ IndirectDeviceContext::~IndirectDeviceContext()
 
 void IndirectDeviceContext::InitAdapter()
 {
+	// IddCxAdapterInitAsync is a one-shot per adapter. The D0 callback calls
+	// this on every power transition, and a second call would leave the live
+	// adapter in place and bring up a second one, duplicating the monitors
+	// FinishInit creates -- and the handle stored in m_Adapter would be
+	// overwritten, orphaning the first one.
+	if (m_Adapter != nullptr) {
+		vddlog("d", "The adapter is already initialised; not bringing up a second one.");
+		return;
+	}
+
 	maincalc();
 	stringstream logStream;
 
