@@ -23,13 +23,13 @@
 // The constants are the SDK's own IDDCX_VERSION_* values:
 //   1.2  RS3              0x1200
 //   1.3  RS4 / RS5        0x1300 / 0x1380
-//   1.4  RS5 (hotfix)     0x1400
+//   1.4  19H1             0x1400
 //   1.5  Vibrainium       0x1500
 //   1.6  Manganese        0x1600
 //   1.7  Iron             0x1700
 //   1.8  Cobalt           0x1800, and 0x1801 for the UpdateMode fix
-//   1.9  Cobalt           0x1900
-//   1.10 Iron             0x1A00, and 0x1A80 for the hotfix
+//   1.9  SV2              0x1900
+//   1.10 SV2_SEPT23       0x1A00, and 0x1A80 (GERMANIUM) for the hotfix
 // The SDK spells the two "hotfix" values IDDCX_VERSION_<name>_UPDATEMODE_FIX.
 //
 // Windows 10 Creators Update (15063) is the first build that ships IddCx.
@@ -54,9 +54,9 @@ std::map<DWORD, IddCxVersionInfo> versionMap = {
     {19041, {"Windows 10 20H1", "1.5",  0x1500}},
     {18363, {"Windows 10 19H2", "1.4",  0x1400}},
     {18362, {"Windows 10 19H1", "1.4",  0x1400}},
-    {17763, {"Windows 10 RS5",   "1.3",  0x1380}},  // RS5 is 0x1380; 0x1300 is RS4
-    {17134, {"Windows 10 RS4",   "1.3",  0x1300}},
-    {16299, {"Windows 10 RS3",   "1.3",  0x1200}},
+    {17763, {"Windows 10 RS5 (October 2018)", "1.3", 0x1380}},
+    {17134, {"Windows 10 RS5 (April 2018)",   "1.3", 0x1380}},
+    {16299, {"Windows 10 RS4",   "1.3",  0x1300}},
     {15063, {"Windows 10 Creators Update", "1.2", 0x1200}}
 };
 
@@ -100,6 +100,29 @@ IddCxVersionInfo GetIddCxVersionFromBuild(DWORD buildNumber) {
     return {"Unknown Windows Version", "Unknown", 0x0000};
 }
 
+// A directory name under um\iddcx\ is not guaranteed to be a version. A file
+// called README.txt can sit next to the version folders, and std::stol on it
+// threw std::invalid_argument out of the sort comparator, which aborted the
+// tool with no output at all. Parse the name by hand and skip what is not one.
+bool ParseNonNegativeInt(const std::wstring& s, int& out) {
+    if (s.empty()) { return false; }
+    long value = 0;
+    for (wchar_t c : s) {
+        if (c < L'0' || c > L'9') { return false; }
+        value = value * 10 + (c - L'0');
+        if (value > 100000) { return false; }
+    }
+    out = (int)value;
+    return true;
+}
+
+bool ParseVersionDir(const std::wstring& name, int& major, int& minor) {
+    const size_t dot = name.find(L'.');
+    if (dot == std::wstring::npos) { return false; }
+    return ParseNonNegativeInt(name.substr(0, dot), major)
+        && ParseNonNegativeInt(name.substr(dot + 1), minor);
+}
+
 // The newest IddCx header set installed on this machine. This part is a
 // measurement, not an inference: it reads um\iddcx\<version>\IddCx.h out of
 // the Windows Kits.
@@ -125,33 +148,40 @@ std::string GetNewestInstalledIddCxHeaders(const wchar_t* kitsRoot) {
     // The unversioned layout, in case an SDK ever ships one.
     roots.push_back(std::wstring(kitsRoot) + L"\\Include\\iddcx");
 
+    // Every version directory of every root, newest first. The old code walked
+    // the roots in turn and returned the newest version of the FIRST root that
+    // had any version directory at all, so a machine with two SDKs reported the
+    // newest header set of whichever one the directory enumeration reached
+    // first -- while the line claimed to be the newest on the machine.
+    struct Candidate {
+        int major;
+        int minor;
+        std::wstring name;
+        std::wstring root;
+    };
+    std::vector<Candidate> candidates;
     for (const auto& root : roots) {
         WIN32_FIND_DATAW fd;
         HANDLE h = FindFirstFileW((root + L"\\*").c_str(), &fd);
         if (h == INVALID_HANDLE_VALUE) { continue; }
-        std::vector<std::wstring> found;
         do {
             if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) { continue; }
-            found.push_back(fd.cFileName);
+            int major = 0, minor = 0;
+            if (!ParseVersionDir(fd.cFileName, major, minor)) { continue; }
+            candidates.push_back({ major, minor, fd.cFileName, root });
         } while (FindNextFileW(h, &fd));
         FindClose(h);
-        if (found.empty()) { continue; }
-        // Compare major and minor separately. As a double, "1.10" is 1.1 and
-        // sorts BELOW "1.9", which would pick the older header set.
-        std::sort(found.begin(), found.end(), [](const std::wstring& a, const std::wstring& b) {
-            auto parts = [](const std::wstring& s) {
-                const size_t dot = s.find(L'.');
-                if (dot == std::wstring::npos) { return std::make_pair(0, 0); }
-                return std::make_pair(
-                    (int)std::stol(std::wstring(s.substr(0, dot))),
-                    (int)std::stol(std::wstring(s.substr(dot + 1))));
-            };
-            return parts(a) > parts(b);
-        });
-        for (const auto& v : found) {
-            if (GetFileAttributesW((root + L"\\" + v + L"\\IddCx.h").c_str()) != INVALID_FILE_ATTRIBUTES) {
-                return std::string(v.begin(), v.end());
-            }
+    }
+
+    // Compare major and minor separately. As a double, "1.10" is 1.1 and
+    // sorts BELOW "1.9", which would pick the older header set.
+    std::sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) {
+        if (a.major != b.major) { return a.major > b.major; }
+        return a.minor > b.minor;
+    });
+    for (const auto& candidate : candidates) {
+        if (GetFileAttributesW((candidate.root + L"\\" + candidate.name + L"\\IddCx.h").c_str()) != INVALID_FILE_ATTRIBUTES) {
+            return std::string(candidate.name.begin(), candidate.name.end());
         }
     }
     return "";
@@ -195,6 +225,14 @@ int wmain(int argc, wchar_t** argv) {
     if (!installed.empty()) {
         std::cout << "Newest IddCx header set installed on this machine: " << installed << "\n";
         std::cout << "  (read from the Windows Kits; this is a measurement, not an inference)\n\n";
+    }
+    else {
+        // Say so. The measurement was skipped silently, so "not measured" and
+        // "none installed" printed exactly the same thing, and a Kits root that
+        // could not be read was indistinguishable from a machine without one.
+        std::cout << "Newest IddCx header set installed on this machine: not measured.\n";
+        std::cout << "  (the Windows Kits root could not be read, or no IddCx header set\n";
+        std::cout << "   was found under it -- that is not the same as 'none installed')\n\n";
     }
 
     std::cout << "How to read the numbers above:\n";
