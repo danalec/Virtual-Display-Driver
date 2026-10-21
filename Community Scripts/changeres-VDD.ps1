@@ -11,6 +11,22 @@ param(
 if (-Not ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] 'Administrator')) {
     if ([int](Get-CimInstance -Class Win32_OperatingSystem | Select-Object -ExpandProperty BuildNumber) -ge 6000) {
         $CommandLine = "-File `"" + $MyInvocation.MyCommand.Path + "`" "
+        # Pass the arguments on. The elevated child is the same script, and a
+        # child that gets no arguments cannot bind the mandatory parameters the
+        # script was called with -- changeres-VDD.ps1 needs xres and yres,
+        # refreshrate-VDD.ps1 needs refreshrate -- so it died with "Cannot process
+        # command because of one or more missing mandatory parameters" and
+        # nothing happened. The same switch-aware form is used by rotate-VDD.ps1
+        # and scale-VDD.ps1: a switch is passed bare when it is on, because
+        # Windows PowerShell 5.1 cannot bind an explicit switch value under -File.
+        $MyInvocation.BoundParameters.GetEnumerator() | ForEach-Object {
+            if ($_.Value -is [System.Management.Automation.SwitchParameter]) {
+                if ($_.Value.IsPresent) { $CommandLine += "-$($_.Key) " }
+            }
+            else {
+                $CommandLine += "-$($_.Key):$($_.Value) "
+            }
+        }
         # Wait for the elevated child and pass its exit code on. Start-Process
         # without -Wait returns immediately, and a bare `exit` sets the parent's
         # exit code to 0 -- so a caller checking $LASTEXITCODE saw success
