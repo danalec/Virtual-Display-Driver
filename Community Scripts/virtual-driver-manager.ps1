@@ -119,7 +119,15 @@ function Write-Log {
 if (-not $PSBoundParameters.ContainsKey('Action')) {
     # Prompts are not suitable for automation or non-interactive shells.
     if ($Json.IsPresent -or ($host.UI.RawUI -eq $null)) {
-        Write-Log -Message "The -Action parameter is mandatory for non-interactive or JSON mode execution." -Status 'Error'
+        $mandatoryMessage = "The -Action parameter is mandatory for non-interactive or JSON mode execution."
+        if ($Json.IsPresent) {
+            # In JSON mode the caller gets one document, even when the script refuses
+            # to run. An empty stdout cannot be told from a silent success.
+            @{ status = 'error'; message = $mandatoryMessage } | ConvertTo-Json -Compress | Write-Output
+        }
+        else {
+            Write-Log -Message $mandatoryMessage -Status 'Error'
+        }
         exit 1
     }
 
@@ -188,8 +196,18 @@ if (-Not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdenti
 
     # Pass the exit code from the elevated process back to the original caller.
     $ActionTitleCase = (Get-Culture).TextInfo.ToTitleCase($Action)
-    if ($elevatedProcess.ExitCode -eq 0) { Write-Log -Message "$ActionTitleCase Succeeded." -Status 'Success' }
-    else { Write-Log -Message "$ActionTitleCase Failed. See the elevated window for details." -Status 'Error' }
+    $elevatedSucceeded = ($elevatedProcess.ExitCode -eq 0)
+    if ($elevatedSucceeded) { $elevatedMessage = "$ActionTitleCase Succeeded." }
+    else { $elevatedMessage = "$ActionTitleCase Failed. See the elevated window for details." }
+    if ($Json.IsPresent) {
+        # The elevated child ran in a window of its own, so its own document never
+        # reached this stdout. Emit one here, so a JSON consumer gets a document and
+        # not an empty string, which it cannot tell from a silent success.
+        $elevatedStatus = $(if ($elevatedSucceeded) { 'success' } else { 'error' })
+        @{ status = $elevatedStatus; message = $elevatedMessage } | ConvertTo-Json -Compress | Write-Output
+    }
+    elseif ($elevatedSucceeded) { Write-Log -Message $elevatedMessage -Status 'Success' }
+    else { Write-Log -Message $elevatedMessage -Status 'Error' }
     exit $elevatedProcess.ExitCode
 }
 
@@ -380,7 +398,14 @@ try {
         # Use the hash to ensure the DevCon-Installer utility downloads the correct, secure version of DevCon.
         $devconArgs = "install -hash $devconHash -update -dir `"$tempDir`""
         Write-Verbose "Running DevCon Installer with arguments: $devconArgs"
-        Start-Process -FilePath $devconInstallerPath -ArgumentList $devconArgs -Wait -NoNewWindow
+        # The installer writes to the console. Left alone, that output lands on this
+        # script's stdout, so -Json output was no longer a single JSON document and
+        # ConvertFrom-Json on it failed. Send it to files instead; the path is in the
+        # verbose log, so nothing is lost.
+        $devconInstallerLog = Join-Path $tempDir 'devcon-installer.log'
+        $devconInstallerErr = Join-Path $tempDir 'devcon-installer.err'
+        Start-Process -FilePath $devconInstallerPath -ArgumentList $devconArgs -Wait -NoNewWindow -RedirectStandardOutput $devconInstallerLog -RedirectStandardError $devconInstallerErr
+        Write-Verbose "DevCon Installer output: $devconInstallerLog (errors: $devconInstallerErr)"
 
         $devconExe = Join-Path $tempDir "devcon.exe"
         if (-not (Test-Path $devconExe)) { throw "Failed to acquire devcon.exe." }
