@@ -5494,31 +5494,36 @@ NTSTATUS VirtualDisplayDriverParseMonitorDescription(const IDARG_IN_PARSEMONITOR
 	//
 	// pOutArgs is the output: it carries the count the caller should allocate. The input
 	// count is left exactly as it arrived and is what bounds the copy.
+	// One number decides three things: the count the OS is told, the count the buffer
+	// is checked against, and the count that is copied. They were two different reads of
+	// the same unlocked global -- the count came from monitorModes and the copy from the
+	// snapshot -- so a list that changed in between let the driver report one number
+	// and write another.
+	const vector<DISPLAYCONFIG_VIDEO_SIGNAL_INFO> knownModes = SnapshotKnownMonitorModes();
+	const UINT required = (UINT)knownModes.size();
 	const UINT available = pInArgs->MonitorModeBufferInputCount;
-	const UINT required = (UINT)monitorModes.size();
-	pOutArgs->MonitorModeBufferOutputCount = required;
+	// PreferredMonitorModeIdx is an output field, and NO_PREFERRED_MODE is what it
+	// carries when there is no preferred mode. It was left unwritten on the call where
+	// the OS only asked for the count, so the OS read whatever its buffer happened to
+	// hold.
+	pOutArgs->PreferredMonitorModeIdx = NO_PREFERRED_MODE;
 
 	logStream.str("");
 	logStream << "Number of monitor modes generated: " << required;
 	vddlog("d", logStream.str().c_str());
 
-	if (available < required)
+	if (available == 0)
 	{
-		logStream.str(""); 
-		logStream << "Buffer too small. Input count: " << available << ", Required: " << required;
-		vddlog("w", logStream.str().c_str());
-		// Return success if there was no buffer, since the caller was only asking for a count of modes
-		return (available > 0) ? STATUS_BUFFER_TOO_SMALL : STATUS_SUCCESS;
+		// The OS is asking how many modes there are. The output count is the number it
+		// would get, and nothing is copied.
+		pOutArgs->MonitorModeBufferOutputCount = required;
+		return STATUS_SUCCESS;
 	}
 
 	// Copy the known modes to the output buffer. Both sides of the copy are bounded
 	// independently: the destination by what the IddCx supplied, the source by how many
-	// entries RebuildKnownMonitorModesCache actually built. Bounding by `available` alone
-	// only protected the destination -- `available >= required` is all the guard above
-	// establishes, so a caller that passes a buffer larger than the count it was handed
-	// reads past the end of s_KnownMonitorModes2.
-	const vector<DISPLAYCONFIG_VIDEO_SIGNAL_INFO> knownModes = SnapshotKnownMonitorModes();
-	const UINT copies = min(available, (UINT)knownModes.size());
+	// entries RebuildKnownMonitorModesCache actually built.
+	const UINT copies = min(available, required);
 	for (DWORD ModeIndex = 0; ModeIndex < copies; ModeIndex++)
 	{
 		pInArgs->pMonitorModes[ModeIndex].Size = sizeof(IDDCX_MONITOR_MODE);
@@ -5526,8 +5531,21 @@ NTSTATUS VirtualDisplayDriverParseMonitorDescription(const IDARG_IN_PARSEMONITOR
 		pInArgs->pMonitorModes[ModeIndex].MonitorVideoSignalInfo = knownModes[ModeIndex];
 	}
 
-	// Set the preferred mode as represented in the EDID
-	pOutArgs->PreferredMonitorModeIdx = 0;
+	// The output count is documented as the number of modes the driver COPIED, so the
+	// OS reads only what was written. It used to be the total, with a failure status to
+	// keep the OS from reading a buffer that was too small -- but the SDK requires a
+	// status the OS reads as success (IddCx.h:1411-1413), and STATUS_BUFFER_TOO_SMALL
+	// is 0xC0000023, so it is not one of those.
+	pOutArgs->MonitorModeBufferOutputCount = copies;
+	if (copies < required) {
+		logStream.str("");
+		logStream << "Buffer too small. Input count: " << available << ", copied: " << copies;
+		vddlog("w", logStream.str().c_str());
+	}
+	else {
+		// Set the preferred mode as represented in the EDID
+		pOutArgs->PreferredMonitorModeIdx = 0;
+	}
 	vddlog("d", "Monitor description parsed successfully.");
 	return STATUS_SUCCESS;
 }
@@ -5536,19 +5554,32 @@ _Use_decl_annotations_
 NTSTATUS VirtualDisplayDriverMonitorGetDefaultModes(IDDCX_MONITOR MonitorObject, const IDARG_IN_GETDEFAULTDESCRIPTIONMODES* pInArgs, IDARG_OUT_GETDEFAULTDESCRIPTIONMODES* pOutArgs)
 {
 	UNREFERENCED_PARAMETER(MonitorObject);
-	UNREFERENCED_PARAMETER(pInArgs);
-	UNREFERENCED_PARAMETER(pOutArgs);
 
-	// Should never be called since we create a single monitor with a known EDID in this sample driver.
+	// The SDK says the driver "must create at least one monitor mode" here, and this
+	// callback is registered, so the OS can call it. It answered
+	// STATUS_NOT_IMPLEMENTED, on the strength of a comment that said it would never
+	// be called -- which a registered callback cannot promise.
+	//
+	// The mode is the one the SDK names as an example of a mode the transport
+	// protocol and nearly every monitor support.
+	const DISPLAYCONFIG_VIDEO_SIGNAL_INFO fallback = dispinfo(640, 480, 60, 1);
+	const UINT available = pInArgs->DefaultMonitorModeBufferInputCount;
+	const UINT copies = (available > 0) ? 1u : 0u;
+	if (copies > 0 && pInArgs->pDefaultMonitorModes != nullptr) {
+		pInArgs->pDefaultMonitorModes[0].Size = sizeof(IDDCX_MONITOR_MODE);
+		pInArgs->pDefaultMonitorModes[0].Origin = IDDCX_MONITOR_MODE_ORIGIN_MONITORDESCRIPTOR;
+		pInArgs->pDefaultMonitorModes[0].MonitorVideoSignalInfo = fallback;
+	}
+	// The output count is the number of modes the driver COPIED, so the OS reads only
+	// what was written; a zero-sized input count is the OS asking how many there are.
+	pOutArgs->DefaultMonitorModeBufferOutputCount = copies;
+	pOutArgs->PreferredMonitorModeIdx = (copies > 0) ? 0 : NO_PREFERRED_MODE;
 
-	// ==============================
-	// TODO: In a real driver, this function would be called to generate monitor modes for a monitor with no EDID.
-	// Drivers should report modes that are guaranteed to be supported by the transport protocol and by nearly all
-	// monitors (such 640x480, 800x600, or 1024x768). If the driver has access to monitor modes from a descriptor other
-	// than an EDID, those modes would also be reported here.
-	// ==============================
+	stringstream logStream;
+	logStream << "Reported " << copies << " default monitor mode(s), 640x480@60";
+	vddlog("d", logStream.str().c_str());
 
-	return STATUS_NOT_IMPLEMENTED;
+	return STATUS_SUCCESS;
 }
 
 /// <summary>
@@ -5694,16 +5725,21 @@ NTSTATUS VirtualDisplayDriverMonitorQueryModes(IDDCX_MONITOR MonitorObject, cons
 		copy(TargetModes.begin(), TargetModes.end(), pInArgs->pTargetModes);
 	}
 	else if (pInArgs->TargetModeBufferInputCount > 0) {
-		// The buffer cannot hold the modes. Returning success with the count
-		// and nothing in the buffer leaves the OS reading modes that were
-		// never written, so say that the buffer has to grow. The output count
-		// above already says how big it has to be. A zero-sized input count
-		// is the OS asking only how many modes there are.
+		// The buffer cannot hold the modes. Copy what fits and report how many that
+		// was: the output count is documented as the number of modes the driver COPIED
+		// (IddCx.h:1950-1957), so the OS reads only what was written. The DDI has to
+		// answer with a status the OS reads as success -- IddCx.h:1444-1446 says the
+		// callback "must return STATUS_SUCCESS, or another status value for which
+		// NT_SUCCESS(status) equals TRUE", and STATUS_BUFFER_TOO_SMALL is 0xC0000023,
+		// so it is not one of those.
+		const UINT copies = (UINT)min(pInArgs->TargetModeBufferInputCount, (UINT)TargetModes.size());
+		copy(TargetModes.begin(), TargetModes.begin() + copies, pInArgs->pTargetModes);
+		pOutArgs->TargetModeBufferOutputCount = copies;
 		logStream.str("");
 		logStream << "Input buffer too small. Required: " << TargetModes.size()
-			<< ", Provided: " << pInArgs->TargetModeBufferInputCount;
+			<< ", Provided: " << pInArgs->TargetModeBufferInputCount
+			<< ", copied: " << copies;
 		vddlog("w", logStream.str().c_str());
-		return STATUS_BUFFER_TOO_SMALL;
 	}
 
 	return STATUS_SUCCESS;
@@ -5914,12 +5950,18 @@ NTSTATUS VirtualDisplayDriverEvtIddCxParseMonitorDescription2(
 	// the snapshot while the check was driven by the live list -- so a list that
 	// shrank in between let the copy run past the buffer the OS gave us.
 	const UINT modeCount = (UINT)knownModes.size();
-	pOutArgs->MonitorModeBufferOutputCount = modeCount;
+	const UINT available = pInArgs->MonitorModeBufferInputCount;
+	// PreferredMonitorModeIdx is an output field, and NO_PREFERRED_MODE is what it
+	// carries when there is no preferred mode. It was left unwritten on the call where
+	// the OS only asked for the count.
+	pOutArgs->PreferredMonitorModeIdx = NO_PREFERRED_MODE;
 
-	if (pInArgs->MonitorModeBufferInputCount < modeCount)
+	if (available == 0)
 	{
-		// Return success if there was no buffer, since the caller was only asking for a count of modes
-		return (pInArgs->MonitorModeBufferInputCount > 0) ? STATUS_BUFFER_TOO_SMALL : STATUS_SUCCESS;
+		// The OS is asking how many modes there are. The output count is the number it
+		// would get, and nothing is copied.
+		pOutArgs->MonitorModeBufferOutputCount = modeCount;
+		return STATUS_SUCCESS;
 	}
 	else
 	{
@@ -5929,9 +5971,14 @@ NTSTATUS VirtualDisplayDriverEvtIddCxParseMonitorDescription2(
 			return STATUS_INVALID_PARAMETER;
 		}
 		
+		// Copy as many as the buffer the OS supplied can hold. The copy used to be
+		// bounded by modeCount alone, which was safe only because the too-small case
+		// returned before reaching it.
+		const UINT copies = min(available, modeCount);
+
 		logStream.str(""); // Clear the stream
 		logStream << "Writing monitor modes to output buffer:";
-		for (DWORD ModeIndex = 0; ModeIndex < modeCount; ModeIndex++)
+		for (DWORD ModeIndex = 0; ModeIndex < copies; ModeIndex++)
 		{
 			pInArgs->pMonitorModes[ModeIndex].Size = sizeof(IDDCX_MONITOR_MODE2);
 			pInArgs->pMonitorModes[ModeIndex].Origin = IDDCX_MONITOR_MODE_ORIGIN_MONITORDESCRIPTOR;
@@ -5964,6 +6011,13 @@ NTSTATUS VirtualDisplayDriverEvtIddCxParseMonitorDescription2(
 		}
 
 		vddlog("d", logStream.str().c_str());
+
+		// The output count is documented as the number of modes the driver COPIED, so
+		// the OS reads only what was written. It used to be the total, with a failure
+		// status to keep the OS from reading a buffer that was too small -- but the SDK
+		// requires a status the OS reads as success (IddCx.h:1444-1446), and
+		// STATUS_BUFFER_TOO_SMALL is 0xC0000023, so it is not one of those.
+		pOutArgs->MonitorModeBufferOutputCount = (UINT)copies;
 
 		// Set the preferred mode as represented in the EDID
 		pOutArgs->PreferredMonitorModeIdx = 0;
@@ -6028,13 +6082,17 @@ NTSTATUS VirtualDisplayDriverEvtIddCxMonitorQueryTargetModes2(
 	}
 	else if (pInArgs->TargetModeBufferInputCount > 0)
 	{
-		// The buffer cannot hold the modes. Returning success with the count
-		// and nothing in the buffer leaves the OS reading modes that were
-		// never written, so say that the buffer has to grow. The output count
-		// above already says how big it has to be. A zero-sized input count
-		// is the OS asking only how many modes there are.
-		vddlog("w", "Input buffer is too small for target modes.");
-		return STATUS_BUFFER_TOO_SMALL;
+		// The buffer cannot hold the modes. Copy what fits and report how many that
+		// was: the output count is documented as the number of modes the driver COPIED
+		// (IddCx.h:1950-1957), so the OS reads only what was written. The DDI has to
+		// answer with a status the OS reads as success -- IddCx.h:1444-1446 says the
+		// callback "must return STATUS_SUCCESS, or another status value for which
+		// NT_SUCCESS(status) equals TRUE", and STATUS_BUFFER_TOO_SMALL is 0xC0000023,
+		// so it is not one of those.
+		const UINT copies = (UINT)min(pInArgs->TargetModeBufferInputCount, (UINT)TargetModes.size());
+		copy(TargetModes.begin(), TargetModes.begin() + copies, pInArgs->pTargetModes);
+		pOutArgs->TargetModeBufferOutputCount = copies;
+		vddlog("w", "Input buffer is too small for target modes; copied what fits.");
 	}
 
 	return STATUS_SUCCESS;
