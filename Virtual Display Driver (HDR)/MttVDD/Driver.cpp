@@ -3596,15 +3596,28 @@ void loadSettings() {
 						refreshRate = L"30";
 					}
 					int vsync_num, vsync_den;
-					float_to_vsync(ParseFloatSafe(refreshRate, 30.0f, L"resolution refresh_rate"), vsync_num, vsync_den);
+					const float parsedRate = ParseFloatSafe(refreshRate, 30.0f, L"resolution refresh_rate");
+					float_to_vsync(parsedRate, vsync_num, vsync_den);
 
 					int parsedWidth = ParseIntSafe(width, 0, L"resolution width");
 					int parsedHeight = ParseIntSafe(height, 0, L"resolution height");
 					if (parsedWidth > 0 && parsedHeight > 0) {
-						res.push_back(make_tuple(parsedWidth, parsedHeight, vsync_num, vsync_den));
-						stringstream ss;
-						ss << "Added: " << parsedWidth << "x" << parsedHeight << " @ " << vsync_num << "/" << vsync_den << "Hz";
-						vddlog("d", ss.str().c_str());
+						// The same bounds the EDID profile filter applies. The
+						// resolution bounds were checked and the refresh rate was not, so
+						// min_refresh_rate and max_refresh_rate did nothing on this path.
+						if (parsedRate < static_cast<float>(minRefreshRate) || parsedRate > static_cast<float>(maxRefreshRate)) {
+							stringstream ss;
+							ss << "Resolution " << parsedWidth << "x" << parsedHeight << " @ " << parsedRate
+							   << "Hz is outside the configured refresh rate range of " << minRefreshRate
+							   << " to " << maxRefreshRate << "Hz, skipping";
+							vddlog("w", ss.str().c_str());
+						}
+						else {
+							res.push_back(make_tuple(parsedWidth, parsedHeight, vsync_num, vsync_den));
+							stringstream ss;
+							ss << "Added: " << parsedWidth << "x" << parsedHeight << " @ " << vsync_num << "/" << vsync_den << "Hz";
+							vddlog("d", ss.str().c_str());
+						}
 					}
 					else {
 						vddlog("e", "Skipping mode with invalid width or height");
@@ -3641,6 +3654,16 @@ void loadSettings() {
 		*/
 
 		for (int globalRate : globalRefreshRates) {
+			// The same bounds the EDID profile filter applies. The
+			// resolution bounds were checked and the refresh rate was not, so
+			// min_refresh_rate and max_refresh_rate did nothing on this path.
+			if (globalRate < minRefreshRate || globalRate > maxRefreshRate) {
+				stringstream ss;
+				ss << "Global refresh rate " << globalRate << "Hz is outside the configured range of "
+				   << minRefreshRate << " to " << maxRefreshRate << "Hz, skipping";
+				vddlog("w", ss.str().c_str());
+				continue;
+			}
 			for (const auto& resTuple : resolutions) {
 				int global_width = get<0>(resTuple);
 				int global_height = get<1>(resTuple);
@@ -3765,7 +3788,8 @@ void loadSettings() {
         vector<string> strvec = split(trimmed, ',');
         if (strvec.size() == 3) {
             int vsync_num, vsync_den;
-            float_to_vsync(ParseFloatSafe(TrimAsciiSpace(strvec[2]), 60.0f, L"option.txt refresh rate"), vsync_num, vsync_den);
+            const float optionRefreshRate = ParseFloatSafe(TrimAsciiSpace(strvec[2]), 60.0f, L"option.txt refresh rate");
+            float_to_vsync(optionRefreshRate, vsync_num, vsync_den);
             int modeWidth = ParseIntSafe(TrimAsciiSpace(strvec[0]), 0, L"option.txt width");
             int modeHeight = ParseIntSafe(TrimAsciiSpace(strvec[1]), 0, L"option.txt height");
             if (modeWidth > 0 && modeHeight > 0) {
@@ -3777,6 +3801,18 @@ void loadSettings() {
                     stringstream ss;
                     ss << "option.txt mode " << modeWidth << "x" << modeHeight
                        << " is outside the configured range, skipping";
+                    vddlog("w", ss.str().c_str());
+                    continue;
+                }
+                // The refresh rate is bounded too. The resolution bounds were checked
+                // and the rate was not, so an option.txt line at 500Hz produced a mode
+                // the rest of the driver considers out of range.
+                if (optionRefreshRate < static_cast<float>(minRefreshRate) ||
+                    optionRefreshRate > static_cast<float>(maxRefreshRate)) {
+                    stringstream ss;
+                    ss << "option.txt mode " << modeWidth << "x" << modeHeight << " @ " << optionRefreshRate
+                       << "Hz is outside the configured refresh rate range of " << minRefreshRate
+                       << " to " << maxRefreshRate << "Hz, skipping";
                     vddlog("w", ss.str().c_str());
                     continue;
                 }
