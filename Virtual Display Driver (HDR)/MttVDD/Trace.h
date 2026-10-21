@@ -57,7 +57,11 @@ Environment:
 //
 // Driver specific #defines
 //
-#if UMDF_VERSION_MAJOR == 2 && UMDF_VERSION_MINOR == 0
+// The minor version test was UMDF_VERSION_MINOR == 0, which no configuration can
+// satisfy: every one of them builds with UMDF_VERSION_MINOR=25, so the tracing id
+// below was never defined and the block was dead. Nothing calls WPP_INIT_TRACING,
+// so the provider is not registered either way -- the driver logs through vddlog().
+#if UMDF_VERSION_MAJOR == 2
     // TODO: Update the name of the tracing provider
     #define MYDRIVER_TRACING_ID      L"Microsoft\\UMDF2.0\\IddSampleDriver V1.0"
 #endif

@@ -136,6 +136,15 @@
       <WppScanConfigurationData Condition="'%(ClCompile.ScanConfigurationData)' == ''">trace.h</WppScanConfigurationData>
       <ExceptionHandling>Async</ExceptionHandling>
       <EnablePREfast>true</EnablePREfast>
+      <!-- The Universal toolset links the RELEASE static CRT in every configuration,
+           Debug included: WindowsDriver.Common.targets (SetHybridCrtCl) maps
+           ClCompile.RuntimeLibrary MultiThreadedDLL to MultiThreaded. _DEBUG must
+           therefore never be defined here: the CRT headers would then ask for
+           __CrtDbgReport and _calloc_dbg, which the release CRT does not export,
+           and the link fails with LNK2001. NDEBUG is the one configuration define
+           the WDK does not supply, and it belongs in Release: it is what the CRT
+           that is actually linked expects, and it keeps assert() out of a release
+           build. CppProperties.json says the same thing. -->
       <AdditionalOptions>/D_ATL_NO_WIN_SUPPORT /DUMDF_DRIVER /DIDDCX_VERSION_MAJOR=1 /DIDDCX_VERSION_MINOR=10 /DIDDCX_MINIMUM_VERSION_REQUIRED=3 %(AdditionalOptions)</AdditionalOptions>
       <AdditionalIncludeDirectories>$(WindowsSdkDir)Include\wdf\umdf\$(UMDF_VERSION_MAJOR).$(UMDF_VERSION_MINOR);$(WindowsSdkDir)Include\$(WindowsTargetPlatformVersion)\wdf\umdf\$(UMDF_VERSION_MAJOR).$(UMDF_VERSION_MINOR);$(ProjectDir)..\..\ThirdParty\Windows-Driver-Frameworks\src\publicinc\wdf\umdf\2.15;$(ProjectDir)..\..\Common\Include;$(WindowsSdkDir)Include\$(WindowsTargetPlatformVersion)\um\iddcx\$(IDDCX_VERSION_MAJOR).$(IDDCX_VERSION_MINOR);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <LanguageStandard>stdcpp17</LanguageStandard>
@@ -157,6 +166,16 @@
       <WppScanConfigurationData Condition="'%(ClCompile.ScanConfigurationData)' == ''">trace.h</WppScanConfigurationData>
       <ExceptionHandling>Async</ExceptionHandling>
       <EnablePREfast>true</EnablePREfast>
+      <!-- The Universal toolset links the RELEASE static CRT in every configuration,
+           Debug included: WindowsDriver.Common.targets (SetHybridCrtCl) maps
+           ClCompile.RuntimeLibrary MultiThreadedDLL to MultiThreaded. _DEBUG must
+           therefore never be defined here: the CRT headers would then ask for
+           __CrtDbgReport and _calloc_dbg, which the release CRT does not export,
+           and the link fails with LNK2001. NDEBUG is the one configuration define
+           the WDK does not supply, and it belongs in Release: it is what the CRT
+           that is actually linked expects, and it keeps assert() out of a release
+           build. CppProperties.json says the same thing. -->
+      <PreprocessorDefinitions>NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <AdditionalOptions>/D_ATL_NO_WIN_SUPPORT /DUMDF_DRIVER /DIDDCX_VERSION_MAJOR=1 /DIDDCX_VERSION_MINOR=10 /DIDDCX_MINIMUM_VERSION_REQUIRED=3 %(AdditionalOptions)</AdditionalOptions>
       <AdditionalIncludeDirectories>$(WindowsSdkDir)Include\wdf\umdf\$(UMDF_VERSION_MAJOR).$(UMDF_VERSION_MINOR);$(WindowsSdkDir)Include\$(WindowsTargetPlatformVersion)\wdf\umdf\$(UMDF_VERSION_MAJOR).$(UMDF_VERSION_MINOR);$(ProjectDir)..\..\ThirdParty\Windows-Driver-Frameworks\src\publicinc\wdf\umdf\2.15;$(ProjectDir)..\..\Common\Include;$(WindowsSdkDir)Include\$(WindowsTargetPlatformVersion)\um\iddcx\$(IDDCX_VERSION_MAJOR).$(IDDCX_VERSION_MINOR);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <LanguageStandard>stdcpp17</LanguageStandard>
@@ -178,6 +197,15 @@
       <WppScanConfigurationData Condition="'%(ClCompile.ScanConfigurationData)' == ''">trace.h</WppScanConfigurationData>
       <ExceptionHandling>Async</ExceptionHandling>
       <EnablePREfast>true</EnablePREfast>
+      <!-- The Universal toolset links the RELEASE static CRT in every configuration,
+           Debug included: WindowsDriver.Common.targets (SetHybridCrtCl) maps
+           ClCompile.RuntimeLibrary MultiThreadedDLL to MultiThreaded. _DEBUG must
+           therefore never be defined here: the CRT headers would then ask for
+           __CrtDbgReport and _calloc_dbg, which the release CRT does not export,
+           and the link fails with LNK2001. NDEBUG is the one configuration define
+           the WDK does not supply, and it belongs in Release: it is what the CRT
+           that is actually linked expects, and it keeps assert() out of a release
+           build. CppProperties.json says the same thing. -->
       <AdditionalOptions>/D_ATL_NO_WIN_SUPPORT /DUMDF_DRIVER /DIDDCX_VERSION_MAJOR=1 /DIDDCX_VERSION_MINOR=10 /DIDDCX_MINIMUM_VERSION_REQUIRED=3 %(AdditionalOptions)</AdditionalOptions>
       <AdditionalIncludeDirectories>$(WindowsSdkDir)Include\wdf\umdf\$(UMDF_VERSION_MAJOR).$(UMDF_VERSION_MINOR);$(WindowsSdkDir)Include\$(WindowsTargetPlatformVersion)\wdf\umdf\$(UMDF_VERSION_MAJOR).$(UMDF_VERSION_MINOR);$(ProjectDir)..\..\ThirdParty\Windows-Driver-Frameworks\src\publicinc\wdf\umdf\2.15;$(ProjectDir)..\..\Common\Include;$(WindowsSdkDir)Include\$(WindowsTargetPlatformVersion)\um\iddcx\$(IDDCX_VERSION_MAJOR).$(IDDCX_VERSION_MINOR);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <LanguageStandard>stdcpp17</LanguageStandard>
@@ -199,6 +227,16 @@
       <WppScanConfigurationData Condition="'%(ClCompile.ScanConfigurationData)' == ''">trace.h</WppScanConfigurationData>
       <ExceptionHandling>Async</ExceptionHandling>
       <EnablePREfast>true</EnablePREfast>
+      <!-- The Universal toolset links the RELEASE static CRT in every configuration,
+           Debug included: WindowsDriver.Common.targets (SetHybridCrtCl) maps
+           ClCompile.RuntimeLibrary MultiThreadedDLL to MultiThreaded. _DEBUG must
+           therefore never be defined here: the CRT headers would then ask for
+           __CrtDbgReport and _calloc_dbg, which the release CRT does not export,
+           and the link fails with LNK2001. NDEBUG is the one configuration define
+           the WDK does not supply, and it belongs in Release: it is what the CRT
+           that is actually linked expects, and it keeps assert() out of a release
+           build. CppProperties.json says the same thing. -->
+      <PreprocessorDefinitions>NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <AdditionalOptions>/D_ATL_NO_WIN_SUPPORT /DUMDF_DRIVER /DIDDCX_VERSION_MAJOR=1 /DIDDCX_VERSION_MINOR=10 /DIDDCX_MINIMUM_VERSION_REQUIRED=3 %(AdditionalOptions)</AdditionalOptions>
       <AdditionalIncludeDirectories>$(WindowsSdkDir)Include\wdf\umdf\$(UMDF_VERSION_MAJOR).$(UMDF_VERSION_MINOR);$(WindowsSdkDir)Include\$(WindowsTargetPlatformVersion)\wdf\umdf\$(UMDF_VERSION_MAJOR).$(UMDF_VERSION_MINOR);$(ProjectDir)..\..\ThirdParty\Windows-Driver-Frameworks\src\publicinc\wdf\umdf\2.15;$(ProjectDir)..\..\Common\Include;$(WindowsSdkDir)Include\$(WindowsTargetPlatformVersion)\um\iddcx\$(IDDCX_VERSION_MAJOR).$(IDDCX_VERSION_MINOR);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <LanguageStandard>stdcpp17</LanguageStandard>

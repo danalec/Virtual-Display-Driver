@@ -14,7 +14,6 @@
       ],
       "defines": [
         "WIN32",
-        "_DEBUG",
         "UNICODE",
         "_UNICODE",
         "UMDF_DRIVER",
@@ -64,7 +63,6 @@
       ],
       "defines": [
         "WIN32",
-        "_DEBUG",
         "UNICODE",
         "_UNICODE",
         "UMDF_DRIVER",
