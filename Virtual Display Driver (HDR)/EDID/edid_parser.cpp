@@ -996,8 +996,11 @@ public:
             return false;
         }
 
-        // The same three rules the driver applies to a custom EDID, so that the
-        // tool and the driver agree on what an EDID is.
+        // The three rules the driver applies to a custom EDID, so that the tool and
+        // the driver agree on what an EDID is -- with one difference: the driver
+        // accepts a file that carries more blocks than it declares and drops the
+        // extra ones, and this tool refuses it, because a file that contradicts its
+        // own extension count is not an EDID anyone asked for.
         //
         // The header magic: every EDID starts with 00 FF FF FF FF FF FF 00. A file
         // without it is not an EDID, and the parser used to report one anyway -- a
