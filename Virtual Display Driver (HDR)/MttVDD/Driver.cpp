@@ -5182,7 +5182,12 @@ void IndirectDeviceContext::InitAdapter()
 	AdapterCaps.EndPointDiagnostics.pEndPointModelName = L"VirtualDisplayDriver Model";
 
 	// Declare your hardware and firmware versions (required)
-	IDDCX_ENDPOINT_VERSION Version = {};
+	//
+	// The OS is handed a POINTER to this structure, and IddCxAdapterInitAsync
+	// completes asynchronously: the framework can read it after this function has
+	// returned. A local would be a pointer into a frame that is gone by then, so the
+	// structure has to outlive the call.
+	static IDDCX_ENDPOINT_VERSION Version = {};
 	Version.Size = sizeof(Version);
 	Version.MajorVer = 1;
 	AdapterCaps.EndPointDiagnostics.pFirmwareVersion = &Version;
