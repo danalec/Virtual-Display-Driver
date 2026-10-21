@@ -1953,7 +1953,13 @@ bool ApplyEdidProfile(const EdidProfileData& profile) {
 	}
 
 	// Generate and store HDR metadata for all monitors if HDR is enabled
-	if (hdr10StaticMetadataEnabled && profile.hdr10Supported) {
+	//
+	// overrideManualSettings decides this as well. The template carries the profile's
+	// luminance and primaries, so storing it is the EDID reaching the driver, and
+	// vdd_settings.xml documents the flag as "false = manual settings take priority".
+	// The template was stored whatever the flag said, and the callbacks prefer it over
+	// the manual values, so a profile was applied with the flag off.
+	if (hdr10StaticMetadataEnabled && profile.hdr10Supported && overrideManualSettings) {
 		VddHdrMetadata hdrMetadata = ConvertEdidToSmpteMetadata(profile);
 		
 		if (hdrMetadata.isValid) {
@@ -1986,7 +1992,10 @@ bool ApplyEdidProfile(const EdidProfileData& profile) {
 	}
 
 	// Generate and store gamma ramp for color space processing if enabled
-	if (colorSpaceEnabled) {
+	//
+	// The ramp carries the profile's gamma and colour space, so the flag decides this
+	// as well, for the same reason as the metadata template above.
+	if (colorSpaceEnabled && overrideManualSettings) {
 		VddGammaRamp gammaRamp = ConvertEdidToGammaRamp(profile);
 		
 		if (gammaRamp.isValid) {
