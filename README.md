@@ -93,7 +93,7 @@ projects.
 
 | Project | Iddcx version | Signed | SDR | HDR | H-Cursor | Tweakable | ARM64 Support | Custom EDID | Floating Point Refresh Rates |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| [Virtual-Display-Driver (HDR)] | 1.10 (latest) | ✅ | ✅ (8/10bit) | ✅ (10/12bit)² | ✅ | ✅ | ✅¹ | ✅ | ✅ |
+| [Virtual-Display-Driver (HDR)] | 1.10 (latest) | ✅ | ✅ (8/10bit) | ✅ (10/12bit)² | ❌⁴ | ✅ | ✅¹ | ✅ | ✅ |
 | `usbmmid_v2`³ |  | ✅ | ✅ (8bit) |  |  |  |  |  |  |
 | [virtual-display-rs] | 1.5 |  | ✅ (8bit) |  | ✅ | ✅ |  |  |  |
 | [parsec-vdd]| 1.5 | ✅ | ✅ (8bit) |  | ✅ | ✅ |  |  |  |
@@ -103,6 +103,10 @@ projects.
 ¹ ARM64 Support in Windows 11 24H2 or later may require test signing be enabled.
 ² HDR 10/12-bit output requires raising `force_bit_depth` in `vdd_settings.xml`; the shipped default is 8-bit with HDR10 static metadata disabled.
 ³ The upstream repository for this project is no longer published, so no link is given.
+⁴ The driver does not claim a hardware cursor. Claiming one takes the cursor away from the OS
+compositor, and the driver never queried the shape it would have had to draw, so the display
+would have been left without a cursor. The OS software cursor is used instead, which is what
+IddCx does by default.
 
 [Virtual-Display-Driver (HDR)]: https://github.com/VirtualDrivers/Virtual-Display-Driver
 [virtual-display-rs]: https://github.com/MolotovCherry/virtual-display-rs
