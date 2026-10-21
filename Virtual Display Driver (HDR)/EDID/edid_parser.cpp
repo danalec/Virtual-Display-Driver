@@ -14,6 +14,17 @@
 #include <windows.h>
 #endif
 
+// The profile stream carries std::fixed and whatever precision the last write
+// set: three decimals for the mode list, four for the chromaticity. A
+// luminance written straight into it inherited that, so the real minimum
+// display mastering luminance of 0.0034 nits came out as 0.003, and the
+// summary printed it as 0.00. Write it on its own stream instead.
+std::string FormatLuminance(double nits) {
+    std::ostringstream os;
+    os << std::defaultfloat << std::setprecision(6) << nits;
+    return os.str();
+}
+
 struct VideoMode {
     int x, y, Z, refresh;
     VideoMode(int x, int y, int Z, int refresh) : x(x), y(y), Z(Z), refresh(refresh) {}
@@ -232,7 +243,7 @@ private:
         if (est[1] & 0x80) video_modes.emplace_back(800, 600, 1000, 72);   // 800x600@72Hz
         if (est[1] & 0x40) video_modes.emplace_back(800, 600, 1000, 75);   // 800x600@75Hz
         if (est[1] & 0x20) video_modes.emplace_back(832, 624, 1000, 75);   // 832x624@75Hz
-        if (est[1] & 0x10) video_modes.emplace_back(1024, 768, 1000, 87);  // 1024x768@87Hz (interlaced)
+        if (est[1] & 0x10) video_modes.emplace_back(1024, 768, 1000, 87);  // 1024x768@87Hz
         if (est[1] & 0x08) video_modes.emplace_back(1024, 768, 1000, 60);  // 1024x768@60Hz
         if (est[1] & 0x04) video_modes.emplace_back(1024, 768, 1000, 70);  // 1024x768@70Hz
         if (est[1] & 0x02) video_modes.emplace_back(1024, 768, 1000, 75);  // 1024x768@75Hz
@@ -517,6 +528,19 @@ private:
             {218, {4096, 2160, 100, false}}, {219, {4096, 2160, 120, false}}
         };
         
+        // Four of the CTA-861 VICs are interlaced: 5 is 1920x1080i, 6 is
+        // 720(1440)x480i, and 21 and 22 are 720(1440)x576i. The mode list has no
+        // interlace field -- the driver reports (width, height, vsyncNum,
+        // vsyncDen) -- so an interlaced mode added here would be reported as
+        // progressive, which is a different mode than the display has. Skip them
+        // rather than report one that does not exist.
+        switch (vic) {
+            case 5: case 6: case 21: case 22:
+                std::cout << "  VIC " << (int)vic << " is interlaced, skipped" << std::endl;
+                return;
+            default: break;
+        }
+
         auto it = vic_table.find(vic);
         if (it != vic_table.end()) {
             const VICMode& mode = it->second;
@@ -866,8 +890,13 @@ public:
                         std::cout << "Processing CEA extension..." << std::endl;
                         parse_cea_extension(extension);
                         break;
-                    case 0xF0: // DisplayID extension
-                        std::cout << "DisplayID extension found (not implemented)" << std::endl;
+                    case 0x70: // DisplayID extension block
+                        // The DisplayID extension block has tag code 0x70, not 0xF0.
+                        // It was printed as an unknown type and dropped without a
+                        // word, so a profile written from an EDID whose modes live
+                        // in that block came out with almost nothing in it. The
+                        // block is still not parsed, and now it says so.
+                        std::cout << "DisplayID extension block found (not parsed; the modes it carries are missing from the profile)" << std::endl;
                         break;
                     default:
                         std::cout << "Unknown extension type: 0x" << std::hex 
@@ -959,10 +988,10 @@ public:
             profile << "    <HDR10PlusSupported>" << (hdr_metadata.hdr10_plus_supported ? "true" : "false") << "</HDR10PlusSupported>\n";
             
             if (hdr_metadata.max_luminance > 0) {
-                profile << "    <MaxLuminance>" << hdr_metadata.max_luminance << "</MaxLuminance>\n";
+                profile << "    <MaxLuminance>" << FormatLuminance(hdr_metadata.max_luminance) << "</MaxLuminance>\n";
             }
             if (hdr_metadata.min_luminance > 0) {
-                profile << "    <MinLuminance>" << hdr_metadata.min_luminance << "</MinLuminance>\n";
+                profile << "    <MinLuminance>" << FormatLuminance(hdr_metadata.min_luminance) << "</MinLuminance>\n";
             }
             
             profile << "  </HDRCapabilities>\n";
@@ -1025,10 +1054,10 @@ public:
         std::cout << "  HDR10+: " << (hdr_metadata.hdr10_plus_supported ? "Yes" : "No") << std::endl;
         
         if (hdr_metadata.max_luminance > 0) {
-            std::cout << "  Max Luminance: " << hdr_metadata.max_luminance << " nits" << std::endl;
+            std::cout << "  Max Luminance: " << FormatLuminance(hdr_metadata.max_luminance) << " nits" << std::endl;
         }
         if (hdr_metadata.min_luminance > 0) {
-            std::cout << "  Min Luminance: " << hdr_metadata.min_luminance << " nits" << std::endl;
+            std::cout << "  Min Luminance: " << FormatLuminance(hdr_metadata.min_luminance) << " nits" << std::endl;
         }
         
         std::cout << "\nColor Profile:" << std::endl;
