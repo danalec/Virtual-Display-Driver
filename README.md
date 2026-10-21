@@ -76,7 +76,7 @@ git submodule update --init --recursive
    - **Device Manager:** Check "Device Manager" under "Display Adapters."
    - **Settings:** Check display settings under system settings and see if the virtual displays show.
 
-While VDC is a good and friendly way to work with VDD, you can also do a lot manually. Like adding or removing resolutions or enable/disable 
+While VDC is a good and friendly way to work with VDD, you can also do a lot manually. Like adding or removing resolutions or enable/disable
 functions, which is done by editing vdd_settings.xml. You should be able to locate the file at the default location: 
 
 ```text
