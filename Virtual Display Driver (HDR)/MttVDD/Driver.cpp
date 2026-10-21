@@ -1724,6 +1724,16 @@ bool LoadEdidProfile(const wstring& profilePath, EdidProfileData& profile) {
 				currentElement == L"ColorProfile" || currentElement == L"PreferredMode") {
 				currentSection = currentElement;
 			}
+			else if (currentElement == L"MonitorMode") {
+				// A mode starts with nothing carried over from the one before it. The four
+				// values used to be read into the same variables for the whole section, so a
+				// mode whose <Width> was missing took the width of the mode before it, and
+				// the profile is a file the user can edit.
+				tempWidth = 0;
+				tempHeight = 0;
+				tempRefreshRateMultiplier = 1000;
+				tempNominalRefreshRate = 60;
+			}
 			break;
 
 		case XmlNodeType_EndElement:
