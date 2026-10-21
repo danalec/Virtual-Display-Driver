@@ -1477,6 +1477,27 @@ vector<tuple<int, int, int, int>> MergeAndOptimizeModes(const vector<tuple<int, 
     return mergedModes;
 }
 
+// The mode list must not carry the same mode twice. A vdd_settings.xml whose
+// <resolution> refresh rate is also one of the <global><g_refresh_rate> values
+// produces that mode from both sources -- the shipped file does exactly that, and
+// it handed IddCx 21 modes of which 3 were duplicates of the 60 Hz ones. The
+// dedupe in OptimizeModeList() only runs on the EDID path, which is off by
+// default, so the paths that run by default had none at all.
+//
+// The first occurrence wins, so the order the configuration asked for is kept: the
+// first mode is the one the driver reports as the preferred one.
+void RemoveDuplicateModes(vector<tuple<int, int, int, int>>& modes) {
+	set<tuple<int, int, int, int>> seen;
+	vector<tuple<int, int, int, int>> uniqueModes;
+	uniqueModes.reserve(modes.size());
+	for (const auto& mode : modes) {
+		if (seen.insert(mode).second) {
+			uniqueModes.push_back(mode);
+		}
+	}
+	modes.swap(uniqueModes);
+}
+
 // Optimize mode list for performance and compatibility
 vector<tuple<int, int, int, int>> OptimizeModeList(const vector<tuple<int, int, int, int>>& modes,
                                                    const tuple<int, int, int, int>& preferredMode) {
@@ -3656,6 +3677,10 @@ void loadSettings() {
 			vddlog("w", "vdd_settings.xml yielded no usable modes. Enabling Fallback");
 			res = BuildFallbackModeList();
 		}
+		// The list can carry the same mode twice when the configuration names it in
+		// two places. IddCx is told how many modes there are and then handed the
+		// list, so a duplicate is a mode that appears twice in the display settings.
+		RemoveDuplicateModes(res);
 		monitorModes = res;
 		RebuildKnownMonitorModesCache();
 		
@@ -3768,6 +3793,10 @@ void loadSettings() {
     }
     else {
         vddlog("i", "Using option.txt");
+        // The list can carry the same mode twice when the configuration names it in
+        // two places. IddCx is told how many modes there are and then handed the
+        // list, so a duplicate is a mode that appears twice in the display settings.
+        RemoveDuplicateModes(res);
         monitorModes = res;
         RebuildKnownMonitorModesCache();
         for (const auto& mode : res) {
@@ -3787,6 +3816,10 @@ void loadSettings() {
 	vddlog("i", "Loading Fallback - no settings found");
 	res = BuildFallbackModeList();
 
+	// The list can carry the same mode twice when the configuration names it in
+	// two places. IddCx is told how many modes there are and then handed the
+	// list, so a duplicate is a mode that appears twice in the display settings.
+	RemoveDuplicateModes(res);
 	monitorModes = res;
 	RebuildKnownMonitorModesCache();
 	return;
