@@ -4831,13 +4831,21 @@ constexpr DISPLAYCONFIG_VIDEO_SIGNAL_INFO dispinfo(UINT32 h, UINT32 v, UINT32 rn
 	// totalLines is UINT64 throughout: keeping "(v + 4)" in UINT32 inside the product trips
 	// C4754 under the Debug configurations, which analyse harder than Release.
 	const UINT64 totalLines = static_cast<UINT64>(v) + 4;
-	const UINT64 wideClock = static_cast<UINT64>(rn) * totalLines * totalLines / (rd ? rd : 1) + 1000;
-	const UINT64 wideVerticalTotal = totalLines * totalLines;
+	const UINT64 totalPixels = static_cast<UINT64>(h) + 4;
+	// The pixel clock has to be the refresh rate times the number of pixels in a
+	// frame, and the total size below is (h + 4) by (v + 4). The old code multiplied
+	// the refresh by (v + 4) squared -- a square model -- so the clock it reported was
+	// short by the factor (v + 4) / (h + 4): 56% of the real value for 1920x1080 and
+	// 75% for 1024x768. The mode contradicted itself, and it contradicted the target
+	// mode the driver builds for the same resolution, which uses the active size and
+	// is internally consistent. The refresh rate the driver reports does not change.
+	const UINT64 wideClock = static_cast<UINT64>(rn) * totalPixels * totalLines / (rd ? rd : 1) + 1000;
+	const UINT64 wideVerticalTotal = totalPixels * totalLines;
 	const UINT32 clock_rate = wideClock > UINT_MAX ? UINT_MAX : static_cast<UINT32>(wideClock);
 	const UINT32 verticalTotal = wideVerticalTotal > UINT_MAX ? UINT_MAX : static_cast<UINT32>(wideVerticalTotal);
 	return {
 	  clock_rate,                                      // pixel clock rate [Hz]
-	{ clock_rate, static_cast<UINT32>(totalLines) }, // fractional horizontal refresh rate [Hz]
+		{ clock_rate, static_cast<UINT32>(totalPixels) }, // fractional horizontal refresh rate [Hz]
 	{ clock_rate, verticalTotal },                  // fractional vertical refresh rate [Hz]
 	{ h, v },                                    // (horizontal, vertical) active pixel resolution
 	{ h + 4, static_cast<UINT32>(totalLines) }, // (horizontal, vertical) total pixel resolution
