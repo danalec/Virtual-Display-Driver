@@ -1,8 +1,10 @@
 param(
     [Parameter(Mandatory, Position = 0)]
-    # Exactly the refresh rates the driver can report, and nothing else. Both sources agree once
-    # you check them: <g_refresh_rate> in vdd_settings.xml ships 60/90/120/144/165/240, and
-    # option.txt -- the fallback used when no XML is present -- carries 60/120/144/240.
+    # Exactly the refresh rates the driver can report, and nothing else. This is the union of
+    # the two sources, which do not agree: <g_refresh_rate> in vdd_settings.xml ships
+    # 60/90/120/144/165/240, and option.txt -- the fallback used when no XML is present --
+    # carries 60/120/144/240. A rate the driver does not report is refused by IddCx, so the
+    # wider set is the one that works under both configurations.
     # 480 and 500 were offered here once and named no mode at all; 30 and 75 survived that cleanup
     # for the same reason. 30 only exists in the XML inside the upstream 25.7.23 release package,
     # which reports 244 rather than 240, and 75 is in neither. Asking for one gets an IddCx error,

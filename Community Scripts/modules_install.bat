@@ -9,11 +9,19 @@ setlocal
 :: is also empty under -Command, which was the original bug: the re-elevated shell
 :: was launched with -File "" and installed nothing while still printing "success".
 ::
-:: The re-elevation launches cmd.exe with this .bat, not powershell.exe with -File.
+:: The re-elevation launches this .bat itself, not powershell.exe with -File.
 :: powershell.exe -File refuses any file that is not a .ps1: it fails with
 :: "Processing -File ... failed because the file does not have a '.ps1' extension"
 :: and exit code -196608, so the elevated child died before installing anything
 :: and the parent reported "Elevated module installation failed".
+::
+:: It used to launch cmd.exe /c with the path wrapped in a backslash-escaped quote,
+:: ('/c', '\"' + $self + '\"'). cmd.exe does not treat a backslash as an escape
+:: character, so the argument it received was still \"C:\path\file.bat\" with the
+:: backslashes in it, the file was not found, and the elevated child never ran at all.
+:: Measured: that form exits 1 and the batch does not run; launching the batch
+:: itself goes through the shell, needs no quoting, and returns the batch's own
+:: exit code.
 set "VDD_INSTALL_BAT=%~f0"
 
 :: The versions are pinned to the same ones set-dependencies.ps1 enforces. Installing "latest"
@@ -29,7 +37,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command ^
     "$mcv = $env:VDD_MONITORCONFIG_VERSION;" ^
     "$elevated = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] 'Administrator');" ^
     "if (-not $elevated) {" ^
-        "$p = Start-Process -FilePath cmd.exe -Verb RunAs -Wait -PassThru -ArgumentList ('/c', '\"' + $self + '\"');" ^
+        "$p = Start-Process -FilePath $self -Verb RunAs -Wait -PassThru;" ^
         "if ($p.ExitCode -ne 0) { Write-Output ('Elevated module installation failed with exit code ' + $p.ExitCode); exit $p.ExitCode }" ^
         "exit 0" ^
     "} else {" ^

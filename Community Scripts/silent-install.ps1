@@ -195,8 +195,15 @@ try {
     }
     Push-Location $tempDir;
     try {
-        & $NefConExe install $driverInf "Root\MttVDD";
-        $installExitCode = $LASTEXITCODE;
+        # nefconw.exe is the windowed build, a GUI-subsystem process. PowerShell's call
+        # operator does not wait for one and never sets $LASTEXITCODE for it, so
+        # $installExitCode was $null -- and $null -ne 0 is true, so the check below
+        # failed every single time and the script rolled back an install that had
+        # actually worked. Measured on a purpose-built GUI-subsystem executable:
+        # $LASTEXITCODE stayed undefined after the call. Start-Process waits for the
+        # process and reports its real exit code, whatever the subsystem is.
+        $nefcon = Start-Process -FilePath $NefConExe -Wait -PassThru -NoNewWindow -ArgumentList @('install', ('"' + $driverInf + '"'), 'Root\MttVDD');
+        $installExitCode = $nefcon.ExitCode;
     }
     finally {
         Pop-Location;

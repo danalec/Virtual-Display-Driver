@@ -72,6 +72,12 @@ $ErrorActionPreference = 'Stop';
 # property, and $monitor.LogicalDisplay.DeviceName in get_disp_num.ps1 does.
 Set-StrictMode -Version 1.0;
 
+# Set when -WhatIf, or a declined -Confirm, left the operation undone, and when the
+# JSON result has already been written. The script reports one result, and the
+# result says what actually happened.
+$script:ActionSkipped = $false
+$script:JsonResultWritten = $false
+
 #----------------------------------------------------------------------
 # SECTION 1: CENTRALIZED LOGGING FUNCTION
 #----------------------------------------------------------------------
@@ -85,11 +91,12 @@ function Write-Log {
     )
 
     if ($Json.IsPresent) {
-        $logObject = [PSCustomObject]@{
-            status  = $Status.ToLower()
-            message = $Message
-        }
-        $logObject | ConvertTo-Json -Compress | Write-Output
+        # In JSON mode the script emits exactly one document, the result. Every log
+        # line was a JSON document of its own, so -Action status -Json printed three
+        # of them and ConvertFrom-Json on the whole output failed with "additional
+        # text encountered after the JSON value". Progress messages are verbose,
+        # not output.
+        Write-Verbose $Message
     }
     else {
         switch ($Status) {
@@ -219,7 +226,14 @@ try {
         }
         # Fallback: If not found by name, use the more specific and stable Hardware ID.
         if (-not $device) {
-            $device = Get-PnpDevice -HardwareID "Root\MttVDD" -ErrorAction Stop
+            # Get-PnpDevice has no -HardwareID parameter. Its parameter set is AsJob,
+            # CimSession, Class, FriendlyName, InstanceId, PresentOnly, Status and
+            # ThrottleLimit, on Windows PowerShell 5.1 as well as on PowerShell 7, so
+            # the call bound to nothing and raised ParameterBindingException instead
+            # of finding the device. The object does carry a HardwareID property, and
+            # that is what toggle-VDD.ps1 already filters on.
+            $device = Get-PnpDevice -Class Display -ErrorAction Stop |
+                Where-Object { $_.HardwareID -like 'Root\MttVDD*' }
         }
         return $device
     }
@@ -462,7 +476,10 @@ try {
                     throw "devcon install failed with exit code $installExitCode"
                 }
             }
-            else { Write-Verbose "Skipped: -WhatIf or -Confirm declined the install." }
+            else {
+                Write-Verbose "Skipped: -WhatIf or -Confirm declined the install."
+                $script:ActionSkipped = $true
+            }
 
             # The INF's [UMDriverCopy] ships only MttVDD.dll, so C:\VirtualDisplayDriver\vdd_settings.xml
             # would not exist after a DevCon-only install, and every runtime toggle fails because
@@ -493,7 +510,10 @@ try {
                         throw "devcon remove failed with exit code $removeExitCode"
                     }
                 }
-                else { Write-Verbose "Skipped: -WhatIf or -Confirm declined the removal." }
+                else {
+                Write-Verbose "Skipped: -WhatIf or -Confirm declined the removal."
+                $script:ActionSkipped = $true
+            }
             }
             else { Write-Log -Message "Driver is not currently installed. Nothing to do." }
         }
@@ -510,14 +530,20 @@ try {
                 Write-Log -Message "Enabling device: $($device.FriendlyName)..."
                 $device | Enable-PnpDevice -Confirm:$false
             }
-            else { Write-Verbose "Skipped: -WhatIf or -Confirm declined the enable." }
+            else {
+                Write-Verbose "Skipped: -WhatIf or -Confirm declined the enable."
+                $script:ActionSkipped = $true
+            }
         }
         elseif ($Action -eq 'disable') {
             if ($PSCmdlet.ShouldProcess($device.FriendlyName, "Disable Virtual Display Driver")) {
                 Write-Log -Message "Disabling device: $($device.FriendlyName)..."
                 $device | Disable-PnpDevice -Confirm:$false
             }
-            else { Write-Verbose "Skipped: -WhatIf or -Confirm declined the disable." }
+            else {
+                Write-Verbose "Skipped: -WhatIf or -Confirm declined the disable."
+                $script:ActionSkipped = $true
+            }
         }
         elseif ($Action -eq 'toggle') {
             $enabling = $device.Status -notin ('OK', 'Degraded', 'Started')
@@ -532,7 +558,10 @@ try {
                     $device | Disable-PnpDevice -Confirm:$false
                 }
             }
-            else { Write-Verbose "Skipped: -WhatIf or -Confirm declined the toggle." }
+            else {
+                Write-Verbose "Skipped: -WhatIf or -Confirm declined the toggle."
+                $script:ActionSkipped = $true
+            }
         }
     }
     elseif ($Action -eq 'status') {
@@ -564,18 +593,43 @@ try {
         if ($Json.IsPresent) {
             # For 'status', the JSON object is the primary output, bypassing the standard log format.
             $statusResult | ConvertTo-Json -Compress | Write-Output
+            $script:JsonResultWritten = $true
         }
         else {
             Write-Log -Message $message
         }
     }
 
-    Write-Log -Message "Operation '$Action' completed successfully." -Status 'Success'
+    # One result, and it says what actually happened. A declined -Confirm or a -WhatIf
+    # left the operation undone, and the old unconditional "completed successfully"
+    # claimed it had been done.
+    $finalStatus = 'success'
+    $finalMessage = "Operation '$Action' completed successfully."
+    if ($script:ActionSkipped) {
+        $finalStatus = 'skipped'
+        $finalMessage = "Operation '$Action' was skipped; nothing was changed."
+    }
+    if ($Json.IsPresent) {
+        if (-not $script:JsonResultWritten) {
+            @{ status = $finalStatus; message = $finalMessage } | ConvertTo-Json -Compress | Write-Output
+        }
+    }
+    elseif ($finalStatus -eq 'skipped') {
+        Write-Log -Message $finalMessage -Status 'Warning'
+    }
+    else {
+        Write-Log -Message $finalMessage -Status 'Success'
+    }
 }
 catch {
     # The 'catch' block will execute if any command in the 'try' block throws an error.
     $errorMessage = "An error occurred during the '$Action' operation: $($_.Exception.Message) `nAt line: $($_.InvocationInfo.ScriptLineNumber)"
-    Write-Log -Message $errorMessage -Status 'Error'
+    if ($Json.IsPresent) {
+        @{ status = 'error'; message = $errorMessage } | ConvertTo-Json -Compress | Write-Output
+    }
+    else {
+        Write-Log -Message $errorMessage -Status 'Error'
+    }
     exit 1
 }
 finally {
@@ -597,5 +651,11 @@ finally {
 # Add a final pause unless in Silent or JSON mode so the user can see the output.
 if (-not $Silent.IsPresent -and -not $Json.IsPresent) {
     Write-Host ""; Write-Host "Press any key to exit..." -ForegroundColor Gray
-    [System.Console]::ReadKey($true) | Out-Null
+    # ReadKey needs a console to read from. With stdin redirected -- under CI, a
+    # scheduled task, or any caller that pipes the output -- it raises
+    # InvalidOperationException, and the script died on its last line, after the work
+    # was already done. get_disp_num.ps1 already guards this the same way.
+    if (-not [Console]::IsInputRedirected -and $host.UI.RawUI) {
+        [System.Console]::ReadKey($true) | Out-Null
+    }
 }
