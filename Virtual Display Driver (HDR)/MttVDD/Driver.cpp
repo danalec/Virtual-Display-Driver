@@ -1945,15 +1945,38 @@ bool ApplyEdidProfile(const EdidProfileData& profile) {
 	}
 
 	// Apply color primaries if configured
+	//
+	// The primaries are range-checked the way the XML path checks them: a coordinate
+	// has to be inside (0, 1]. The profile path had no check at all, so a profile with a
+	// coordinate of zero, or of a number that is not a coordinate at all, put the colour
+	// triangle outside the display.
 	if (colorPrimariesEnabled && overrideManualSettings) {
-		redX = profile.redX;
-		redY = profile.redY;
-		greenX = profile.greenX;
-		greenY = profile.greenY;
-		blueX = profile.blueX;
-		blueY = profile.blueY;
-		whiteX = profile.whiteX;
-		whiteY = profile.whiteY;
+		const double primaries[8] = {
+			profile.redX, profile.redY, profile.greenX, profile.greenY,
+			profile.blueX, profile.blueY, profile.whiteX, profile.whiteY
+		};
+		bool usable = true;
+		for (int i = 0; i < 8; i++) {
+			if (primaries[i] <= 0.0 || primaries[i] > 1.0) {
+				usable = false;
+				break;
+			}
+		}
+		
+		if (usable) {
+			redX = profile.redX;
+			redY = profile.redY;
+			greenX = profile.greenX;
+			greenY = profile.greenY;
+			blueX = profile.blueX;
+			blueY = profile.blueY;
+			whiteX = profile.whiteX;
+			whiteY = profile.whiteY;
+		}
+		else {
+			vddlog("w", "The EDID profile carries a primary coordinate outside (0, 1]; "
+				"the manual primaries are kept.");
+		}
 	}
 
 	// Apply color space settings
