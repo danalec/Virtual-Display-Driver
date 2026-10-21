@@ -5433,11 +5433,17 @@ NTSTATUS VirtualDisplayDriverMonitorQueryModes(IDDCX_MONITOR MonitorObject, cons
 		vddlog("d", logStream.str().c_str());
 		copy(TargetModes.begin(), TargetModes.end(), pInArgs->pTargetModes);
 	}
-	else {
+	else if (pInArgs->TargetModeBufferInputCount > 0) {
+		// The buffer cannot hold the modes. Returning success with the count
+		// and nothing in the buffer leaves the OS reading modes that were
+		// never written, so say that the buffer has to grow. The output count
+		// above already says how big it has to be. A zero-sized input count
+		// is the OS asking only how many modes there are.
 		logStream.str("");
 		logStream << "Input buffer too small. Required: " << TargetModes.size()
 			<< ", Provided: " << pInArgs->TargetModeBufferInputCount;
 		vddlog("w", logStream.str().c_str());
+		return STATUS_BUFFER_TOO_SMALL;
 	}
 
 	return STATUS_SUCCESS;
@@ -5760,9 +5766,15 @@ NTSTATUS VirtualDisplayDriverEvtIddCxMonitorQueryTargetModes2(
 		}
 		vddlog("d", logStream.str().c_str());
 	}
-	else
+	else if (pInArgs->TargetModeBufferInputCount > 0)
 	{
+		// The buffer cannot hold the modes. Returning success with the count
+		// and nothing in the buffer leaves the OS reading modes that were
+		// never written, so say that the buffer has to grow. The output count
+		// above already says how big it has to be. A zero-sized input count
+		// is the OS asking only how many modes there are.
 		vddlog("w", "Input buffer is too small for target modes.");
+		return STATUS_BUFFER_TOO_SMALL;
 	}
 
 	return STATUS_SUCCESS;
